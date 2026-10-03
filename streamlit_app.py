@@ -276,6 +276,8 @@ def render_event_evidence(event: Dict[str, Any]) -> None:
                 "ticker": item.get("ticker", ""),
                 "source": item.get("source", ""),
                 "published_at": item.get("published_at", ""),
+                "relevance": item.get("relevance_status", "unreviewed"),
+                "relevance_reason": item.get("relevance_reason", ""),
                 "url": item.get("url", ""),
             }
             for item in headlines
@@ -283,7 +285,7 @@ def render_event_evidence(event: Dict[str, Any]) -> None:
         st.dataframe(
             headline_frame,
             hide_index=True,
-            use_container_width=True,
+                width="stretch",
             column_config={"url": st.column_config.LinkColumn("Article")},
         )
     elif event["agent_name"] in {"researcher", "strategist", "risk_manager"}:
@@ -364,11 +366,14 @@ def render_summary(summary: Dict[str, Any]) -> None:
     st.subheader("Research headlines")
     if summary.get("news"):
         headlines = pd.DataFrame(summary["news"])
-        visible_columns = ["title", "ticker", "source", "published_at", "url"]
+        visible_columns = [
+            "title", "ticker", "source", "published_at", "relevance_status",
+            "relevance_reason", "url",
+        ]
         st.dataframe(
             headlines[visible_columns],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             column_config={"url": st.column_config.LinkColumn("Article")},
         )
     else:
@@ -409,6 +414,10 @@ def render_time_range() -> tuple[str, str]:
     start_utc = selected_start.astimezone(timezone.utc)
     end_utc = selected_end.astimezone(timezone.utc)
     return start_utc.strftime("%Y-%m-%d %H:%M:%S"), end_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def refresh_dashboard_end_time() -> None:
+    st.session_state["dashboard_range_end"] = datetime.now()
 
 
 def render_trade_search(trades: list[Dict[str, Any]]) -> None:
@@ -523,6 +532,7 @@ def main() -> None:
             with st.spinner("Fetching screened Yahoo Finance headlines..."):
                 news_result = asyncio.run(run_hourly_news_fetch())
             st.session_state["manual_research_result"] = {"news": news_result, "cycle": None}
+            refresh_dashboard_end_time()
             st.rerun()
 
         if st.button("Run agent analysis", key="manual_agent_analysis"):
@@ -530,6 +540,7 @@ def main() -> None:
                 cycle_result = run_agent_cycle_for_ui()
             if cycle_result:
                 st.session_state["manual_research_result"] = {"news": None, "cycle": cycle_result}
+            refresh_dashboard_end_time()
             st.rerun()
 
         if st.button("Fetch news + analyze", type="primary", key="manual_fetch_and_analyze"):
@@ -537,6 +548,7 @@ def main() -> None:
                 news_result = asyncio.run(run_hourly_news_fetch())
                 cycle_result = run_agent_cycle_for_ui()
             st.session_state["manual_research_result"] = {"news": news_result, "cycle": cycle_result}
+            refresh_dashboard_end_time()
             st.rerun()
 
     summary = get_dashboard_summary(start_at, end_at)
@@ -552,14 +564,18 @@ def main() -> None:
             if news_result is not None:
                 st.write(
                     f"News fetch: {news_result['fetched']} headlines received, "
-                    f"{news_result['inserted']} new articles stored."
+                    f"{news_result['inserted']} new and {news_result['updated']} existing articles refreshed."
                 )
             if cycle_result:
                 headlines = cycle_result["market_data"].get("recent_news", [])
-                st.write(f"Analysis received {len(headlines)} stored headlines as context.")
+                relevance = cycle_result["market_data"].get("headline_relevance", {})
+                st.write(
+                    f"Analyzed {len(headlines)} headlines: {relevance.get('relevant', 0)} relevant, "
+                    f"{relevance.get('not_relevant', 0)} not relevant."
+                )
                 research_mode = "OpenAI research" if cycle_result["ai_research_enabled"] else "Dummy research"
                 st.write(f"Research mode: {research_mode}")
-                st.dataframe(pd.DataFrame(cycle_result["trades"]), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(cycle_result["trades"]), hide_index=True, width="stretch")
 
     st.sidebar.subheader("Agent rule editor")
     for agent_name, default_rules in DEFAULT_AGENT_RULES.items():

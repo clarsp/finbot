@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -71,7 +72,7 @@ def ensure_db() -> None:
         """
         CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, sector TEXT NOT NULL, signal TEXT NOT NULL, catalyst TEXT NOT NULL, confidence REAL NOT NULL, payload TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS news_articles (id INTEGER PRIMARY KEY AUTOINCREMENT, article_key TEXT NOT NULL UNIQUE, ticker TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', published_at TEXT, fetched_at TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS news_articles (id INTEGER PRIMARY KEY AUTOINCREMENT, article_key TEXT NOT NULL UNIQUE, ticker TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', published_at TEXT, fetched_at TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', relevance_status TEXT NOT NULL DEFAULT 'unreviewed', relevance_tickers TEXT NOT NULL DEFAULT '', relevance_reason TEXT NOT NULL DEFAULT '', relevance_analyzed_at TEXT);
         CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, symbol TEXT NOT NULL, side TEXT NOT NULL, leverage REAL NOT NULL, exit_target REAL NOT NULL, status TEXT NOT NULL, notes TEXT, allocated_capital REAL NOT NULL DEFAULT 0, entry_price REAL, current_price REAL, quantity REAL NOT NULL DEFAULT 0, realized_pnl REAL NOT NULL DEFAULT 0, closed_at TEXT, company_name TEXT NOT NULL DEFAULT '', stop_loss_price REAL, take_profit_price REAL);
         CREATE TABLE IF NOT EXISTS trade_events (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER NOT NULL REFERENCES trades(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, stage TEXT NOT NULL, agent_name TEXT NOT NULL, status TEXT NOT NULL, decision TEXT NOT NULL, message TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS risk_events (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, pnl REAL NOT NULL, volatility REAL NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL);
@@ -90,6 +91,16 @@ def ensure_db() -> None:
     }.items():
         if column not in existing_columns:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {definition}")
+
+    existing_news_columns = {row["name"] for row in conn.execute("PRAGMA table_info(news_articles)")}
+    for column, definition in {
+        "relevance_status": "TEXT NOT NULL DEFAULT 'unreviewed'",
+        "relevance_tickers": "TEXT NOT NULL DEFAULT ''",
+        "relevance_reason": "TEXT NOT NULL DEFAULT ''",
+        "relevance_analyzed_at": "TEXT",
+    }.items():
+        if column not in existing_news_columns:
+            conn.execute(f"ALTER TABLE news_articles ADD COLUMN {column} {definition}")
 
     starting_capital = float(os.getenv("FINBOT_STARTING_CAPITAL", "10000"))
     conn.execute(
@@ -558,15 +569,45 @@ def save_signal(sector: str, signal: str, catalyst: str, confidence: float, payl
     conn.close()
 
 
-def save_news_articles(articles: List[Dict[str, Any]]) -> int:
+def save_news_articles(articles: List[Dict[str, Any]]) -> Dict[str, int]:
     conn = get_connection()
     inserted = 0
+    updated = 0
     for article in articles:
         fetched_at = datetime.fromisoformat(
             article["fetched_at"].replace("Z", "+00:00")
         ).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        existing = conn.execute(
+            "SELECT 1 FROM news_articles WHERE article_key = ?",
+            (article["article_key"],),
+        ).fetchone()
         cursor = conn.execute(
-            "INSERT OR IGNORE INTO news_articles (article_key, ticker, title, summary, source, url, published_at, fetched_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO news_articles
+                (article_key, ticker, title, summary, source, url, published_at, fetched_at, payload)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(article_key) DO UPDATE SET
+                ticker = excluded.ticker,
+                title = excluded.title,
+                summary = excluded.summary,
+                source = excluded.source,
+                url = excluded.url,
+                published_at = excluded.published_at,
+                fetched_at = excluded.fetched_at,
+                payload = excluded.payload,
+                relevance_status = CASE
+                    WHEN news_articles.title != excluded.title OR news_articles.summary != excluded.summary
+                    THEN 'unreviewed' ELSE news_articles.relevance_status END,
+                relevance_tickers = CASE
+                    WHEN news_articles.title != excluded.title OR news_articles.summary != excluded.summary
+                    THEN '' ELSE news_articles.relevance_tickers END,
+                relevance_reason = CASE
+                    WHEN news_articles.title != excluded.title OR news_articles.summary != excluded.summary
+                    THEN '' ELSE news_articles.relevance_reason END,
+                relevance_analyzed_at = CASE
+                    WHEN news_articles.title != excluded.title OR news_articles.summary != excluded.summary
+                    THEN NULL ELSE news_articles.relevance_analyzed_at END
+            """,
             (
                 article["article_key"], article["ticker"], article["title"],
                 article.get("summary", ""), article.get("source", "Yahoo Finance"),
@@ -574,10 +615,13 @@ def save_news_articles(articles: List[Dict[str, Any]]) -> int:
                 fetched_at, json.dumps(article, sort_keys=True),
             ),
         )
-        inserted += cursor.rowcount
+        if existing:
+            updated += cursor.rowcount
+        else:
+            inserted += cursor.rowcount
     conn.commit()
     conn.close()
-    return inserted
+    return {"inserted": inserted, "updated": updated}
 
 
 def get_news_articles(
@@ -597,36 +641,89 @@ def get_news_articles(
     parameters.append(limit)
     conn = get_connection()
     rows = conn.execute(
-        f"SELECT article_key, ticker, title, summary, source, url, published_at, fetched_at FROM news_articles {where_clause} ORDER BY fetched_at DESC LIMIT ?",
+        f"SELECT article_key, ticker, title, summary, source, url, published_at, fetched_at, relevance_status, relevance_tickers, relevance_reason, relevance_analyzed_at FROM news_articles {where_clause} ORDER BY fetched_at DESC LIMIT ?",
         parameters,
     ).fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+    articles = [dict(row) for row in rows]
+    for article in articles:
+        article["relevance_tickers"] = [ticker for ticker in article["relevance_tickers"].split(",") if ticker]
+    return articles
+
+
+def classify_research_headlines(
+    headlines: List[Dict[str, Any]], candidates: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    sector_terms = {
+        "technology": ("artificial intelligence", "ai", "semiconductor", "chip", "memory", "cloud", "software", "data center", "datacenter", "compute", "earnings", "guidance"),
+        "energy": ("crude", "oil", "opec", "inventory", "inventories", "natural gas", "energy", "refinery", "production"),
+    }
+    totals = {"relevant": 0, "not_relevant": 0}
+    for headline in headlines:
+        text = f"{headline.get('title', '')} {headline.get('summary', '')}".lower()
+        matched_tickers = []
+        reasons = []
+        for candidate in candidates:
+            ticker = str(candidate.get("ticker", "")).upper()
+            company = str(candidate.get("company_name", "")).lower()
+            if ticker and headline.get("ticker", "").upper() == ticker:
+                matched_tickers.append(ticker)
+                reasons.append(f"Ticker matches {ticker}")
+                continue
+            if company and company in text:
+                matched_tickers.append(ticker)
+                reasons.append(f"Company name matches {company}")
+                continue
+            terms = sector_terms.get(str(candidate.get("sector", "")).lower(), ())
+            matching_terms = [
+                term for term in terms
+                if (" " in term and term in text) or (" " not in term and re.search(rf"\b{re.escape(term)}\b", text))
+            ]
+            if matching_terms:
+                matched_tickers.append(ticker)
+                reasons.append(f"{candidate.get('sector')} topic match: {', '.join(matching_terms[:3])}")
+
+        matched_tickers = list(dict.fromkeys(filter(None, matched_tickers)))
+        status = "relevant" if matched_tickers else "not relevant"
+        reason = "; ".join(dict.fromkeys(reasons)) if reasons else "No matching candidate ticker, company, or sector research terms."
+        update_news_relevance(headline["article_key"], status, matched_tickers, reason)
+        totals["relevant" if matched_tickers else "not_relevant"] += 1
+    return totals
+
+
+def update_news_relevance(article_key: str, status: str, tickers: List[str], reason: str) -> None:
+    conn = get_connection()
+    conn.execute(
+        "UPDATE news_articles SET relevance_status = ?, relevance_tickers = ?, relevance_reason = ?, relevance_analyzed_at = CURRENT_TIMESTAMP WHERE article_key = ?",
+        (status, ",".join(tickers), reason, article_key),
+    )
+    conn.commit()
+    conn.close()
 
 
 async def run_hourly_news_fetch() -> Dict[str, int]:
     settings = IntegrationSettings.from_environment()
     if settings.news_provider not in {"yfinance", "yahoo", "yahoo_finance"}:
         logger.info("News provider is '%s'; skipping remote news fetch.", settings.news_provider)
-        return {"fetched": 0, "inserted": 0}
+        return {"fetched": 0, "inserted": 0, "updated": 0}
 
     try:
         articles = await YahooFinanceNewsProvider(settings).fetch_news()
-        inserted = save_news_articles(articles)
+        counts = save_news_articles(articles)
         record_agent_event(
             "researcher", "completed", "hourly_news_fetch",
-            f"Fetched {len(articles)} Yahoo Finance headlines; stored {inserted} new articles.",
+            f"Fetched {len(articles)} Yahoo Finance headlines; stored {counts['inserted']} new and refreshed {counts['updated']} existing articles.",
             "accepted" if articles else "rejected",
-            {"fetched": len(articles), "inserted": inserted},
+            {"fetched": len(articles), **counts},
         )
-        logger.info("Hourly Yahoo news fetch completed: %d fetched, %d new", len(articles), inserted)
-        return {"fetched": len(articles), "inserted": inserted}
+        logger.info("Hourly Yahoo news fetch completed: %d fetched, %d new, %d refreshed", len(articles), counts["inserted"], counts["updated"])
+        return {"fetched": len(articles), **counts}
     except Exception as error:
         logger.exception("Hourly news fetch failed; the dummy research feed remains available")
         record_agent_event(
             "researcher", "warning", "hourly_news_fetch", str(error), "rejected", {}
         )
-        return {"fetched": 0, "inserted": 0}
+        return {"fetched": 0, "inserted": 0, "updated": 0}
 
 
 def save_trade(
@@ -923,15 +1020,22 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
 
     market_data = await researcher.run_data_fetch()
     recent_news = get_news_articles(limit=50)
+    relevance_counts = classify_research_headlines(
+        recent_news, [market_data["tech_data"], market_data["energy_data"]]
+    )
+    recent_news = get_news_articles(limit=50)
     market_data["recent_news"] = recent_news
+    market_data["headline_relevance"] = relevance_counts
     market_data["ai_research_enabled"] = ai_enabled
     candidates = [market_data["tech_data"], market_data["energy_data"]]
     cycle_trades: List[Dict[str, Any]] = []
 
     for candidate in candidates:
-        related_news = [article for article in recent_news if article["ticker"] == candidate["ticker"]]
-        if not related_news:
-            related_news = recent_news[:3]
+        related_news = [
+            article for article in recent_news
+            if article["relevance_status"] == "relevant"
+            and candidate["ticker"] in article["relevance_tickers"]
+        ]
         ai_analysis = None
         if ai_researcher:
             ai_analysis = await ai_researcher.research(
