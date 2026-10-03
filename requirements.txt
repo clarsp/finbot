@@ -1,2 +1,5 @@
 streamlit>=1.36.0
 extra-streamlit-components>=0.1.81
+yfscreen>=0.1.2
+yfinance>=0.2.54
+openai>=1.30.0

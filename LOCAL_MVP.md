@@ -2,7 +2,7 @@
 
 ## Run locally
 
-1. Copy `.env.example` to `.env` and replace `FINBOT_PASSWORD` with a private password.
+1. Copy `.env.example` to `.env.config` and set local credentials there. `.env.config` is git-ignored.
 2. Run `./start.sh`.
 3. Open the local URL printed by Streamlit. HTTPS stays disabled unless `ENABLE_HTTPS=true` is set in `.env`.
 
@@ -22,6 +22,10 @@ The current simulator uses feed confidence and simple deterministic checks. Stop
 
 ## Provider scaffolding
 
-`.env.example` contains separate placeholders for a news source, an OpenAI-compatible analysis endpoint, and Interactive Brokers. The current researcher reads `research_feed.json`; it does not use IBKR news or OpenAI. A future news adapter retrieves licensed headlines/data, an AI adapter analyzes that input, and IBKR is configured separately for brokerage execution. IBKR data/news availability depends on supported services, subscriptions, and account permissions, so it should not be assumed as the research source. `integrations.py` defines provider protocols and adapter placeholders. Providers default to `dummy`; selecting a real provider currently raises `NotImplementedError` rather than making network requests. No credential needs to be entered until a reviewed adapter is implemented.
+The backend uses `yfscreen` to screen U.S. equities and `yfinance` to fetch ticker headlines immediately at startup and once per hour. Articles are deduplicated and stored in SQLite, displayed in the dashboard, and attached to matching trade research logs. Use the sidebar's Manual research actions to fetch headlines only, analyze stored headlines, or fetch and analyze in one action. Screening/news retrieval does not itself open or close trades. Yahoo can rate-limit or return no articles; on those runs the configured ticker list is tried, errors are logged, and the existing `research_feed.json` trading simulation remains available.
 
-Before using broker credentials, use a dedicated paper account, restrict permissions, never enable withdrawals, and keep `.env` out of source control.
+OpenAI research is disabled by default and can be enabled in the sidebar. When enabled, each candidate and up to eight related headlines are sent to the configured OpenAI-compatible Chat Completions endpoint. The adapter requires structured JSON for signal, confidence, catalyst, and summary; these results are saved with the research event and feed the Strategist. API/configuration errors are surfaced rather than silently falling back to dummy decisions.
+
+The Strategist still applies deterministic confidence and direction rules, the Risk Manager remains the deterministic final threshold gate, and execution remains paper-only. OpenAI does not place orders and no live brokerage orders are available. Interactive Brokers remains a separate execution/account integration and is not used as a news source. IBKR news/data availability depends on supported services, subscriptions, and account permissions. Keep provider credentials in `.env.config`; no key is required for the Yahoo screener/news packages.
+
+Before using broker credentials, use a dedicated paper account, restrict permissions, never enable withdrawals, and keep `.env.config` out of source control.

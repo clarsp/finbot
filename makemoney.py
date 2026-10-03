@@ -8,9 +8,11 @@ import os
 import secrets
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from integrations import IntegrationSettings, OpenAIResearchAdapter, YahooFinanceNewsProvider
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -69,6 +71,7 @@ def ensure_db() -> None:
         """
         CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, sector TEXT NOT NULL, signal TEXT NOT NULL, catalyst TEXT NOT NULL, confidence REAL NOT NULL, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS news_articles (id INTEGER PRIMARY KEY AUTOINCREMENT, article_key TEXT NOT NULL UNIQUE, ticker TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', published_at TEXT, fetched_at TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, symbol TEXT NOT NULL, side TEXT NOT NULL, leverage REAL NOT NULL, exit_target REAL NOT NULL, status TEXT NOT NULL, notes TEXT, allocated_capital REAL NOT NULL DEFAULT 0, entry_price REAL, current_price REAL, quantity REAL NOT NULL DEFAULT 0, realized_pnl REAL NOT NULL DEFAULT 0, closed_at TEXT, company_name TEXT NOT NULL DEFAULT '', stop_loss_price REAL, take_profit_price REAL);
         CREATE TABLE IF NOT EXISTS trade_events (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER NOT NULL REFERENCES trades(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, stage TEXT NOT NULL, agent_name TEXT NOT NULL, status TEXT NOT NULL, decision TEXT NOT NULL, message TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS risk_events (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, pnl REAL NOT NULL, volatility REAL NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL);
@@ -94,6 +97,7 @@ def ensure_db() -> None:
         (str(starting_capital),),
     )
     conn.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('auth_signing_key', ?)", (secrets.token_urlsafe(48),))
+    conn.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('ai_research_enabled', 'false')")
     user_count = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
     if user_count == 0:
         conn.execute(
@@ -190,10 +194,40 @@ def get_agent_rules() -> Dict[str, Dict[str, Any]]:
     return data
 
 
-def get_decision_timeline() -> List[Dict[str, Any]]:
+def get_ai_research_enabled() -> bool:
+    conn = get_connection()
+    row = conn.execute("SELECT value FROM app_settings WHERE key = 'ai_research_enabled'").fetchone()
+    conn.close()
+    return bool(row and row["value"].lower() == "true")
+
+
+def set_ai_research_enabled(enabled: bool) -> None:
+    if enabled and not IntegrationSettings.from_environment().openai_api_key:
+        raise ValueError("Set OPENAI_API_KEY in .env.config before enabling OpenAI research.")
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES ('ai_research_enabled', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ("true" if enabled else "false",),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_decision_timeline(start_at: Optional[str] = None, end_at: Optional[str] = None) -> List[Dict[str, Any]]:
+    conditions = []
+    parameters: List[str] = []
+    if start_at:
+        conditions.append("created_at >= ?")
+        parameters.append(start_at)
+    if end_at:
+        conditions.append("created_at <= ?")
+        parameters.append(end_at)
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     conn = get_connection()
     rows = conn.execute(
-        "SELECT created_at, agent_name, decision FROM agent_events ORDER BY id ASC"
+        f"SELECT created_at, agent_name, decision FROM agent_events {where_clause} ORDER BY id ASC",
+        parameters,
     ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
@@ -524,6 +558,77 @@ def save_signal(sector: str, signal: str, catalyst: str, confidence: float, payl
     conn.close()
 
 
+def save_news_articles(articles: List[Dict[str, Any]]) -> int:
+    conn = get_connection()
+    inserted = 0
+    for article in articles:
+        fetched_at = datetime.fromisoformat(
+            article["fetched_at"].replace("Z", "+00:00")
+        ).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO news_articles (article_key, ticker, title, summary, source, url, published_at, fetched_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                article["article_key"], article["ticker"], article["title"],
+                article.get("summary", ""), article.get("source", "Yahoo Finance"),
+                article.get("url", ""), article.get("published_at"),
+                fetched_at, json.dumps(article, sort_keys=True),
+            ),
+        )
+        inserted += cursor.rowcount
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def get_news_articles(
+    start_at: Optional[str] = None,
+    end_at: Optional[str] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    conditions = []
+    parameters: List[Any] = []
+    if start_at:
+        conditions.append("fetched_at >= ?")
+        parameters.append(start_at)
+    if end_at:
+        conditions.append("fetched_at <= ?")
+        parameters.append(end_at)
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    parameters.append(limit)
+    conn = get_connection()
+    rows = conn.execute(
+        f"SELECT article_key, ticker, title, summary, source, url, published_at, fetched_at FROM news_articles {where_clause} ORDER BY fetched_at DESC LIMIT ?",
+        parameters,
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+async def run_hourly_news_fetch() -> Dict[str, int]:
+    settings = IntegrationSettings.from_environment()
+    if settings.news_provider not in {"yfinance", "yahoo", "yahoo_finance"}:
+        logger.info("News provider is '%s'; skipping remote news fetch.", settings.news_provider)
+        return {"fetched": 0, "inserted": 0}
+
+    try:
+        articles = await YahooFinanceNewsProvider(settings).fetch_news()
+        inserted = save_news_articles(articles)
+        record_agent_event(
+            "researcher", "completed", "hourly_news_fetch",
+            f"Fetched {len(articles)} Yahoo Finance headlines; stored {inserted} new articles.",
+            "accepted" if articles else "rejected",
+            {"fetched": len(articles), "inserted": inserted},
+        )
+        logger.info("Hourly Yahoo news fetch completed: %d fetched, %d new", len(articles), inserted)
+        return {"fetched": len(articles), "inserted": inserted}
+    except Exception as error:
+        logger.exception("Hourly news fetch failed; the dummy research feed remains available")
+        record_agent_event(
+            "researcher", "warning", "hourly_news_fetch", str(error), "rejected", {}
+        )
+        return {"fetched": 0, "inserted": 0}
+
+
 def save_trade(
     symbol: str,
     side: str,
@@ -591,8 +696,10 @@ def get_dashboard_summary(start_at: Optional[str] = None, end_at: Optional[str] 
         "latest_trade": dict(latest_trade) if latest_trade else None,
         "risk_events": [dict(row) for row in risk_events],
         "agents": agent_summary,
+        "decision_timeline": get_decision_timeline(start_at, end_at),
         "portfolio": get_portfolio_summary(end_at),
         "trades": get_trade_history(start_at, end_at),
+        "news": get_news_articles(start_at, end_at),
     }
 
 
@@ -677,23 +784,27 @@ class StrategistAgent:
         tech_data = market_data.get("tech_data", {})
         energy_data = market_data.get("energy_data", {})
 
-        position = "LONG" if tech_data.get("signal") == "bullish" else "SHORT"
+        signal = tech_data.get("signal")
+        position = "LONG" if signal == "bullish" else "SHORT" if signal == "bearish" else "HOLD"
         leverage = 2.0
-        exit_target = 1.05 if position == "LONG" else 0.95
-        decision = "accepted" if float(tech_data.get("confidence", 0.0)) >= float(rules.get("min_confidence", 0.7)) else "rejected"
+        exit_target = 1.05 if position == "LONG" else 0.95 if position == "SHORT" else 1.0
+        decision = "accepted" if position in {"LONG", "SHORT"} and float(tech_data.get("confidence", 0.0)) >= float(rules.get("min_confidence", 0.7)) else "rejected"
+        recent_news = market_data.get("recent_news", [])
 
         payload = {
             "position": position,
             "leverage": leverage,
             "exit_target": exit_target,
             "assets": [tech_data.get("ticker", "AAPL"), energy_data.get("ticker", "USOIL")],
-            "notes": "Balanced exposure across tech strength and energy macro risk.",
+            "news_context": recent_news,
+            "ai_analysis": tech_data.get("ai_analysis"),
+            "notes": f"Received {len(recent_news)} headlines; decision uses confidence and directional rules.",
         }
         record_agent_event(
             "strategist",
             "completed",
             "build_strategy",
-            f"Strategy selected {position} with leverage {leverage}",
+            f"Strategy selected {position} with leverage {leverage}; received {len(recent_news)} headlines as context. Decision uses deterministic rules.",
             decision,
             payload,
         )
@@ -703,6 +814,7 @@ class StrategistAgent:
 class RiskManagerAgent:
     def check_risk(self, pnl: float, volatility: float, strategy_signal: Dict[str, Any]) -> Dict[str, Any]:
         rules = get_agent_rules().get("risk_manager", DEFAULT_AGENT_RULES["risk_manager"])
+        news_context = strategy_signal.get("news_context", [])
         logger.info("Checking risk thresholds...")
         if pnl < -float(rules.get("max_drawdown", 0.05)) or volatility > float(rules.get("max_volatility", 0.03)):
             action = "EXIT_IMMEDIATELY"
@@ -713,6 +825,7 @@ class RiskManagerAgent:
             action = "HOLD"
             details = "Within risk limits. Continue monitoring."
             decision = "accepted"
+        details = f"{details} Received {len(news_context)} research headlines; risk remains threshold-rule based."
 
         save_risk_event(pnl=pnl, volatility=volatility, action=action, details=details)
         record_agent_event(
@@ -721,7 +834,7 @@ class RiskManagerAgent:
             "risk_check",
             details,
             decision,
-            {"pnl": pnl, "volatility": volatility, "action": action},
+            {"pnl": pnl, "volatility": volatility, "action": action, "news_context": news_context},
         )
         return {"action": action, "details": details, "decision": decision}
 
@@ -764,7 +877,12 @@ class ExecutionAgent:
         return trade
 
 
-async def run_trading_cycle() -> Dict[str, Any]:
+async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]:
+    ai_enabled = get_ai_research_enabled() if use_openai is None else use_openai
+    ai_researcher = (
+        OpenAIResearchAdapter(IntegrationSettings.from_environment())
+        if ai_enabled else None
+    )
     researcher = ResearcherAgent()
     strategist = StrategistAgent()
     risk_manager = RiskManagerAgent()
@@ -776,18 +894,52 @@ async def run_trading_cycle() -> Dict[str, Any]:
     record_agent_event("execution", "running", "start_cycle", "Starting execution review.", "pending", {})
 
     market_data = await researcher.run_data_fetch()
+    recent_news = get_news_articles(limit=50)
+    market_data["recent_news"] = recent_news
+    market_data["ai_research_enabled"] = ai_enabled
     candidates = [market_data["tech_data"], market_data["energy_data"]]
     cycle_trades: List[Dict[str, Any]] = []
 
     for candidate in candidates:
-        signal_decision = "accepted" if candidate["confidence"] >= float(
+        related_news = [article for article in recent_news if article["ticker"] == candidate["ticker"]]
+        if not related_news:
+            related_news = recent_news[:3]
+        ai_analysis = None
+        if ai_researcher:
+            ai_analysis = await ai_researcher.research(
+                {
+                    "company_name": candidate["company_name"],
+                    "ticker": candidate["ticker"],
+                    "sector": candidate["sector"],
+                    "dummy_signal": candidate["signal"],
+                    "dummy_confidence": candidate["confidence"],
+                    "background": candidate["notes"],
+                    "headlines": related_news,
+                }
+            )
+            candidate = {
+                **candidate,
+                "signal": ai_analysis["signal"],
+                "confidence": ai_analysis["confidence"],
+                "catalyst": ai_analysis["catalyst"],
+                "notes": ai_analysis["summary"],
+                "ai_analysis": ai_analysis,
+            }
+
+        signal_decision = "accepted" if candidate["signal"] != "neutral" and candidate["confidence"] >= float(
             get_agent_rules()["researcher"].get("min_confidence", 0.6)
         ) else "rejected"
-        inferred_side = "LONG" if candidate["signal"] == "bullish" else "SHORT"
+        if ai_analysis:
+            record_agent_event(
+                "researcher", "completed", "openai_research",
+                f"OpenAI returned {candidate['signal']} at {candidate['confidence']:.0%} confidence for {candidate['ticker']}.",
+                signal_decision, ai_analysis,
+            )
+        inferred_side = "LONG" if candidate["signal"] == "bullish" else "SHORT" if candidate["signal"] == "bearish" else "HOLD"
         entry_price = float(candidate["price"])
         protection_pct = float(get_agent_rules()["risk_manager"].get("stop_loss_pct", 0.02))
-        initial_exit_target = 1.05 if inferred_side == "LONG" else 0.95
-        stop_loss_price = entry_price * (1 - protection_pct if inferred_side == "LONG" else 1 + protection_pct)
+        initial_exit_target = 1.05 if inferred_side == "LONG" else 0.95 if inferred_side == "SHORT" else 1.0
+        stop_loss_price = entry_price * (1 - protection_pct if inferred_side == "LONG" else 1 + protection_pct if inferred_side == "SHORT" else 1.0)
         take_profit_price = entry_price * initial_exit_target
         trade_id = save_trade(
             symbol=candidate["ticker"], side=inferred_side, leverage=1.0, exit_target=initial_exit_target,
@@ -798,7 +950,7 @@ async def run_trading_cycle() -> Dict[str, Any]:
         record_trade_event(
             trade_id, "research", "researcher", "completed", signal_decision,
             f"{candidate['company_name']} ({candidate['ticker']}): {candidate['signal']} research at {candidate['confidence']:.0%} confidence. Initial stop loss {stop_loss_price:.4f}; take-profit {take_profit_price:.4f}.",
-            candidate,
+            {**candidate, "related_news": related_news, "ai_analysis": ai_analysis},
         )
 
         trade_result: Dict[str, Any] = {"trade_id": trade_id, "symbol": candidate["ticker"], "status": "REJECTED_RESEARCH"}
@@ -810,11 +962,15 @@ async def run_trading_cycle() -> Dict[str, Any]:
             cycle_trades.append(trade_result)
             continue
 
-        candidate_market = {"tech_data": candidate, "energy_data": candidate}
+        candidate_market = {
+            "tech_data": {**candidate, "related_news": related_news},
+            "energy_data": {**candidate, "related_news": related_news},
+            "recent_news": related_news,
+        }
         strategy = strategist.analyze_and_decide(candidate_market)
         strategy_decision = "accepted" if candidate["confidence"] >= float(
             get_agent_rules()["strategist"].get("min_confidence", 0.7)
-        ) else "rejected"
+        ) and strategy["position"] in {"LONG", "SHORT"} else "rejected"
         record_trade_event(
             trade_id, "strategy", "strategist", "completed", strategy_decision,
             f"Strategy recommends {strategy['position']} {candidate['company_name']} ({candidate['ticker']}) at {strategy['leverage']}x. Stop loss {stop_loss_price:.4f}; take-profit {take_profit_price:.4f}.",
@@ -883,13 +1039,23 @@ async def run_trading_cycle() -> Dict[str, Any]:
         trade_result.update({"status": "OPEN" if execution_decision == "accepted" else "REJECTED_EXECUTION", "allocated_capital": allocation if execution_decision == "accepted" else 0})
         cycle_trades.append(trade_result)
 
-    return {"market_data": market_data, "trades": cycle_trades, "agent_summary": get_agent_summary()}
+    return {
+        "market_data": market_data,
+        "trades": cycle_trades,
+        "agent_summary": get_agent_summary(),
+        "ai_research_enabled": ai_enabled,
+    }
 
 
 async def main() -> None:
     ensure_db()
-    result = await run_trading_cycle()
-    logger.info("Trading cycle complete: %s", json.dumps(result, sort_keys=True))
+    settings = IntegrationSettings.from_environment()
+    logger.info("Starting hourly news polling every %d seconds", settings.news_interval_seconds)
+    while True:
+        started = time.monotonic()
+        await run_hourly_news_fetch()
+        elapsed = time.monotonic() - started
+        await asyncio.sleep(max(1, settings.news_interval_seconds - elapsed))
 
 
 if __name__ == "__main__":

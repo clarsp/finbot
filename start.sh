@@ -3,11 +3,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-if [ -f .env ]; then
-  set -a
-  source .env
-  set +a
-fi
+set -a
+for env_file in .env .env.config; do
+  if [ -f "$env_file" ]; then
+    source "$env_file"
+  fi
+done
+set +a
 
 if [ ! -d .venv ]; then
   echo "Creating virtual environment..."
@@ -16,7 +18,7 @@ fi
 
 source .venv/bin/activate
 python -m pip install --upgrade pip >/dev/null 2>&1 || true
-python -m pip install -r requirements.txt >/dev/null 2>&1 || true
+python -m pip install -r requirements.txt
 
 export FINBOT_USERNAME="${FINBOT_USERNAME:-admin}"
 export FINBOT_PASSWORD="${FINBOT_PASSWORD:-admin123}"

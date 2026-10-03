@@ -3,7 +3,7 @@ import html
 import importlib
 import inspect
 import os
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict
 
 import extra_streamlit_components as stx
@@ -18,11 +18,14 @@ from makemoney import (
     authenticate_user,
     close_paper_trade,
     create_session_token,
+    get_ai_research_enabled,
     get_dashboard_summary,
     get_portfolio_summary,
     revoke_session_token,
+    run_hourly_news_fetch,
     run_trading_cycle,
     set_starting_capital,
+    set_ai_research_enabled,
     update_agent_rules,
     validate_session_token,
 )
@@ -231,16 +234,24 @@ def render_portfolio(summary: Dict[str, Any]) -> None:
             st.caption("No open positions yet.")
     with trend_col:
         st.markdown("#### Decisions over time")
-        events = [event for trade in summary["trades"] for event in trade["events"]]
+        events = [
+            event for event in summary.get("decision_timeline", [])
+            if event["decision"] in {"accepted", "rejected"}
+        ]
         if events:
             event_frame = pd.DataFrame(events)
             event_frame["created_at"] = pd.to_datetime(event_frame["created_at"])
-            event_frame["accepted"] = (event_frame["decision"] == "accepted").astype(int)
-            event_frame["rejected"] = (event_frame["decision"] == "rejected").astype(int)
-            trend = event_frame.groupby(pd.Grouper(key="created_at", freq="15min"))[["accepted", "rejected"]].sum()
-            st.line_chart(trend, color=["#22c55e", "#ef4444"])
+            event_frame["count"] = 1
+            trend = (
+                event_frame.groupby([pd.Grouper(key="created_at", freq="15min"), "agent_name"])["count"]
+                .sum()
+                .unstack("agent_name", fill_value=0)
+                .reindex(columns=["researcher", "strategist", "risk_manager", "execution"], fill_value=0)
+            )
+            trend.columns = ["Researcher", "Strategist", "Risk Manager", "Execution"]
+            st.line_chart(trend, color=["#38bdf8", "#f59e0b", "#a78bfa", "#22c55e"])
         else:
-            st.caption("Decision history will appear after the first research cycle.")
+            st.caption("Agent decision history will appear after the first research cycle.")
 
 
 def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
@@ -297,44 +308,54 @@ def render_summary(summary: Dict[str, Any]) -> None:
     render_portfolio(summary)
     render_agent_cards(summary["agents"])
 
-    with st.expander("Latest research signal", expanded=False):
-        if summary["latest_signal"]:
-            st.json(summary["latest_signal"])
-        else:
-            st.caption("No market signals yet.")
+    st.subheader("Research headlines")
+    if summary.get("news"):
+        headlines = pd.DataFrame(summary["news"])
+        visible_columns = ["title", "ticker", "source", "published_at", "url"]
+        st.dataframe(
+            headlines[visible_columns],
+            hide_index=True,
+            use_container_width=True,
+            column_config={"url": st.column_config.LinkColumn("Article")},
+        )
+    else:
+        st.info("No dynamic headlines in this range yet. The backend checks Yahoo Finance hourly; dummy research data remains available.")
 
 
 def render_time_range() -> tuple[str, str]:
     now = datetime.now().replace(second=0, microsecond=0)
     default_start = now - timedelta(days=30)
-    st.subheader("Dashboard time range")
-    with st.form("dashboard_time_range"):
-        start_col, end_col, apply_col = st.columns([2, 2, 1])
-        with start_col:
-            st.markdown("**From**")
-            start_date = st.date_input("Start date", value=default_start.date(), key="range_start_date")
-            start_time = st.time_input("Start time", value=time(0, 0), key="range_start_time")
-        with end_col:
-            st.markdown("**To**")
-            end_date = st.date_input("End date", value=now.date(), key="range_end_date")
-            end_time = st.time_input("End time", value=now.time(), key="range_end_time")
-        with apply_col:
-            st.markdown("&nbsp;", unsafe_allow_html=True)
-            apply_range = st.form_submit_button("Apply range", type="primary")
+    selected_start = st.session_state.get("dashboard_range_start", default_start)
+    selected_end = st.session_state.get("dashboard_range_end", now)
+    range_label = (
+        f"Time range · {selected_start:%b %d %H:%M} – {selected_end:%b %d %H:%M}"
+    )
+    with st.expander(range_label, expanded=False):
+        with st.form("dashboard_time_range"):
+            start_col, end_col, apply_col = st.columns([2, 2, 1])
+            with start_col:
+                start_date = st.date_input("From date", value=selected_start.date(), key="range_start_date")
+                start_time = st.time_input("From time", value=selected_start.time(), key="range_start_time")
+            with end_col:
+                end_date = st.date_input("To date", value=selected_end.date(), key="range_end_date")
+                end_time = st.time_input("To time", value=selected_end.time(), key="range_end_time")
+            with apply_col:
+                apply_range = st.form_submit_button("Apply", type="primary")
 
-    selected_start = datetime.combine(start_date, start_time)
-    selected_end = datetime.combine(end_date, end_time)
-    if selected_start > selected_end:
-        st.error("The start time must be earlier than the end time.")
-        selected_start = default_start
-        selected_end = now
-    if apply_range:
-        st.session_state["dashboard_range_start"] = selected_start
-        st.session_state["dashboard_range_end"] = selected_end
+        if "start_date" in locals():
+            candidate_start = datetime.combine(start_date, start_time)
+            candidate_end = datetime.combine(end_date, end_time)
+            if candidate_start > candidate_end:
+                st.error("Start must be earlier than end.")
+            elif apply_range:
+                st.session_state["dashboard_range_start"] = candidate_start
+                st.session_state["dashboard_range_end"] = candidate_end
+                selected_start = candidate_start
+                selected_end = candidate_end
 
-    selected_start = st.session_state.get("dashboard_range_start", selected_start)
-    selected_end = st.session_state.get("dashboard_range_end", selected_end)
-    return selected_start.strftime("%Y-%m-%d %H:%M:%S"), selected_end.strftime("%Y-%m-%d %H:%M:%S")
+    start_utc = selected_start.astimezone(timezone.utc)
+    end_utc = selected_end.astimezone(timezone.utc)
+    return start_utc.strftime("%Y-%m-%d %H:%M:%S"), end_utc.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def render_trade_search(trades: list[Dict[str, Any]]) -> None:
@@ -369,10 +390,19 @@ def refresh_stale_backend_import() -> None:
     for name in (
         "DEFAULT_AGENT_RULES", "add_user", "ensure_db", "authenticate_user",
         "close_paper_trade", "create_session_token", "get_dashboard_summary",
-        "get_portfolio_summary", "revoke_session_token", "run_trading_cycle",
+        "get_ai_research_enabled", "get_portfolio_summary", "revoke_session_token",
+        "run_hourly_news_fetch", "run_trading_cycle", "set_ai_research_enabled",
         "set_starting_capital", "update_agent_rules", "validate_session_token",
     ):
         globals()[name] = getattr(refreshed, name)
+
+
+def run_agent_cycle_for_ui() -> Dict[str, Any] | None:
+    try:
+        return asyncio.run(run_trading_cycle())
+    except Exception as error:
+        st.session_state["manual_research_error"] = str(error)
+        return None
 
 
 def main() -> None:
@@ -415,15 +445,68 @@ def main() -> None:
             except ValueError as error:
                 st.error(str(error))
 
+    with st.sidebar.expander("AI research settings", expanded=False):
+        ai_enabled = get_ai_research_enabled()
+        with st.form("ai_research_settings"):
+            requested_ai_enabled = st.checkbox(
+                "Use OpenAI to analyze research",
+                value=ai_enabled,
+                help="When enabled, the selected dummy signal and recent headlines are sent to the configured OpenAI-compatible endpoint.",
+            )
+            st.caption("Disabled uses the existing dummy research signal. Risk and execution gates remain deterministic.")
+            if st.form_submit_button("Save AI setting"):
+                try:
+                    set_ai_research_enabled(requested_ai_enabled)
+                    st.rerun()
+                except ValueError as error:
+                    st.error(str(error))
+
     st.title("Trading Monitor")
     st.caption("Paper portfolio · simulated research and execution · no live brokerage orders")
     start_at, end_at = render_time_range()
 
-    if st.sidebar.button("Run research cycle", type="primary"):
-        asyncio.run(run_trading_cycle())
-        st.rerun()
+    with st.sidebar.expander("Manual research actions", expanded=False):
+        if st.button("Fetch news only", key="manual_fetch_news"):
+            with st.spinner("Fetching screened Yahoo Finance headlines..."):
+                news_result = asyncio.run(run_hourly_news_fetch())
+            st.session_state["manual_research_result"] = {"news": news_result, "cycle": None}
+            st.rerun()
+
+        if st.button("Run agent analysis", key="manual_agent_analysis"):
+            with st.spinner("Running researcher, strategist, risk, and execution rules..."):
+                cycle_result = run_agent_cycle_for_ui()
+            if cycle_result:
+                st.session_state["manual_research_result"] = {"news": None, "cycle": cycle_result}
+            st.rerun()
+
+        if st.button("Fetch news + analyze", type="primary", key="manual_fetch_and_analyze"):
+            with st.spinner("Fetching news and running the agent cycle..."):
+                news_result = asyncio.run(run_hourly_news_fetch())
+                cycle_result = run_agent_cycle_for_ui()
+            st.session_state["manual_research_result"] = {"news": news_result, "cycle": cycle_result}
+            st.rerun()
 
     summary = get_dashboard_summary(start_at, end_at)
+
+    manual_result = st.session_state.pop("manual_research_result", None)
+    manual_error = st.session_state.pop("manual_research_error", None)
+    if manual_error:
+        st.error(f"Agent analysis failed: {manual_error}")
+    if manual_result:
+        with st.expander("Latest manual research run", expanded=True):
+            news_result = manual_result["news"]
+            cycle_result = manual_result["cycle"]
+            if news_result is not None:
+                st.write(
+                    f"News fetch: {news_result['fetched']} headlines received, "
+                    f"{news_result['inserted']} new articles stored."
+                )
+            if cycle_result:
+                headlines = cycle_result["market_data"].get("recent_news", [])
+                st.write(f"Analysis received {len(headlines)} stored headlines as context.")
+                research_mode = "OpenAI research" if cycle_result["ai_research_enabled"] else "Dummy research"
+                st.write(f"Research mode: {research_mode}")
+                st.dataframe(pd.DataFrame(cycle_result["trades"]), hide_index=True, use_container_width=True)
 
     st.sidebar.subheader("Agent rule editor")
     for agent_name, default_rules in DEFAULT_AGENT_RULES.items():
