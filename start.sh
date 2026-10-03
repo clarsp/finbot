@@ -3,6 +3,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+if [ -f .env ]; then
+  set -a
+  source .env
+  set +a
+fi
+
 if [ ! -d .venv ]; then
   echo "Creating virtual environment..."
   python3 -m venv .venv

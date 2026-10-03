@@ -22,8 +22,20 @@ SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
     "researcher": {"enabled": True, "status": "idle", "min_confidence": 0.6, "allowed_sectors": ["Technology", "Energy"], "max_fetch_per_cycle": 2},
     "strategist": {"enabled": True, "status": "idle", "min_confidence": 0.7, "max_leverage": 3.0, "position_limit": 0.35},
-    "risk_manager": {"enabled": True, "status": "idle", "max_drawdown": 0.05, "max_volatility": 0.03, "exit_on_risk_breach": True},
+    "risk_manager": {"enabled": True, "status": "idle", "max_drawdown": 0.05, "max_volatility": 0.03, "exit_on_risk_breach": True, "stop_loss_pct": 0.02},
     "execution": {"enabled": True, "status": "idle", "paper_trading_only": True, "max_trade_value": 2500, "allowed_side": ["LONG", "SHORT"]},
+}
+
+INSTRUMENT_NAMES = {
+    "AAPL": "Apple Inc.",
+    "AMD": "Advanced Micro Devices, Inc.",
+    "CL": "WTI Crude Oil Futures",
+    "META": "Meta Platforms, Inc.",
+    "MSFT": "Microsoft Corporation",
+    "NVDA": "NVIDIA Corporation",
+    "USOIL": "WTI Crude Oil",
+    "XLE": "Energy Select Sector SPDR Fund",
+    "XOM": "Exxon Mobil Corporation",
 }
 
 
@@ -57,7 +69,7 @@ def ensure_db() -> None:
         """
         CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, sector TEXT NOT NULL, signal TEXT NOT NULL, catalyst TEXT NOT NULL, confidence REAL NOT NULL, payload TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, symbol TEXT NOT NULL, side TEXT NOT NULL, leverage REAL NOT NULL, exit_target REAL NOT NULL, status TEXT NOT NULL, notes TEXT, allocated_capital REAL NOT NULL DEFAULT 0, entry_price REAL, current_price REAL, quantity REAL NOT NULL DEFAULT 0, realized_pnl REAL NOT NULL DEFAULT 0, closed_at TEXT);
+        CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, symbol TEXT NOT NULL, side TEXT NOT NULL, leverage REAL NOT NULL, exit_target REAL NOT NULL, status TEXT NOT NULL, notes TEXT, allocated_capital REAL NOT NULL DEFAULT 0, entry_price REAL, current_price REAL, quantity REAL NOT NULL DEFAULT 0, realized_pnl REAL NOT NULL DEFAULT 0, closed_at TEXT, company_name TEXT NOT NULL DEFAULT '', stop_loss_price REAL, take_profit_price REAL);
         CREATE TABLE IF NOT EXISTS trade_events (id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER NOT NULL REFERENCES trades(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, stage TEXT NOT NULL, agent_name TEXT NOT NULL, status TEXT NOT NULL, decision TEXT NOT NULL, message TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS risk_events (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, pnl REAL NOT NULL, volatility REAL NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS agent_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_name TEXT NOT NULL UNIQUE, rules_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -71,11 +83,16 @@ def ensure_db() -> None:
     for column, definition in {
         "allocated_capital": "REAL NOT NULL DEFAULT 0", "entry_price": "REAL", "current_price": "REAL",
         "quantity": "REAL NOT NULL DEFAULT 0", "realized_pnl": "REAL NOT NULL DEFAULT 0", "closed_at": "TEXT",
+        "company_name": "TEXT NOT NULL DEFAULT ''", "stop_loss_price": "REAL", "take_profit_price": "REAL",
     }.items():
         if column not in existing_columns:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {definition}")
 
-    conn.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('starting_capital', '10000')")
+    starting_capital = float(os.getenv("FINBOT_STARTING_CAPITAL", "10000"))
+    conn.execute(
+        "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('starting_capital', ?)",
+        (str(starting_capital),),
+    )
     conn.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('auth_signing_key', ?)", (secrets.token_urlsafe(48),))
     user_count = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
     if user_count == 0:
@@ -84,10 +101,23 @@ def ensure_db() -> None:
             (os.getenv("FINBOT_USERNAME", "admin"), hash_password(os.getenv("FINBOT_PASSWORD", "admin123"))),
         )
     for agent_name, rules in DEFAULT_AGENT_RULES.items():
-        conn.execute(
-            "INSERT OR IGNORE INTO agent_rules (agent_name, rules_json) VALUES (?, ?)",
-            (agent_name, json.dumps(rules, sort_keys=True)),
-        )
+        existing = conn.execute(
+            "SELECT rules_json FROM agent_rules WHERE agent_name = ?",
+            (agent_name,),
+        ).fetchone()
+        if not existing:
+            conn.execute(
+                "INSERT INTO agent_rules (agent_name, rules_json) VALUES (?, ?)",
+                (agent_name, json.dumps(rules, sort_keys=True)),
+            )
+        else:
+            saved_rules = json.loads(existing["rules_json"])
+            merged_rules = {**rules, **saved_rules}
+            if merged_rules != saved_rules:
+                conn.execute(
+                    "UPDATE agent_rules SET rules_json = ?, updated_at = CURRENT_TIMESTAMP WHERE agent_name = ?",
+                    (json.dumps(merged_rules, sort_keys=True), agent_name),
+                )
     conn.commit()
     conn.close()
 
@@ -208,21 +238,33 @@ def record_agent_event(
     conn.close()
 
 
-def get_agent_summary() -> List[Dict[str, Any]]:
+def get_agent_summary(start_at: Optional[str] = None, end_at: Optional[str] = None) -> List[Dict[str, Any]]:
     conn = get_connection()
     rules_map = {
         row["agent_name"]: json.loads(row["rules_json"])
         for row in conn.execute("SELECT agent_name, rules_json FROM agent_rules").fetchall()
     }
 
+    conditions = []
+    parameters: List[str] = []
+    if start_at:
+        conditions.append("created_at >= ?")
+        parameters.append(start_at)
+    if end_at:
+        conditions.append("created_at <= ?")
+        parameters.append(end_at)
+    event_where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
     counters = conn.execute(
-        """
+        f"""
         SELECT agent_name,
                SUM(CASE WHEN decision = 'accepted' THEN 1 ELSE 0 END) AS accepted_count,
                SUM(CASE WHEN decision = 'rejected' THEN 1 ELSE 0 END) AS rejected_count
         FROM agent_events
+        {event_where}
         GROUP BY agent_name
-        """
+        """,
+        parameters,
     ).fetchall()
     counts = {
         row["agent_name"]: {
@@ -233,13 +275,14 @@ def get_agent_summary() -> List[Dict[str, Any]]:
     }
 
     latest_events = conn.execute(
-        """
+        f"""
         SELECT agent_name, status, action, message, decision, details
         FROM agent_events
         WHERE id IN (
-            SELECT MAX(id) FROM agent_events GROUP BY agent_name
+            SELECT MAX(id) FROM agent_events {event_where} GROUP BY agent_name
         )
-        """
+        """,
+        parameters,
     ).fetchall()
     latest_map = {row["agent_name"]: dict(row) for row in latest_events}
     conn.close()
@@ -375,39 +418,75 @@ def set_starting_capital(amount: float) -> None:
     if amount <= 0:
         raise ValueError("Starting capital must be greater than zero.")
     conn = get_connection()
+    invested = conn.execute(
+        "SELECT COALESCE(SUM(allocated_capital), 0) AS amount FROM trades WHERE status = 'OPEN'"
+    ).fetchone()["amount"]
+    if amount < float(invested):
+        conn.close()
+        raise ValueError("Starting capital cannot be lower than capital allocated to open positions.")
     conn.execute("UPDATE app_settings SET value = ? WHERE key = 'starting_capital'", (str(float(amount)),))
     conn.commit()
     conn.close()
 
 
-def get_portfolio_summary() -> Dict[str, float]:
+def get_portfolio_summary(as_of: Optional[str] = None) -> Dict[str, float]:
     conn = get_connection()
     starting = float(conn.execute("SELECT value FROM app_settings WHERE key = 'starting_capital'").fetchone()["value"])
-    open_positions = conn.execute(
-        "SELECT COALESCE(SUM(allocated_capital), 0) AS invested FROM trades WHERE status = 'OPEN'"
-    ).fetchone()["invested"]
-    realized = conn.execute("SELECT COALESCE(SUM(realized_pnl), 0) AS pnl FROM trades WHERE status = 'CLOSED'").fetchone()["pnl"]
+    if as_of:
+        open_clause = "created_at <= ? AND (status = 'OPEN' OR (status = 'CLOSED' AND closed_at > ?))"
+        position_params = (as_of, as_of)
+        realized_clause = "status = 'CLOSED' AND closed_at <= ?"
+        realized_params = (as_of,)
+    else:
+        open_clause = "status = 'OPEN'"
+        position_params = ()
+        realized_clause = "status = 'CLOSED'"
+        realized_params = ()
+    positions = conn.execute(
+        f"SELECT COALESCE(SUM(allocated_capital), 0) AS invested, COALESCE(SUM(allocated_capital * leverage), 0) AS gross_exposure FROM trades WHERE {open_clause}",
+        position_params,
+    ).fetchone()
+    realized = conn.execute(
+        f"SELECT COALESCE(SUM(realized_pnl), 0) AS pnl FROM trades WHERE {realized_clause}",
+        realized_params,
+    ).fetchone()["pnl"]
     conn.close()
-    invested = float(open_positions or 0)
+    invested = float(positions["invested"] or 0)
+    gross_exposure = float(positions["gross_exposure"] or 0)
     realized = float(realized or 0)
     return {
         "starting_capital": starting,
         "cash_available": starting - invested + realized,
         "invested_capital": invested,
+        "gross_exposure": gross_exposure,
         "realized_pnl": realized,
         "account_equity": starting + realized,
     }
 
 
-def get_trade_history() -> List[Dict[str, Any]]:
+def get_trade_history(start_at: Optional[str] = None, end_at: Optional[str] = None) -> List[Dict[str, Any]]:
     conn = get_connection()
-    trades = conn.execute("SELECT * FROM trades ORDER BY id DESC").fetchall()
+    conditions = []
+    parameters: List[str] = []
+    if start_at:
+        conditions.append("created_at >= ?")
+        parameters.append(start_at)
+    if end_at:
+        conditions.append("created_at <= ?")
+        parameters.append(end_at)
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    trades = conn.execute(f"SELECT * FROM trades {where_clause} ORDER BY id DESC", parameters).fetchall()
     result = []
     for trade in trades:
         item = dict(trade)
+        item["company_name"] = item.get("company_name") or INSTRUMENT_NAMES.get(item["symbol"], item["symbol"])
+        event_clause = " AND created_at <= ?" if end_at else ""
         item["events"] = [
             {**dict(event), "details": json.loads(event["details"])}
-            for event in conn.execute("SELECT * FROM trade_events WHERE trade_id = ? ORDER BY id", (trade["id"],))
+            for event in conn.execute(
+                f"SELECT * FROM trade_events WHERE trade_id = ?{event_clause} ORDER BY id",
+                (trade["id"], end_at) if end_at else (trade["id"],),
+            )
         ]
         result.append(item)
     conn.close()
@@ -445,14 +524,30 @@ def save_signal(sector: str, signal: str, catalyst: str, confidence: float, payl
     conn.close()
 
 
-def save_trade(symbol: str, side: str, leverage: float, exit_target: float, status: str, notes: Optional[str] = None) -> None:
+def save_trade(
+    symbol: str,
+    side: str,
+    leverage: float,
+    exit_target: float,
+    status: str,
+    notes: Optional[str] = None,
+    allocated_capital: float = 0,
+    entry_price: Optional[float] = None,
+    current_price: Optional[float] = None,
+    quantity: float = 0,
+    company_name: str = "",
+    stop_loss_price: Optional[float] = None,
+    take_profit_price: Optional[float] = None,
+) -> int:
     conn = get_connection()
-    conn.execute(
-        "INSERT INTO trades (symbol, side, leverage, exit_target, status, notes) VALUES (?, ?, ?, ?, ?, ?)",
-        (symbol, side, leverage, exit_target, status, notes),
+    cursor = conn.execute(
+        "INSERT INTO trades (symbol, side, leverage, exit_target, status, notes, allocated_capital, entry_price, current_price, quantity, company_name, stop_loss_price, take_profit_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (symbol, side, leverage, exit_target, status, notes, allocated_capital, entry_price, current_price, quantity, company_name, stop_loss_price, take_profit_price),
     )
     conn.commit()
+    trade_id = int(cursor.lastrowid)
     conn.close()
+    return trade_id
 
 
 def save_risk_event(pnl: float, volatility: float, action: str, details: str) -> None:
@@ -465,45 +560,61 @@ def save_risk_event(pnl: float, volatility: float, action: str, details: str) ->
     conn.close()
 
 
-def get_dashboard_summary() -> Dict[str, Any]:
+def get_dashboard_summary(start_at: Optional[str] = None, end_at: Optional[str] = None) -> Dict[str, Any]:
     conn = get_connection()
+    conditions = []
+    parameters: List[str] = []
+    if start_at:
+        conditions.append("created_at >= ?")
+        parameters.append(start_at)
+    if end_at:
+        conditions.append("created_at <= ?")
+        parameters.append(end_at)
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     latest_signal = conn.execute(
-        "SELECT sector, signal, catalyst, confidence, payload, created_at FROM signals ORDER BY id DESC LIMIT 1"
+        f"SELECT sector, signal, catalyst, confidence, payload, created_at FROM signals {where_clause} ORDER BY id DESC LIMIT 1",
+        parameters,
     ).fetchone()
     latest_trade = conn.execute(
-        "SELECT symbol, side, leverage, exit_target, status, notes, created_at FROM trades ORDER BY id DESC LIMIT 1"
+        f"SELECT symbol, side, leverage, exit_target, status, notes, created_at FROM trades {where_clause} ORDER BY id DESC LIMIT 1",
+        parameters,
     ).fetchone()
     risk_events = conn.execute(
-        "SELECT pnl, volatility, action, details, created_at FROM risk_events ORDER BY id DESC LIMIT 5"
+        f"SELECT pnl, volatility, action, details, created_at FROM risk_events {where_clause} ORDER BY id DESC LIMIT 5",
+        parameters,
     ).fetchall()
-    agent_summary = get_agent_summary()
     conn.close()
+    agent_summary = get_agent_summary(start_at, end_at)
 
     return {
         "latest_signal": dict(latest_signal) if latest_signal else None,
         "latest_trade": dict(latest_trade) if latest_trade else None,
         "risk_events": [dict(row) for row in risk_events],
         "agents": agent_summary,
+        "portfolio": get_portfolio_summary(end_at),
+        "trades": get_trade_history(start_at, end_at),
     }
 
 
 class ResearcherAgent:
-    def __init__(self) -> None:
-        self._feed_index = 0
-
     def _next_payload_for_sector(self, sector: str) -> Dict[str, Any]:
         feed = load_research_feed()
         candidates = [item for item in feed if item.get("sector") == sector]
         if not candidates:
             candidates = feed
-        selected = candidates[self._feed_index % len(candidates)]
-        self._feed_index += 1
+        conn = get_connection()
+        fetch_count = conn.execute("SELECT COUNT(*) AS count FROM signals WHERE sector = ?", (sector,)).fetchone()["count"]
+        conn.close()
+        selected = candidates[int(fetch_count) % len(candidates)]
+        ticker = selected.get("ticker", "UNKNOWN")
         return {
             "sector": selected.get("sector", sector),
             "signal": selected.get("signal", "neutral"),
             "catalyst": selected.get("catalyst", "macro"),
             "confidence": float(selected.get("confidence", 0.5)),
-            "ticker": selected.get("ticker", "UNKNOWN"),
+            "ticker": ticker,
+            "company_name": selected.get("company_name", INSTRUMENT_NAMES.get(ticker, ticker)),
+            "price": float(selected.get("price", 100.0)),
             "notes": selected.get("notes", "No notes supplied."),
             "timestamp": selected.get("timestamp", "2026-10-03T00:00:00Z"),
         }
@@ -665,20 +776,114 @@ async def run_trading_cycle() -> Dict[str, Any]:
     record_agent_event("execution", "running", "start_cycle", "Starting execution review.", "pending", {})
 
     market_data = await researcher.run_data_fetch()
-    strategy_signal = strategist.analyze_and_decide(market_data)
+    candidates = [market_data["tech_data"], market_data["energy_data"]]
+    cycle_trades: List[Dict[str, Any]] = []
 
-    pnl = 0.03
-    volatility = 0.018
-    risk_decision = risk_manager.check_risk(pnl, volatility, strategy_signal)
-    trade = execution.place_trade(strategy_signal, pnl=pnl, volatility=volatility)
+    for candidate in candidates:
+        signal_decision = "accepted" if candidate["confidence"] >= float(
+            get_agent_rules()["researcher"].get("min_confidence", 0.6)
+        ) else "rejected"
+        inferred_side = "LONG" if candidate["signal"] == "bullish" else "SHORT"
+        entry_price = float(candidate["price"])
+        protection_pct = float(get_agent_rules()["risk_manager"].get("stop_loss_pct", 0.02))
+        initial_exit_target = 1.05 if inferred_side == "LONG" else 0.95
+        stop_loss_price = entry_price * (1 - protection_pct if inferred_side == "LONG" else 1 + protection_pct)
+        take_profit_price = entry_price * initial_exit_target
+        trade_id = save_trade(
+            symbol=candidate["ticker"], side=inferred_side, leverage=1.0, exit_target=initial_exit_target,
+            status="RESEARCHED", notes=candidate["notes"], entry_price=entry_price,
+            company_name=candidate["company_name"], stop_loss_price=stop_loss_price,
+            take_profit_price=take_profit_price,
+        )
+        record_trade_event(
+            trade_id, "research", "researcher", "completed", signal_decision,
+            f"{candidate['company_name']} ({candidate['ticker']}): {candidate['signal']} research at {candidate['confidence']:.0%} confidence. Initial stop loss {stop_loss_price:.4f}; take-profit {take_profit_price:.4f}.",
+            candidate,
+        )
 
-    return {
-        "market_data": market_data,
-        "strategy_signal": strategy_signal,
-        "risk_decision": risk_decision,
-        "trade": trade,
-        "agent_summary": get_agent_summary(),
-    }
+        trade_result: Dict[str, Any] = {"trade_id": trade_id, "symbol": candidate["ticker"], "status": "REJECTED_RESEARCH"}
+        if signal_decision != "accepted":
+            conn = get_connection()
+            conn.execute("UPDATE trades SET status = 'REJECTED_RESEARCH' WHERE id = ?", (trade_id,))
+            conn.commit()
+            conn.close()
+            cycle_trades.append(trade_result)
+            continue
+
+        candidate_market = {"tech_data": candidate, "energy_data": candidate}
+        strategy = strategist.analyze_and_decide(candidate_market)
+        strategy_decision = "accepted" if candidate["confidence"] >= float(
+            get_agent_rules()["strategist"].get("min_confidence", 0.7)
+        ) else "rejected"
+        record_trade_event(
+            trade_id, "strategy", "strategist", "completed", strategy_decision,
+            f"Strategy recommends {strategy['position']} {candidate['company_name']} ({candidate['ticker']}) at {strategy['leverage']}x. Stop loss {stop_loss_price:.4f}; take-profit {take_profit_price:.4f}.",
+            {**strategy, "stop_loss_price": stop_loss_price, "take_profit_price": take_profit_price},
+        )
+        trade_result["side"] = strategy["position"]
+        if strategy_decision != "accepted":
+            conn = get_connection()
+            conn.execute("UPDATE trades SET side = ?, status = 'REJECTED_STRATEGY' WHERE id = ?", (strategy["position"], trade_id))
+            conn.commit()
+            conn.close()
+            record_trade_event(trade_id, "risk", "risk_manager", "skipped", "pending", "Skipped because the strategist rejected this setup.")
+            record_trade_event(trade_id, "execution", "execution", "skipped", "pending", "No order submitted after strategy rejection.")
+            record_agent_event("risk_manager", "skipped", "risk_check", "Skipped after strategy rejection.", "pending", {})
+            record_agent_event("execution", "skipped", "trade_execution", "No order submitted after strategy rejection.", "pending", {})
+            trade_result["status"] = "REJECTED_STRATEGY"
+            cycle_trades.append(trade_result)
+            continue
+
+        risk = risk_manager.check_risk(pnl=0.0, volatility=0.018, strategy_signal=strategy)
+        record_trade_event(trade_id, "risk", "risk_manager", "completed", risk["decision"], risk["details"], risk)
+        trade_result["risk"] = risk
+        if risk["decision"] != "accepted":
+            conn = get_connection()
+            conn.execute("UPDATE trades SET side = ?, status = 'REJECTED_RISK' WHERE id = ?", (strategy["position"], trade_id))
+            conn.commit()
+            conn.close()
+            record_trade_event(trade_id, "execution", "execution", "skipped", "rejected", "Risk manager blocked execution.")
+            record_agent_event("execution", "skipped", "trade_execution", "Risk manager blocked execution.", "rejected", {})
+            trade_result["status"] = "REJECTED_RISK"
+            cycle_trades.append(trade_result)
+            continue
+
+        rules = get_agent_rules().get("execution", DEFAULT_AGENT_RULES["execution"])
+        portfolio = get_portfolio_summary()
+        allocation = min(
+            float(rules.get("max_trade_value", 2500)),
+            portfolio["cash_available"],
+            portfolio["starting_capital"] * float(get_agent_rules()["strategist"].get("position_limit", 0.35)),
+        )
+        execution_decision = "accepted"
+        if strategy["position"] not in rules.get("allowed_side", ["LONG", "SHORT"]):
+            execution_decision = "rejected"
+            execution_message = "Execution side is disabled by the current rules."
+        elif allocation <= 0:
+            execution_decision = "rejected"
+            execution_message = "Insufficient available cash for another paper position."
+        else:
+            execution_message = f"Paper position opened with {allocation:.2f} allocated to {candidate['ticker']}."
+
+        if execution_decision == "accepted":
+            conn = get_connection()
+            conn.execute(
+                "UPDATE trades SET side = ?, leverage = ?, exit_target = ?, status = 'OPEN', allocated_capital = ?, entry_price = ?, current_price = ?, quantity = ?, take_profit_price = ?, notes = ? WHERE id = ?",
+                (strategy["position"], strategy["leverage"], strategy["exit_target"], allocation, entry_price, entry_price, allocation * strategy["leverage"] / entry_price, entry_price * strategy["exit_target"], execution_message, trade_id),
+            )
+            conn.commit()
+            conn.close()
+        else:
+            conn = get_connection()
+            conn.execute("UPDATE trades SET side = ?, status = 'REJECTED_EXECUTION', notes = ? WHERE id = ?", (strategy["position"], execution_message, trade_id))
+            conn.commit()
+            conn.close()
+        record_trade_event(trade_id, "execution", "execution", "completed", execution_decision, f"{execution_message} Stop loss {stop_loss_price:.4f}; take-profit {entry_price * strategy['exit_target']:.4f}.", {"allocated_capital": allocation if execution_decision == "accepted" else 0, "paper_only": True, "stop_loss_price": stop_loss_price, "take_profit_price": entry_price * strategy["exit_target"]})
+        record_agent_event("execution", "completed", "trade_execution", execution_message, execution_decision, {"trade_id": trade_id, "symbol": candidate["ticker"]})
+        trade_result.update({"status": "OPEN" if execution_decision == "accepted" else "REJECTED_EXECUTION", "allocated_capital": allocation if execution_decision == "accepted" else 0})
+        cycle_trades.append(trade_result)
+
+    return {"market_data": market_data, "trades": cycle_trades, "agent_summary": get_agent_summary()}
 
 
 async def main() -> None:
