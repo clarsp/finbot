@@ -1,0 +1,92 @@
+[
+  {
+    "timestamp": "2026-10-03T08:00:00Z",
+    "sector": "Technology",
+    "signal": "bullish",
+    "catalyst": "earnings",
+    "confidence": 0.89,
+    "ticker": "AAPL",
+    "notes": "Strong earnings guidance and resilient cloud demand."
+  },
+  {
+    "timestamp": "2026-10-03T08:15:00Z",
+    "sector": "Energy",
+    "signal": "bearish",
+    "catalyst": "OPEC_supply",
+    "confidence": 0.72,
+    "ticker": "USOIL",
+    "notes": "Production discipline softened, but supply pressure remains elevated."
+  },
+  {
+    "timestamp": "2026-10-03T08:30:00Z",
+    "sector": "Technology",
+    "signal": "neutral",
+    "catalyst": "valuation",
+    "confidence": 0.46,
+    "ticker": "MSFT",
+    "notes": "Momentum remains positive but valuation compresses the setup."
+  },
+  {
+    "timestamp": "2026-10-03T08:45:00Z",
+    "sector": "Energy",
+    "signal": "bullish",
+    "catalyst": "macro_shift",
+    "confidence": 0.76,
+    "ticker": "XLE",
+    "notes": "Lower inventory and stable demand support energy strength."
+  },
+  {
+    "timestamp": "2026-10-03T09:00:00Z",
+    "sector": "Technology",
+    "signal": "bearish",
+    "catalyst": "guidance",
+    "confidence": 0.58,
+    "ticker": "NVDA",
+    "notes": "Margins are pressured, and guidance remains conservative."
+  },
+  {
+    "timestamp": "2026-10-03T09:15:00Z",
+    "sector": "Energy",
+    "signal": "bullish",
+    "catalyst": "commodity_strength",
+    "confidence": 0.83,
+    "ticker": "XOM",
+    "notes": "Commodity price support and improving refinery margins."
+  },
+  {
+    "timestamp": "2026-10-03T09:30:00Z",
+    "sector": "Technology",
+    "signal": "bullish",
+    "catalyst": "ai_adoption",
+    "confidence": 0.91,
+    "ticker": "AMD",
+    "notes": "AI infrastructure demand continues to accelerate the cycle."
+  },
+  {
+    "timestamp": "2026-10-03T09:45:00Z",
+    "sector": "Energy",
+    "signal": "neutral",
+    "catalyst": "inventory",
+    "confidence": 0.49,
+    "ticker": "USOIL",
+    "notes": "Inventories are mixed; no clear directional edge yet."
+  },
+  {
+    "timestamp": "2026-10-03T10:00:00Z",
+    "sector": "Technology",
+    "signal": "bearish",
+    "catalyst": "macro_slowdown",
+    "confidence": 0.61,
+    "ticker": "META",
+    "notes": "Ad revenue sensitivity and softening spend expectations."
+  },
+  {
+    "timestamp": "2026-10-03T10:15:00Z",
+    "sector": "Energy",
+    "signal": "bearish",
+    "catalyst": "demand_risk",
+    "confidence": 0.67,
+    "ticker": "CL",
+    "notes": "Demand slowdown concerns outweigh short-term supply support."
+  }
+]
