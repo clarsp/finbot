@@ -254,6 +254,53 @@ def render_portfolio(summary: Dict[str, Any]) -> None:
             st.caption("Agent decision history will appear after the first research cycle.")
 
 
+def render_event_evidence(event: Dict[str, Any]) -> None:
+    details = event.get("details") or {}
+    st.markdown(f"**Outcome: {event['decision'].title()}**")
+    st.write(event["message"])
+
+    decision_data = {
+        key: value for key, value in details.items()
+        if key not in {"related_news", "news_context", "ai_analysis"}
+    }
+    if decision_data:
+        st.markdown("**Analyzed values**")
+        st.json(decision_data)
+
+    headlines = details.get("related_news") or details.get("news_context") or []
+    if headlines:
+        st.markdown("**Headline input**")
+        headline_frame = pd.DataFrame([
+            {
+                "title": item.get("title", ""),
+                "ticker": item.get("ticker", ""),
+                "source": item.get("source", ""),
+                "published_at": item.get("published_at", ""),
+                "url": item.get("url", ""),
+            }
+            for item in headlines
+        ])
+        st.dataframe(
+            headline_frame,
+            hide_index=True,
+            use_container_width=True,
+            column_config={"url": st.column_config.LinkColumn("Article")},
+        )
+    elif event["agent_name"] in {"researcher", "strategist", "risk_manager"}:
+        st.caption("No stored headlines were attached to this decision.")
+
+    ai_analysis = details.get("ai_analysis")
+    if ai_analysis:
+        st.markdown("**OpenAI research response**")
+        st.write(ai_analysis.get("summary", "No summary returned."))
+        st.json({
+            key: ai_analysis.get(key)
+            for key in ("provider", "model", "signal", "confidence", "catalyst")
+        })
+    elif "ai_analysis" in details:
+        st.caption("OpenAI research was disabled for this cycle; the decision used the configured rules and dummy baseline.")
+
+
 def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
     st.subheader("Trade lifecycles")
     if not trades:
@@ -286,8 +333,14 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                     if index < len(events) - 1:
                         flow += '<div class="flow-arrow">→</div>'
                 st.markdown(f'<div class="flow-stream">{flow}</div>', unsafe_allow_html=True)
-                for event in events:
-                    st.caption(f"{event['created_at']} · {event['message']}")
+                evidence_tabs = st.tabs([
+                    f"{event['stage'].title()} · {event['decision'].title()}"
+                    for event in events
+                ])
+                for tab, event in zip(evidence_tabs, events):
+                    with tab:
+                        st.caption(event["created_at"])
+                        render_event_evidence(event)
             else:
                 st.caption("Trade has no recorded lifecycle events.")
 

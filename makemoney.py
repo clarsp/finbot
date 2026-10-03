@@ -796,6 +796,12 @@ class StrategistAgent:
             "leverage": leverage,
             "exit_target": exit_target,
             "assets": [tech_data.get("ticker", "AAPL"), energy_data.get("ticker", "USOIL")],
+            "research_input": {
+                "signal": tech_data.get("signal"),
+                "confidence": tech_data.get("confidence"),
+                "catalyst": tech_data.get("catalyst"),
+                "notes": tech_data.get("notes"),
+            },
             "news_context": recent_news,
             "ai_analysis": tech_data.get("ai_analysis"),
             "notes": f"Received {len(recent_news)} headlines; decision uses confidence and directional rules.",
@@ -834,9 +840,31 @@ class RiskManagerAgent:
             "risk_check",
             details,
             decision,
-            {"pnl": pnl, "volatility": volatility, "action": action, "news_context": news_context},
+            {
+                "pnl": pnl,
+                "volatility": volatility,
+                "action": action,
+                "max_drawdown": float(rules.get("max_drawdown", 0.05)),
+                "max_volatility": float(rules.get("max_volatility", 0.03)),
+                "exit_on_risk_breach": bool(rules.get("exit_on_risk_breach", True)),
+                "news_context": news_context,
+                "ai_analysis": strategy_signal.get("ai_analysis"),
+            },
         )
-        return {"action": action, "details": details, "decision": decision}
+        return {
+            "action": action,
+            "details": details,
+            "decision": decision,
+            "pnl": pnl,
+            "volatility": volatility,
+            "thresholds": {
+                "max_drawdown": float(rules.get("max_drawdown", 0.05)),
+                "max_volatility": float(rules.get("max_volatility", 0.03)),
+                "exit_on_risk_breach": bool(rules.get("exit_on_risk_breach", True)),
+            },
+            "news_context": news_context,
+            "ai_analysis": strategy_signal.get("ai_analysis"),
+        }
 
 
 class ExecutionAgent:
@@ -1034,7 +1062,21 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
             conn.execute("UPDATE trades SET side = ?, status = 'REJECTED_EXECUTION', notes = ? WHERE id = ?", (strategy["position"], execution_message, trade_id))
             conn.commit()
             conn.close()
-        record_trade_event(trade_id, "execution", "execution", "completed", execution_decision, f"{execution_message} Stop loss {stop_loss_price:.4f}; take-profit {entry_price * strategy['exit_target']:.4f}.", {"allocated_capital": allocation if execution_decision == "accepted" else 0, "paper_only": True, "stop_loss_price": stop_loss_price, "take_profit_price": entry_price * strategy["exit_target"]})
+        record_trade_event(
+            trade_id, "execution", "execution", "completed", execution_decision,
+            f"{execution_message} Stop loss {stop_loss_price:.4f}; take-profit {entry_price * strategy['exit_target']:.4f}.",
+            {
+                "allocated_capital": allocation if execution_decision == "accepted" else 0,
+                "paper_only": True,
+                "stop_loss_price": stop_loss_price,
+                "take_profit_price": entry_price * strategy["exit_target"],
+                "side": strategy["position"],
+                "leverage": strategy["leverage"],
+                "research_input": strategy.get("research_input"),
+                "news_context": strategy.get("news_context", []),
+                "ai_analysis": strategy.get("ai_analysis"),
+            },
+        )
         record_agent_event("execution", "completed", "trade_execution", execution_message, execution_decision, {"trade_id": trade_id, "symbol": candidate["ticker"]})
         trade_result.update({"status": "OPEN" if execution_decision == "accepted" else "REJECTED_EXECUTION", "allocated_capital": allocation if execution_decision == "accepted" else 0})
         cycle_trades.append(trade_result)
