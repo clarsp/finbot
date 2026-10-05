@@ -13,6 +13,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Load environment variables from .env.config if it exists
+env_config_path = Path(__file__).resolve().parent / ".env.config"
+if env_config_path.exists():
+    with open(env_config_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                os.environ[key] = value
+
 from integrations import (
     IntegrationSettings,
     OpenAIResearchAdapter,
