@@ -17,8 +17,10 @@ if [ ! -d .venv ]; then
 fi
 
 source .venv/bin/activate
-python -m pip install --upgrade pip >/dev/null 2>&1 || true
-python -m pip install -r requirements.txt
+if [ "${FINBOT_SKIP_INSTALL:-false}" != "true" ]; then
+  python -m pip install --upgrade pip >/dev/null 2>&1 || true
+  python -m pip install -r requirements.txt
+fi
 
 export FINBOT_USERNAME="${FINBOT_USERNAME:-admin}"
 export FINBOT_PASSWORD="${FINBOT_PASSWORD:-admin123}"

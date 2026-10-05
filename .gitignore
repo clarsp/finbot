@@ -8,3 +8,4 @@ __pycache__/
 *.db-wal
 logs/
 certs/
+data/

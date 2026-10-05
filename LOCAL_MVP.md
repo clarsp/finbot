@@ -8,6 +8,20 @@
 
 The app stores users, sessions, research, trade lifecycles, and portfolio allocations in `finbot.db`. Login uses a signed 30-day browser cookie backed by a revocable SQLite session. Logout revokes the session. Existing SHA-256 password records are upgraded to salted scrypt after a successful login.
 
+## Profile and users
+
+The Profile page lets each signed-in user choose an avatar and change their password. Administrators can create accounts, grant or revoke admin access, and delete other users. Password changes require the current password and at least 12 characters. User removal revokes that user's sessions, and the last administrator cannot be removed or demoted. Existing databases gain avatar/admin columns in place; if a database has no administrator, its earliest account is promoted.
+
+## Docker
+
+1. Ensure `.env.config` exists and contains the credentials/settings you want to pass to the container. Compose injects this ignored file at runtime; it is excluded from the image build context.
+2. Build and start with `docker compose up --build -d`.
+3. Open `http://localhost:8501`. To publish on another host port, run `FINBOT_HOST_PORT=8502 docker compose up --build -d` and open port 8502.
+
+Compose bind-mounts `./data` to `/data` and stores SQLite at `./data/finbot.db`, so database updates survive container rebuilds and restarts. To use an existing local database, stop the local app and copy it before the first container start: `mkdir -p data && cp finbot.db data/finbot.db`. Back up `data/finbot.db` with the container stopped so SQLite writes are complete. `docker compose down` stops the service but leaves the bind-mounted database in place.
+
+The image installs Python dependencies at build time. It runs the existing background worker and Streamlit app together; `FINBOT_SKIP_INSTALL=true` prevents package installation at container startup. This is a local paper-trading deployment, not a live broker integration.
+
 ## Portfolio semantics
 
 - Starting capital is the configured account balance for the local paper account.
@@ -25,6 +39,8 @@ The current simulator uses feed confidence and simple deterministic checks. Stop
 The backend uses `yfscreen` to screen U.S. equities and `yfinance` to fetch ticker headlines immediately at startup and once per hour. Repeat fetches refresh article timestamps and metadata. During an agent analysis cycle, the Researcher marks each stored headline relevant/not relevant using candidate ticker, company, and sector-topic matches, and persists the reason. Only relevant items are passed into matching trade lifecycle evidence. The dashboard shows the classification and reason; use Manual research actions to fetch only, analyze stored items, or do both in one action. Screening/news retrieval does not itself open or close trades. Yahoo can rate-limit or return no articles; on those runs the configured ticker list is tried, errors are logged, and the existing `research_feed.json` trading simulation remains available.
 
 OpenAI research is disabled by default and can be enabled in the sidebar. When enabled, each candidate and up to eight related headlines are sent to the configured OpenAI-compatible Chat Completions endpoint. The adapter requires structured JSON for signal, confidence, catalyst, and summary; these results are saved with the research event and feed the Strategist. API/configuration errors are surfaced rather than silently falling back to dummy decisions.
+
+The **OpenAI API spend** panel uses the organization Costs endpoint and requires an organization admin key (`OPENAI_ADMIN_KEY`) plus organization ID (`OPENAI_ORGANIZATION_ID`) in `.env.config`. It reports month-to-date usage cost, not remaining prepaid credit; the project API key alone cannot retrieve billing costs.
 
 The Strategist still applies deterministic confidence and direction rules, the Risk Manager remains the deterministic final threshold gate, and execution remains paper-only. OpenAI does not place orders and no live brokerage orders are available. Interactive Brokers remains a separate execution/account integration and is not used as a news source. IBKR news/data availability depends on supported services, subscriptions, and account permissions. Keep provider credentials in `.env.config`; no key is required for the Yahoo screener/news packages.
 

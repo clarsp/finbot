@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+certs
+logs
+data
+.DS_Store

@@ -58,6 +58,16 @@ def main() -> None:
     except OSError:
         port = get_free_port(preferred_port)
 
+    # Start the scheduler daemon in the background
+    print("Starting research scheduler daemon...")
+    scheduler_process = subprocess.Popen(
+        [sys.executable, "makemoney.py"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    print(f"Scheduler daemon started (PID: {scheduler_process.pid})")
+
     cmd = [
         sys.executable,
         "-m",
@@ -74,7 +84,19 @@ def main() -> None:
         cert_path, key_path = generate_self_signed_cert()
         cmd.extend(["--server.sslCertFile", cert_path, "--server.sslKeyFile", key_path])
 
-    subprocess.run(cmd, check=True)
+    print(f"Starting Streamlit on port {port}...")
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        # Cleanup scheduler when Streamlit exits
+        if scheduler_process.poll() is None:
+            print("Stopping scheduler daemon...")
+            scheduler_process.terminate()
+            try:
+                scheduler_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                scheduler_process.kill()
+                scheduler_process.wait()
 
 
 if __name__ == "__main__":

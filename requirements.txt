@@ -3,3 +3,4 @@ extra-streamlit-components>=0.1.81
 yfscreen>=0.1.2
 yfinance>=0.2.54
 openai>=1.30.0
+plotly>=5.18.0

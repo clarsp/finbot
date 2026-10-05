@@ -1,0 +1,16 @@
+services:
+  finbot:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env.config
+    environment:
+      FINBOT_DB_PATH: /data/finbot.db
+      FINBOT_SKIP_INSTALL: "true"
+      STREAMLIT_PORT: "8501"
+      ENABLE_HTTPS: "false"
+    ports:
+      - "${FINBOT_HOST_PORT:-8501}:8501"
+    volumes:
+      - ./data:/data
