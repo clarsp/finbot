@@ -1897,10 +1897,13 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
             "price": entry_price,
             "price_source": price_source,
         }
+        # In automatic mode, use both reviewed and unreviewed articles
+        # For reviewed articles: use if ticker matches relevance_tickers
+        # For unreviewed articles: include all of them since they haven't been categorized yet
         related_news = [
             article for article in recent_news
-            if article["relevance_status"] == "relevant"
-            and candidate["ticker"] in article["relevance_tickers"]
+            if (article["relevance_status"] == "relevant" and candidate["ticker"] in article["relevance_tickers"])
+            or (article["relevance_status"] == "unreviewed")  # Always include unreviewed in automatic mode
         ]
         ai_analysis = None
         if ai_researcher:
