@@ -1240,6 +1240,18 @@ async def run_hourly_news_fetch() -> Dict[str, int]:
     try:
         articles = await YahooFinanceNewsProvider(settings).fetch_news()
         counts = save_news_articles(articles)
+        
+        # Classify newly fetched headlines against current research candidates
+        researcher = ResearcherAgent()
+        market_data = await researcher.run_data_fetch(max_candidates=100)
+        candidates = market_data.get("candidates", [])
+        if candidates:
+            recent_news = get_news_articles(limit=200)
+            classification_results = classify_research_headlines(recent_news, candidates)
+            logger.info("Headline classification after fetch: %d relevant, %d not relevant", 
+                       classification_results.get("relevant", 0), 
+                       classification_results.get("not_relevant", 0))
+        
         record_agent_event(
             "researcher", "completed", "hourly_news_fetch",
             f"Fetched {len(articles)} Yahoo Finance headlines; stored {counts['inserted']} new and refreshed {counts['updated']} existing articles.",
