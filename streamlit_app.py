@@ -1218,7 +1218,10 @@ def render_companies_dashboard() -> None:
             trades_df["Created"] = pd.to_datetime(trades_df["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
             trades_df["Entry"] = trades_df["entry_price"].apply(lambda x: f"${x:.2f}" if x else "N/A")
             trades_df["Current"] = trades_df["current_price"].apply(lambda x: f"${x:.2f}" if x else "N/A")
-            trades_df["Leverage"] = trades_df["leverage"].apply(lambda x: f"{x:.1f}x" if x else "1.0x")
+            if "leverage" in trades_df.columns:
+                trades_df["Leverage"] = trades_df["leverage"].apply(lambda x: f"{x:.1f}x" if x else "1.0x")
+            else:
+                trades_df["Leverage"] = "1.0x"
             trades_df["P&L"] = trades_df["realized_pnl"].apply(lambda x: f"${x:.2f}" if x else "-")
             st.dataframe(
                 trades_df[["Created", "side", "Leverage", "status", "Entry", "Current", "P&L"]],

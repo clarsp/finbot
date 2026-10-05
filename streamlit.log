@@ -13,3 +13,134 @@
   $ xcode-select --install
   $ pip install watchdog
             
+2026-10-05 20:22:18.213 Uncaught app execution
+Traceback (most recent call last):
+2026-10-05 20:22:25.888 Uncaught app execution
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py", line 3641, in get_loc
+    return self._engine.get_loc(casted_key)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pandas/_libs/index.pyx", line 168, in pandas._libs.index.IndexEngine.get_loc
+  File "pandas/_libs/index.pyx", line 197, in pandas._libs.index.IndexEngine.get_loc
+  File "pandas/_libs/hashtable_class_helper.pxi", line 7668, in pandas._libs.hashtable.PyObjectHashTable.get_item
+  File "pandas/_libs/hashtable_class_helper.pxi", line 7676, in pandas._libs.hashtable.PyObjectHashTable.get_item
+KeyError: 'leverage'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/exec_code.py", line 136, in exec_func_with_error_handling
+    result = func()
+             ^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 924, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1761, in <module>
+    main()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1753, in main
+    render_companies_dashboard()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1221, in render_companies_dashboard
+    trades_df["Leverage"] = trades_df["leverage"].apply(lambda x: f"{x:.1f}x" if x else "1.0x")
+                            ~~~~~~~~~^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pandas/core/frame.py", line 4378, in __getitem__
+    indexer = self.columns.get_loc(key)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pandas/core/indexes/base2026-10-05 20:22:49.736 Uncaught app execution
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py", line 3641, in get_loc
+    return self._engine.get_loc(casted_key)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pandas/_libs/index.pyx", line 168, in pandas._libs.index.IndexEngine.get_loc
+  File "pandas/_libs/index.pyx", line 197, in pandas._libs.index.IndexEngine.get_loc
+  File "pandas/_libs/hashtable_class_helper.pxi", line 7668, in pandas._libs.hashtable.PyObjectHashTable.get_item
+  File "pandas/_libs/hashtable_class_helper.pxi", line 7676, in pandas._libs.hashtable.PyObjectHashTable.get_item
+KeyError: 'leverage'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/exec_code.py", line 136, in exec_func_with_error_handling
+    result = func()
+             ^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 924, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1761, in <module>
+    main()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1753, in main
+    render_companies_dashboard()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1221, in render_companies_dashboard
+    trades_df["Leverage"] = trades_df["leverage"].apply(lambda x: f"{x:.1f}x" if x else "1.0x")
+                            ~~~~~~~~~^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pandas/core/frame.py", line 4378, in __getitem__
+    indexer = self.columns.get_loc(key)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py", line 3648, in get_loc
+    raise KeyError(key) from err
+KeyError: 'leverage'
+2026-10-05 20:22:51.017 Uncaught app execution
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py", line 3641, in get_loc
+    return self._engine.get_loc(casted_key)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pandas/_libs/index.pyx", line 168, in pandas._libs.index.IndexEngine.get_loc
+  File "pandas/_libs/index.pyx", line 197, in pandas._libs.index.IndexEngine.get_loc
+  File "pandas/_libs/hashtable_class_helper.pxi", line 7668, in pandas._libs.hashtable.PyObjectHashTable.get_item
+  File "pandas/_libs/hashtable_class_helper.pxi", line 7676, in pandas._libs.hashtable.PyObjectHashTable.get_item
+KeyError: 'leverage'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/exec_code.py", line 136, in exec_func_with_error_handling
+    result = func()
+             ^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 924, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1761, in <module>
+    main()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1753, in main
+    render_companies_dashboard()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1221, in render_companies_dashboard
+    trades_df["Leverage"] = trades_df["leverage"].apply(lambda x: f"{x:.1f}x" if x else "1.0x")
+                            ~~~~~~~~~^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pandas/core/frame.py", line 4378, in __getitem__
+    indexer = self.columns.get_loc(key)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py", line 3648, in get_loc
+    raise KeyError(key) from err
+KeyError: 'leverage'
+2026-10-05 20:22:51.855 Uncaught app execution
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py", line 3641, in get_loc
+    return self._engine.get_loc(casted_key)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pandas/_libs/index.pyx", line 168, in pandas._libs.index.IndexEngine.get_loc
+  File "pandas/_libs/index.pyx", line 197, in pandas._libs.index.IndexEngine.get_loc
+  File "pandas/_libs/hashtable_class_helper.pxi", line 7668, in pandas._libs.hashtable.PyObjectHashTable.get_item
+  File "pandas/_libs/hashtable_class_helper.pxi", line 7676, in pandas._libs.hashtable.PyObjectHashTable.get_item
+KeyError: 'leverage'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/exec_code.py", line 136, in exec_func_with_error_handling
+    result = func()
+             ^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 924, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1761, in <module>
+    main()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1753, in main
+    render_companies_dashboard()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1221, in render_companies_dashboard
+    trades_df["Leverage"] = trades_df["leverage"].apply(lambda x: f"{x:.1f}x" if x else "1.0x")
+                            ~~~~~~~~~^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pandas/core/frame.py", line 4378, in __getitem__
+    indexer = self.columns.get_loc(key)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pandas/core/indexes/base.py", line 3648, in get_loc
+    raise KeyError(key) from err
+KeyError: 'leverage'

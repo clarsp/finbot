@@ -532,7 +532,7 @@ def get_company_analysis_history(ticker: str, days: int = 30) -> List[Dict[str, 
     ).fetchall()
     
     trades = conn.execute(
-        """SELECT id, created_at, side, status, entry_price, current_price, realized_pnl, allocated_capital
+        """SELECT id, created_at, side, status, entry_price, current_price, realized_pnl, allocated_capital, leverage
            FROM trades
            WHERE symbol = ? AND created_at >= ?
            ORDER BY created_at DESC""",
