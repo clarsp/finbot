@@ -1496,7 +1496,9 @@ class StrategistAgent:
 
         signal = tech_data.get("signal")
         position = "LONG" if signal == "bullish" else "SHORT" if signal == "bearish" else "HOLD"
-        leverage = min(2.0, float(rules.get("max_leverage", 3.0)))
+        default_leverage = float(rules.get("default_leverage", 2.0))
+        max_leverage = float(rules.get("max_leverage", 3.0))
+        leverage = min(default_leverage, max_leverage)
         exit_target = 1.05 if position == "LONG" else 0.95 if position == "SHORT" else 1.0
         recent_news = market_data.get("recent_news", [])
         decision_gate = evaluate_strategist_gate(tech_data, position, recent_news, rules)

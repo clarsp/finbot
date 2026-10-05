@@ -1026,10 +1026,15 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                 )
                 validation_label = "Revalidate 14-day path" if has_validation else "Validate 14-day path"
                 if st.button(validation_label, key=f"validate_trade_{trade['id']}"):
-                    with st.spinner("Checking Yahoo 5-minute price history, up to 14 days..."):
-                        validation = asyncio.run(validate_trade_outcome(int(trade["id"]), max_days=14))
-                    if not validation.get("available"):
-                        st.warning(validation.get("reason", "Historical validation is unavailable."))
+                    try:
+                        with st.spinner("Checking Yahoo 5-minute price history, up to 14 days..."):
+                            validation = asyncio.run(validate_trade_outcome(int(trade["id"]), max_days=14))
+                        if validation.get("available"):
+                            st.success(f"✓ Validation complete: {validation.get('first_exit', 'N/A')} exit over {validation.get('window_days', 14)} days ({validation.get('bars_analyzed', 0)} bars).")
+                        else:
+                            st.warning(validation.get("reason", "Historical validation is unavailable."))
+                    except Exception as e:
+                        st.error(f"Validation failed: {str(e)}")
                     st.rerun()
 
             metrics = st.columns(6)
