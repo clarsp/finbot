@@ -274,6 +274,28 @@ def load_research_feed() -> List[Dict[str, Any]]:
     return []
 
 
+def format_json_readable(data: Any) -> str:
+    """Format JSON with comma-separated large numbers for readability."""
+    def format_value(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: format_value(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [format_value(item) for item in obj]
+        elif isinstance(obj, (int, float)) and abs(obj) >= 1000:
+            if isinstance(obj, int):
+                return f"{obj:,}"
+            else:
+                return f"{obj:,.2f}"
+        else:
+            return obj
+    
+    if isinstance(data, str):
+        data = json.loads(data)
+    
+    formatted = format_value(data)
+    return json.dumps(formatted, indent=2)
+
+
 def get_agent_rules() -> Dict[str, Dict[str, Any]]:
     conn = get_connection()
     rows = conn.execute("SELECT agent_name, rules_json FROM agent_rules").fetchall()
@@ -1858,6 +1880,129 @@ def calculate_candidate_success_score(
     }
 
 
+class OverwatcherAgent:
+    """Validates agent configurations are correctly applied and monitors trade health."""
+    
+    def __init__(self):
+        self.audit_log_path = Path(__file__).resolve().parent / "audit_logs" / f"oversight_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.jsonl"
+        self.audit_log_path.parent.mkdir(exist_ok=True)
+    
+    def validate_trade_configuration(self, trade_id: int) -> Dict[str, Any]:
+        """Validate that all agent configurations were correctly applied to a trade."""
+        conn = get_connection()
+        trade = conn.execute(
+            "SELECT * FROM trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+        
+        if not trade:
+            return {"trade_id": trade_id, "status": "error", "message": "Trade not found"}
+        
+        # Get agent rules
+        agent_rules = get_agent_rules()
+        strategist_rules = agent_rules.get("strategist", DEFAULT_AGENT_RULES["strategist"])
+        risk_rules = agent_rules.get("risk_manager", DEFAULT_AGENT_RULES["risk_manager"])
+        
+        # Get trade events to see what each agent decided
+        events = conn.execute(
+            "SELECT stage, agent_name, decision, details FROM trade_events WHERE trade_id = ? ORDER BY id",
+            (trade_id,)
+        ).fetchall()
+        conn.close()
+        
+        checks = {
+            "trade_id": trade_id,
+            "ticker": trade["symbol"],
+            "status": trade["status"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "configuration_checks": {},
+            "issues": [],
+        }
+        
+        # Check leverage configuration
+        expected_leverage = float(strategist_rules.get("default_leverage", 2.0))
+        max_leverage = float(strategist_rules.get("max_leverage", 3.0))
+        actual_leverage = float(trade["leverage"])
+        
+        checks["configuration_checks"]["leverage"] = {
+            "expected": expected_leverage,
+            "max_allowed": max_leverage,
+            "actual": actual_leverage,
+            "valid": abs(actual_leverage - min(expected_leverage, max_leverage)) < 0.01
+        }
+        
+        if not checks["configuration_checks"]["leverage"]["valid"]:
+            checks["issues"].append(f"Leverage mismatch: expected {expected_leverage}, got {actual_leverage}")
+        
+        # Check stop loss is proportional to leverage
+        if trade["entry_price"] and trade["stop_loss_price"]:
+            entry = float(trade["entry_price"])
+            sl = float(trade["stop_loss_price"])
+            sl_pct = abs(entry - sl) / entry if entry != 0 else 0
+            risk_factor = float(risk_rules.get("stop_loss_pct", 0.02))
+            # With higher leverage, stop loss should be tighter (proportionally smaller %)
+            expected_sl_pct = risk_factor / (actual_leverage if actual_leverage > 0 else 1.0)
+            
+            checks["configuration_checks"]["stop_loss"] = {
+                "actual_pct": round(sl_pct, 4),
+                "expected_pct": round(expected_sl_pct, 4),
+                "leverage_factor": actual_leverage,
+                "valid": abs(sl_pct - expected_sl_pct) / expected_sl_pct < 0.1 if expected_sl_pct > 0 else True
+            }
+            
+            if not checks["configuration_checks"]["stop_loss"]["valid"]:
+                checks["issues"].append(
+                    f"Stop loss not proportional to leverage: {sl_pct*100:.2f}% vs expected {expected_sl_pct*100:.2f}%"
+                )
+        
+        # Get strategist and research decisions from events
+        strategist_decision = None
+        researcher_decision = None
+        for event in events:
+            if event["stage"] == "strategist":
+                strategist_decision = json.loads(event["details"]) if event["details"] and event["details"] != '{}' else {}
+            elif event["stage"] == "researcher":
+                researcher_decision = json.loads(event["details"]) if event["details"] and event["details"] != '{}' else {}
+        
+        checks["agent_decisions"] = {
+            "researcher": "approved" if researcher_decision else "unknown",
+            "strategist": "approved" if strategist_decision and strategist_decision.get("leverage") else "unknown",
+        }
+        
+        return checks
+    
+    def audit_trade(self, trade_id: int) -> None:
+        """Log trade validation results to audit log."""
+        result = self.validate_trade_configuration(trade_id)
+        with open(self.audit_log_path, "a") as f:
+            f.write(json.dumps(result) + "\n")
+    
+    def audit_all_trades(self) -> Dict[str, Any]:
+        """Audit all OPEN and recently CLOSED trades."""
+        conn = get_connection()
+        trades = conn.execute(
+            "SELECT id FROM trades WHERE status IN ('OPEN', 'CLOSED') ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+        conn.close()
+        
+        summary = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "total_trades_audited": len(trades),
+            "audit_log_file": str(self.audit_log_path),
+            "trades_audited": []
+        }
+        
+        for trade in trades:
+            self.audit_trade(trade["id"])
+            summary["trades_audited"].append(trade["id"])
+        
+        # Log summary
+        with open(self.audit_log_path, "a") as f:
+            f.write(json.dumps({"summary": summary}) + "\n")
+        
+        logger.info(f"Audit complete: {len(trades)} trades audited. Log: {self.audit_log_path}")
+        return summary
+
+
 async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]:
     ai_enabled = get_ai_research_enabled() if use_openai is None else use_openai
     settings = IntegrationSettings.from_environment()
@@ -1974,13 +2119,15 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
         entry_price = float(candidate["price"]) if candidate.get("price") is not None else None
         protection_pct = float(get_agent_rules()["risk_manager"].get("stop_loss_pct", 0.02))
         initial_exit_target = 1.05 if inferred_side == "LONG" else 0.95 if inferred_side == "SHORT" else 1.0
+        # Use default leverage from researcher rules
+        default_leverage = float(researcher_rules.get("default_leverage", 2.0))
+        # Stop loss is proportional to leverage: higher leverage requires tighter stop loss
+        leverage_adjusted_protection = protection_pct / (default_leverage if default_leverage > 0 else 1.0)
         stop_loss_price = (
-            entry_price * (1 - protection_pct if inferred_side == "LONG" else 1 + protection_pct if inferred_side == "SHORT" else 1.0)
+            entry_price * (1 - leverage_adjusted_protection if inferred_side == "LONG" else 1 + leverage_adjusted_protection if inferred_side == "SHORT" else 1.0)
             if entry_price is not None else None
         )
         take_profit_price = entry_price * initial_exit_target if entry_price is not None else None
-        # Use default leverage from researcher rules
-        default_leverage = float(researcher_rules.get("default_leverage", 2.0))
         trade_id = save_trade(
             symbol=candidate["ticker"], side=inferred_side, leverage=default_leverage, exit_target=initial_exit_target,
             status="RESEARCHED", notes=candidate["notes"], entry_price=entry_price,
@@ -2238,10 +2385,19 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
 
         execution_message = f"Paper position opened with {allocation:.2f} allocated to {candidate['ticker']}."
         entry_price = item["entry_price"]
+        # Calculate proportional stop loss based on final leverage
+        final_leverage = strategy["leverage"]
+        protection_pct = float(get_agent_rules()["risk_manager"].get("stop_loss_pct", 0.02))
+        leverage_adjusted_protection = protection_pct / (final_leverage if final_leverage > 0 else 1.0)
+        side = strategy["position"]
+        stop_loss_price = (
+            entry_price * (1 - leverage_adjusted_protection if side == "LONG" else 1 + leverage_adjusted_protection if side == "SHORT" else 1.0)
+            if entry_price is not None else None
+        )
         conn = get_connection()
         conn.execute(
-            "UPDATE trades SET side = ?, leverage = ?, exit_target = ?, status = 'OPEN', allocated_capital = ?, entry_price = ?, current_price = ?, quantity = ?, take_profit_price = ?, notes = ? WHERE id = ?",
-            (strategy["position"], strategy["leverage"], strategy["exit_target"], allocation, entry_price, entry_price, allocation * strategy["leverage"] / entry_price, entry_price * strategy["exit_target"], execution_message, trade_id),
+            "UPDATE trades SET side = ?, leverage = ?, exit_target = ?, status = 'OPEN', allocated_capital = ?, entry_price = ?, current_price = ?, quantity = ?, take_profit_price = ?, stop_loss_price = ?, notes = ? WHERE id = ?",
+            (strategy["position"], strategy["leverage"], strategy["exit_target"], allocation, entry_price, entry_price, allocation * strategy["leverage"] / entry_price, entry_price * strategy["exit_target"], stop_loss_price, execution_message, trade_id),
         )
         conn.commit()
         conn.close()
@@ -2255,7 +2411,7 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
         )
         record_trade_event(
             trade_id, "execution", "execution", "completed", "accepted",
-            f"{execution_message} Stop loss {item['stop_loss_price']:.4f}; take-profit {entry_price * strategy['exit_target']:.4f}.",
+            f"{execution_message} Stop loss {stop_loss_price:.4f}; take-profit {entry_price * strategy['exit_target']:.4f}.",
             {
                 "allocated_capital": allocation,
                 "paper_only": True,

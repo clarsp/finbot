@@ -58,6 +58,8 @@ from makemoney import (
     sync_openai_token_allowance,
     update_agent_rules,
     validate_pending_trade_outcomes,
+    OverwatcherAgent,
+    format_json_readable,
     validate_trade_outcome,
     validate_session_token,
 )
@@ -590,7 +592,7 @@ def render_event_evidence(event: Dict[str, Any]) -> None:
     }
     if decision_data:
         with st.expander("Decision inputs and rule checks", expanded=False):
-            st.json(decision_data)
+            st.code(format_json_readable(decision_data), language="json")
 
     headlines = details.get("related_news") or details.get("news_context") or []
     if headlines:
@@ -629,14 +631,14 @@ def render_event_evidence(event: Dict[str, Any]) -> None:
                 key: "Unavailable" if value is None else value
                 for key, value in (ai_analysis.get("fundamentals") or {}).items()
             }
-            st.json({
+            st.code(format_json_readable({
                 "provider": ai_analysis.get("provider"),
                 "model": ai_analysis.get("model"),
                 "fundamentals": fundamentals,
                 "fundamental_analysis": ai_analysis.get("fundamental_analysis"),
                 "fundamental_grade": ai_analysis.get("fundamental_grade", "unknown"),
                 "fundamental_grades": ai_analysis.get("fundamental_grades", {}),
-            })
+            }), language="json")
     elif "ai_analysis" in details:
         st.caption("OpenAI research was disabled for this cycle; the decision used the configured rules and dummy baseline.")
 
@@ -1634,6 +1636,16 @@ def main() -> None:
                 st.rerun()
             except ValueError as error:
                 st.error(str(error))
+        
+        st.divider()
+        st.subheader("Trade Oversight")
+        if st.button("🔍 Audit all trades", key="run_overwatcher_audit"):
+            with st.spinner("Running trade configuration audit..."):
+                overwatcher = OverwatcherAgent()
+                audit_result = overwatcher.audit_all_trades()
+            st.success(f"✓ Audit complete: {audit_result['total_trades_audited']} trades checked")
+            st.caption(f"Log file: audit_logs/{audit_result['audit_log_file'].split('/')[-1]}")
+            st.rerun()
 
     with st.sidebar.expander("AI research settings", expanded=False):
         ai_enabled = get_ai_research_enabled()
