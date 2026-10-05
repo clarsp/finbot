@@ -67,6 +67,7 @@ DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
         "require_company_specific_news_for_countertrend_short": True,
         "require_company_specific_news_for_countertrend_long": True,
         "require_current_market_quote": True,
+        "default_leverage": 2.0,
         "max_leverage": 3.0,
         "position_limit": 0.35,
     },
@@ -1976,8 +1977,10 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
             if entry_price is not None else None
         )
         take_profit_price = entry_price * initial_exit_target if entry_price is not None else None
+        # Use default leverage from researcher rules
+        default_leverage = float(researcher_rules.get("default_leverage", 2.0))
         trade_id = save_trade(
-            symbol=candidate["ticker"], side=inferred_side, leverage=1.0, exit_target=initial_exit_target,
+            symbol=candidate["ticker"], side=inferred_side, leverage=default_leverage, exit_target=initial_exit_target,
             status="RESEARCHED", notes=candidate["notes"], entry_price=entry_price,
             company_name=candidate["company_name"], stop_loss_price=stop_loss_price,
             take_profit_price=take_profit_price,

@@ -983,7 +983,7 @@ def render_trade_validation_chart(trades: list[Dict[str, Any]]) -> None:
             name=name,
             marker_color=color,
             customdata=[point["hover"] for point in points],
-            hovertemplate="%{customdata}<br>Return: %{y:+.2f}%<extra>%{fullData.name}</extra>",
+            hovertemplate="%{customdata}<br><b>%{fullData.name}:</b> %{y:+.2f}%<extra></extra>",
         ))
     figure.add_hline(y=0, line_color="#94a3b8", line_width=1)
     figure.update_layout(
@@ -996,7 +996,11 @@ def render_trade_validation_chart(trades: list[Dict[str, Any]]) -> None:
         legend={"orientation": "h", "y": 1.12, "x": 1, "xanchor": "right"},
     )
     st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
-    st.caption("Rejected/deferred trades are counterfactual. Historical barrier results apply stop/target rules to Yahoo 5-minute bars; they are not fills or net returns.")
+    st.caption(
+        "**Blue bars** = Planned target return you set. **Green bars** = Actual result from historical price data "
+        "(what would have happened). Rejected/deferred trades are counterfactual outcomes. Results apply stop-loss and "
+        "take-profit rules to Yahoo 5-minute bars; they are not actual fills or net returns."
+    )
 
 
 def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
@@ -1214,9 +1218,10 @@ def render_companies_dashboard() -> None:
             trades_df["Created"] = pd.to_datetime(trades_df["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
             trades_df["Entry"] = trades_df["entry_price"].apply(lambda x: f"${x:.2f}" if x else "N/A")
             trades_df["Current"] = trades_df["current_price"].apply(lambda x: f"${x:.2f}" if x else "N/A")
+            trades_df["Leverage"] = trades_df["leverage"].apply(lambda x: f"{x:.1f}x" if x else "1.0x")
             trades_df["P&L"] = trades_df["realized_pnl"].apply(lambda x: f"${x:.2f}" if x else "-")
             st.dataframe(
-                trades_df[["Created", "side", "status", "Entry", "Current", "P&L"]],
+                trades_df[["Created", "side", "Leverage", "status", "Entry", "Current", "P&L"]],
                 hide_index=True,
                 width="stretch",
             )
@@ -1645,7 +1650,7 @@ def main() -> None:
 
     render_research_actions()
 
-    navigation_col, range_col = st.columns([9, 1], vertical_alignment="center", gap="small")
+    navigation_col, range_col, refresh_col = st.columns([8, 1, 1], vertical_alignment="center", gap="small")
     with navigation_col:
         selected_view = st.segmented_control(
             "Main navigation",
@@ -1656,6 +1661,9 @@ def main() -> None:
         )
     with range_col:
         start_at, end_at = render_time_range()
+    with refresh_col:
+        if st.button("🔄", help="Refresh page", key="page_refresh_button", use_container_width=True):
+            st.rerun()
 
     summary = get_dashboard_summary(start_at, end_at)
 
