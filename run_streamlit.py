@@ -48,7 +48,25 @@ def generate_self_signed_cert() -> tuple[str, str]:
     return str(cert_path), str(key_path)
 
 
+def get_python_executable() -> str:
+    project_dir = Path(__file__).resolve().parent
+    project_environment_executable = project_dir / ".venv" / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+    if project_environment_executable.is_file():
+        return str(project_environment_executable)
+    if sys.prefix == sys.base_prefix:
+        return sys.executable
+    executable = Path(sys.prefix) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if not executable.is_file():
+        raise RuntimeError(f"Python environment executable was not found: {executable}")
+    return str(executable)
+
+
 def main() -> None:
+    project_dir = Path(__file__).resolve().parent
+    python_executable = get_python_executable()
+    print(f"Using Python environment: {python_executable}", flush=True)
     enable_https = os.getenv("ENABLE_HTTPS", "false").lower() in {"1", "true", "yes", "on"}
     preferred_port = int(os.getenv("STREAMLIT_PORT", "8501"))
     port = preferred_port
@@ -60,32 +78,38 @@ def main() -> None:
 
     # Start the scheduler daemon in the background
     print("Starting research scheduler daemon...")
-    scheduler_process = subprocess.Popen(
-        [sys.executable, "makemoney.py"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-    print(f"Scheduler daemon started (PID: {scheduler_process.pid})")
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "streamlit",
-        "run",
-        "streamlit_app.py",
-        "--server.address",
-        "0.0.0.0",
-        "--server.port",
-        str(port),
-    ]
-
-    if enable_https:
-        cert_path, key_path = generate_self_signed_cert()
-        cmd.extend(["--server.sslCertFile", cert_path, "--server.sslKeyFile", key_path])
-
-    print(f"Starting Streamlit on port {port}...")
+    scheduler_log = (project_dir / "scheduler.log").open("a", buffering=1)
     try:
+        scheduler_process = subprocess.Popen(
+            [python_executable, "makemoney.py"],
+            cwd=project_dir,
+            stdout=scheduler_log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except Exception:
+        scheduler_log.close()
+        raise
+    print(f"Scheduler daemon started (PID: {scheduler_process.pid}); logging to scheduler.log")
+
+    try:
+        cmd = [
+            python_executable,
+            "-m",
+            "streamlit",
+            "run",
+            "streamlit_app.py",
+            "--server.address",
+            "0.0.0.0",
+            "--server.port",
+            str(port),
+        ]
+
+        if enable_https:
+            cert_path, key_path = generate_self_signed_cert()
+            cmd.extend(["--server.sslCertFile", cert_path, "--server.sslKeyFile", key_path])
+
+        print(f"Starting Streamlit on port {port}...")
         subprocess.run(cmd, check=True)
     finally:
         # Cleanup scheduler when Streamlit exits
@@ -97,6 +121,7 @@ def main() -> None:
             except subprocess.TimeoutExpired:
                 scheduler_process.kill()
                 scheduler_process.wait()
+        scheduler_log.close()
 
 
 if __name__ == "__main__":

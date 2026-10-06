@@ -49,7 +49,7 @@ PROFILE_AVATARS = {
 }
 
 DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
-    "researcher": {"enabled": True, "status": "idle", "min_confidence": 0.6, "allowed_sectors": ["Technology", "Energy"], "max_fetch_per_cycle": 6, "include_market_fundamentals": True},
+    "researcher": {"enabled": True, "status": "idle", "min_confidence": 0.6, "allowed_sectors": ["Technology", "Energy"], "max_fetch_per_cycle": 6, "include_market_fundamentals": True, "default_leverage": 2.0},
     "strategist": {
         "enabled": True,
         "status": "idle",
@@ -95,6 +95,7 @@ INSTRUMENT_NAMES = {
     "XLE": "Energy Select Sector SPDR Fund",
     "XOM": "Exxon Mobil Corporation",
 }
+BASE_TAKE_PROFIT_PCT = 0.05
 
 
 def get_connection() -> sqlite3.Connection:
@@ -296,6 +297,33 @@ def format_json_readable(data: Any) -> str:
     return json.dumps(formatted, indent=2)
 
 
+def calculate_leveraged_exit_prices(
+    entry_price: Optional[float],
+    side: str,
+    leverage: float,
+    stop_loss_pct: float,
+    base_exit_target: float,
+) -> tuple[Optional[float], Optional[float], float]:
+    if leverage <= 0:
+        raise ValueError("Trade leverage must be greater than zero.")
+    if entry_price is None:
+        return None, None, base_exit_target
+    if side == "HOLD":
+        return entry_price, entry_price, 1.0
+    if side not in {"LONG", "SHORT"}:
+        raise ValueError(f"Unsupported position side: {side}")
+
+    stop_distance = stop_loss_pct / leverage
+    adjusted_exit_target = 1 + (base_exit_target - 1) / leverage
+    stop_loss_price = (
+        entry_price * (1 - stop_distance)
+        if side == "LONG"
+        else entry_price * (1 + stop_distance)
+    )
+    take_profit_price = entry_price * adjusted_exit_target
+    return stop_loss_price, take_profit_price, adjusted_exit_target
+
+
 def get_agent_rules() -> Dict[str, Dict[str, Any]]:
     conn = get_connection()
     rows = conn.execute("SELECT agent_name, rules_json FROM agent_rules").fetchall()
@@ -442,33 +470,88 @@ def get_research_schedule() -> Dict[str, Any]:
     }
 
 
+def get_latest_research_cycle_status() -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    candidate_pool = conn.execute(
+        """
+        SELECT id, created_at, message
+        FROM agent_events
+        WHERE agent_name = 'researcher' AND action = 'candidate_pool'
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if not candidate_pool:
+        conn.close()
+        return None
+
+    outcome = conn.execute(
+        """
+        SELECT id, created_at, message, decision, details
+        FROM agent_events
+        WHERE action = 'cycle_trade_selection' AND id > ?
+        ORDER BY id
+        LIMIT 1
+        """,
+        (candidate_pool["id"],),
+    ).fetchone()
+    end_id = outcome["id"] if outcome else None
+    rejection_query = """
+        SELECT agent_name, action, message
+        FROM agent_events
+        WHERE id > ? AND decision = 'rejected' AND status = 'completed'
+          AND action NOT IN ('candidate_pool', 'cycle_trade_selection')
+    """
+    rejection_parameters: List[Any] = [candidate_pool["id"]]
+    if end_id is not None:
+        rejection_query += " AND id < ?"
+        rejection_parameters.append(end_id)
+    rejection_query += " ORDER BY id DESC LIMIT 8"
+    rejections = conn.execute(rejection_query, rejection_parameters).fetchall()
+    conn.close()
+
+    details = json.loads(outcome["details"]) if outcome and outcome["details"] else {}
+    return {
+        "started_at": candidate_pool["created_at"],
+        "candidate_pool_message": candidate_pool["message"],
+        "completed_at": outcome["created_at"] if outcome else None,
+        "outcome_message": outcome["message"] if outcome else None,
+        "outcome_decision": outcome["decision"] if outcome else None,
+        "outcome_details": details,
+        "rejections": [dict(row) for row in rejections],
+    }
+
+
 def claim_due_research_cycle(now: Optional[datetime] = None) -> bool:
     now = now or datetime.now(timezone.utc)
     conn = get_connection()
-    settings = {row["key"]: row["value"] for row in conn.execute(
-        "SELECT key, value FROM app_settings WHERE key LIKE 'research_schedule_%'"
-    )}
-    if settings.get("research_schedule_mode", "manual") != "automatic":
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        settings = {row["key"]: row["value"] for row in conn.execute(
+            "SELECT key, value FROM app_settings WHERE key LIKE 'research_schedule_%'"
+        )}
+        if settings.get("research_schedule_mode", "manual") != "automatic":
+            conn.rollback()
+            return False
+        suspended_until = settings.get("research_schedule_suspended_until", "")
+        if suspended_until and datetime.fromisoformat(suspended_until) > now:
+            conn.rollback()
+            return False
+        last_run = settings.get("research_schedule_last_run", "")
+        due_at = datetime.fromisoformat(last_run) + timedelta(
+            minutes=int(settings.get("research_schedule_interval_minutes", "60"))
+        ) if last_run else now
+        if due_at > now:
+            conn.rollback()
+            return False
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('research_schedule_last_run', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (now.isoformat(),),
+        )
+        conn.commit()
+        return True
+    finally:
         conn.close()
-        return False
-    suspended_until = settings.get("research_schedule_suspended_until", "")
-    if suspended_until and datetime.fromisoformat(suspended_until) > now:
-        conn.close()
-        return False
-    last_run = settings.get("research_schedule_last_run", "")
-    due_at = datetime.fromisoformat(last_run) + timedelta(
-        minutes=int(settings.get("research_schedule_interval_minutes", "60"))
-    ) if last_run else now
-    if due_at > now:
-        conn.close()
-        return False
-    conn.execute(
-        "INSERT INTO app_settings (key, value) VALUES ('research_schedule_last_run', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (now.isoformat(),),
-    )
-    conn.commit()
-    conn.close()
-    return True
 
 
 def update_company_analytics(ticker: str, company_name: str, sector: str, signal: str, confidence: float, accepted: bool) -> None:
@@ -554,7 +637,8 @@ def get_company_analysis_history(ticker: str, days: int = 30) -> List[Dict[str, 
     ).fetchall()
     
     trades = conn.execute(
-        """SELECT id, created_at, side, status, entry_price, current_price, realized_pnl, allocated_capital, leverage
+        """SELECT id, created_at, side, status, entry_price, current_price, realized_pnl,
+                  allocated_capital, leverage, quantity, take_profit_price
            FROM trades
            WHERE symbol = ? AND created_at >= ?
            ORDER BY created_at DESC""",
@@ -1521,7 +1605,13 @@ class StrategistAgent:
         default_leverage = float(rules.get("default_leverage", 2.0))
         max_leverage = float(rules.get("max_leverage", 3.0))
         leverage = min(default_leverage, max_leverage)
-        exit_target = 1.05 if position == "LONG" else 0.95 if position == "SHORT" else 1.0
+        exit_target = (
+            1 + BASE_TAKE_PROFIT_PCT
+            if position == "LONG"
+            else 1 - BASE_TAKE_PROFIT_PCT
+            if position == "SHORT"
+            else 1.0
+        )
         recent_news = market_data.get("recent_news", [])
         decision_gate = evaluate_strategist_gate(tech_data, position, recent_news, rules)
         decision = "accepted" if decision_gate["accepted"] and leverage > 0 else "rejected"
@@ -1637,11 +1727,17 @@ class RiskManagerAgent:
 
 class ExecutionAgent:
     def place_trade(self, signal: Dict[str, Any], pnl: float = 0.0, volatility: float = 0.01) -> Dict[str, Any]:
-        rules = get_agent_rules().get("execution", DEFAULT_AGENT_RULES["execution"])
+        agent_rules = get_agent_rules()
+        rules = agent_rules.get("execution", DEFAULT_AGENT_RULES["execution"])
         logger.info("Placing paper trade based on strategy signal.")
         symbol = signal["assets"][0]
         side = signal["position"]
-        leverage = float(signal.get("leverage", 1.0))
+        strategist_rules = agent_rules.get("strategist", DEFAULT_AGENT_RULES["strategist"])
+        configured_leverage = min(
+            float(strategist_rules.get("default_leverage", 2.0)),
+            float(strategist_rules.get("max_leverage", 3.0)),
+        )
+        leverage = float(signal.get("leverage", configured_leverage))
         exit_target = float(signal.get("exit_target", 1.0))
 
         decision = "accepted" if side in rules.get("allowed_side", ["LONG", "SHORT"]) else "rejected"
@@ -1933,26 +2029,37 @@ class OverwatcherAgent:
         if not checks["configuration_checks"]["leverage"]["valid"]:
             checks["issues"].append(f"Leverage mismatch: expected {expected_leverage}, got {actual_leverage}")
         
-        # Check stop loss is proportional to leverage
-        if trade["entry_price"] and trade["stop_loss_price"]:
+        # Verify price distances produce the same account-level risk and reward at each leverage.
+        if trade["entry_price"]:
             entry = float(trade["entry_price"])
-            sl = float(trade["stop_loss_price"])
-            sl_pct = abs(entry - sl) / entry if entry != 0 else 0
-            risk_factor = float(risk_rules.get("stop_loss_pct", 0.02))
-            # With higher leverage, stop loss should be tighter (proportionally smaller %)
-            expected_sl_pct = risk_factor / (actual_leverage if actual_leverage > 0 else 1.0)
-            
-            checks["configuration_checks"]["stop_loss"] = {
-                "actual_pct": round(sl_pct, 4),
-                "expected_pct": round(expected_sl_pct, 4),
-                "leverage_factor": actual_leverage,
-                "valid": abs(sl_pct - expected_sl_pct) / expected_sl_pct < 0.1 if expected_sl_pct > 0 else True
-            }
-            
-            if not checks["configuration_checks"]["stop_loss"]["valid"]:
-                checks["issues"].append(
-                    f"Stop loss not proportional to leverage: {sl_pct*100:.2f}% vs expected {expected_sl_pct*100:.2f}%"
-                )
+            expected_leverage_factor = actual_leverage if actual_leverage > 0 else 1.0
+            if trade["stop_loss_price"]:
+                sl_pct = abs(entry - float(trade["stop_loss_price"])) / entry if entry != 0 else 0
+                expected_sl_pct = float(risk_rules.get("stop_loss_pct", 0.02)) / expected_leverage_factor
+                checks["configuration_checks"]["stop_loss"] = {
+                    "actual_pct": round(sl_pct, 4),
+                    "expected_pct": round(expected_sl_pct, 4),
+                    "leverage_factor": actual_leverage,
+                    "valid": abs(sl_pct - expected_sl_pct) / expected_sl_pct < 0.1 if expected_sl_pct > 0 else True,
+                }
+                if not checks["configuration_checks"]["stop_loss"]["valid"]:
+                    checks["issues"].append(
+                        f"Stop loss not proportional to leverage: {sl_pct*100:.2f}% vs expected {expected_sl_pct*100:.2f}%"
+                    )
+
+            if trade["take_profit_price"] and trade["side"] in {"LONG", "SHORT"}:
+                tp_pct = abs(entry - float(trade["take_profit_price"])) / entry if entry != 0 else 0
+                expected_tp_pct = BASE_TAKE_PROFIT_PCT / expected_leverage_factor
+                checks["configuration_checks"]["take_profit"] = {
+                    "actual_pct": round(tp_pct, 4),
+                    "expected_pct": round(expected_tp_pct, 4),
+                    "leverage_factor": actual_leverage,
+                    "valid": abs(tp_pct - expected_tp_pct) / expected_tp_pct < 0.1 if expected_tp_pct > 0 else True,
+                }
+                if not checks["configuration_checks"]["take_profit"]["valid"]:
+                    checks["issues"].append(
+                        f"Take profit not proportional to leverage: {tp_pct*100:.2f}% vs expected {expected_tp_pct*100:.2f}%"
+                    )
         
         # Get strategist and research decisions from events
         strategist_decision = None
@@ -2117,17 +2224,23 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
             )
         inferred_side = "LONG" if candidate["signal"] == "bullish" else "SHORT" if candidate["signal"] == "bearish" else "HOLD"
         entry_price = float(candidate["price"]) if candidate.get("price") is not None else None
-        protection_pct = float(get_agent_rules()["risk_manager"].get("stop_loss_pct", 0.02))
-        initial_exit_target = 1.05 if inferred_side == "LONG" else 0.95 if inferred_side == "SHORT" else 1.0
+        protection_pct = float(risk_rules.get("stop_loss_pct", 0.02))
+        initial_exit_target = (
+            1 + BASE_TAKE_PROFIT_PCT
+            if inferred_side == "LONG"
+            else 1 - BASE_TAKE_PROFIT_PCT
+            if inferred_side == "SHORT"
+            else 1.0
+        )
         # Use default leverage from researcher rules
         default_leverage = float(researcher_rules.get("default_leverage", 2.0))
-        # Stop loss is proportional to leverage: higher leverage requires tighter stop loss
-        leverage_adjusted_protection = protection_pct / (default_leverage if default_leverage > 0 else 1.0)
-        stop_loss_price = (
-            entry_price * (1 - leverage_adjusted_protection if inferred_side == "LONG" else 1 + leverage_adjusted_protection if inferred_side == "SHORT" else 1.0)
-            if entry_price is not None else None
+        stop_loss_price, take_profit_price, initial_exit_target = calculate_leveraged_exit_prices(
+            entry_price=entry_price,
+            side=inferred_side,
+            leverage=default_leverage,
+            stop_loss_pct=protection_pct,
+            base_exit_target=initial_exit_target,
         )
-        take_profit_price = entry_price * initial_exit_target if entry_price is not None else None
         trade_id = save_trade(
             symbol=candidate["ticker"], side=inferred_side, leverage=default_leverage, exit_target=initial_exit_target,
             status="RESEARCHED", notes=candidate["notes"], entry_price=entry_price,
@@ -2145,7 +2258,14 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
             {**candidate, "related_news": related_news, "ai_analysis": ai_analysis},
         )
 
-        trade_result: Dict[str, Any] = {"trade_id": trade_id, "symbol": candidate["ticker"], "status": "REJECTED_RESEARCH"}
+        trade_result: Dict[str, Any] = {
+            "trade_id": trade_id,
+            "symbol": candidate["ticker"],
+            "status": "REJECTED_RESEARCH",
+            "leverage": default_leverage,
+            "stop_loss_price": stop_loss_price,
+            "take_profit_price": take_profit_price,
+        }
         if signal_decision != "accepted":
             conn = get_connection()
             conn.execute("UPDATE trades SET status = 'REJECTED_RESEARCH' WHERE id = ?", (trade_id,))
@@ -2168,6 +2288,38 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
             "recent_news": related_news,
         }
         strategy = strategist.analyze_and_decide(candidate_market)
+        strategy_leverage = float(strategy["leverage"])
+        if strategy_leverage > 0:
+            stop_loss_price, take_profit_price, strategy["exit_target"] = calculate_leveraged_exit_prices(
+                entry_price=entry_price,
+                side=strategy["position"],
+                leverage=strategy_leverage,
+                stop_loss_pct=protection_pct,
+                base_exit_target=strategy["exit_target"],
+            )
+        else:
+            stop_loss_price = take_profit_price = None
+            strategy["exit_target"] = 1.0
+        price_note = (
+            f"Quote {entry_price:.4f} from {candidate['price_source']}. "
+            f"Stop loss {stop_loss_price:.4f}; take-profit {take_profit_price:.4f}."
+            if entry_price is not None and stop_loss_price is not None and take_profit_price is not None
+            else "No usable market quote or positive leverage; price-based exits were not generated."
+        )
+        conn = get_connection()
+        conn.execute(
+            "UPDATE trades SET side = ?, leverage = ?, exit_target = ?, stop_loss_price = ?, take_profit_price = ? WHERE id = ?",
+            (
+                strategy["position"],
+                strategy_leverage,
+                strategy["exit_target"],
+                stop_loss_price,
+                take_profit_price,
+                trade_id,
+            ),
+        )
+        conn.commit()
+        conn.close()
         decision_gate = strategy["decision_gate"]
         strategy_decision = "accepted" if decision_gate["accepted"] else "rejected"
         strategy_message = (
@@ -2181,6 +2333,11 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
             {**strategy, "stop_loss_price": stop_loss_price, "take_profit_price": take_profit_price},
         )
         trade_result["side"] = strategy["position"]
+        trade_result.update({
+            "leverage": strategy_leverage,
+            "stop_loss_price": stop_loss_price,
+            "take_profit_price": take_profit_price,
+        })
         if strategy_decision != "accepted":
             conn = get_connection()
             conn.execute("UPDATE trades SET side = ?, status = 'REJECTED_STRATEGY' WHERE id = ?", (strategy["position"], trade_id))
@@ -2385,19 +2542,12 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
 
         execution_message = f"Paper position opened with {allocation:.2f} allocated to {candidate['ticker']}."
         entry_price = item["entry_price"]
-        # Calculate proportional stop loss based on final leverage
-        final_leverage = strategy["leverage"]
-        protection_pct = float(get_agent_rules()["risk_manager"].get("stop_loss_pct", 0.02))
-        leverage_adjusted_protection = protection_pct / (final_leverage if final_leverage > 0 else 1.0)
-        side = strategy["position"]
-        stop_loss_price = (
-            entry_price * (1 - leverage_adjusted_protection if side == "LONG" else 1 + leverage_adjusted_protection if side == "SHORT" else 1.0)
-            if entry_price is not None else None
-        )
+        stop_loss_price = item["stop_loss_price"]
+        take_profit_price = item["take_profit_price"]
         conn = get_connection()
         conn.execute(
             "UPDATE trades SET side = ?, leverage = ?, exit_target = ?, status = 'OPEN', allocated_capital = ?, entry_price = ?, current_price = ?, quantity = ?, take_profit_price = ?, stop_loss_price = ?, notes = ? WHERE id = ?",
-            (strategy["position"], strategy["leverage"], strategy["exit_target"], allocation, entry_price, entry_price, allocation * strategy["leverage"] / entry_price, entry_price * strategy["exit_target"], stop_loss_price, execution_message, trade_id),
+            (strategy["position"], strategy["leverage"], strategy["exit_target"], allocation, entry_price, entry_price, allocation * strategy["leverage"] / entry_price, take_profit_price, stop_loss_price, execution_message, trade_id),
         )
         conn.commit()
         conn.close()
@@ -2411,12 +2561,12 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
         )
         record_trade_event(
             trade_id, "execution", "execution", "completed", "accepted",
-            f"{execution_message} Stop loss {stop_loss_price:.4f}; take-profit {entry_price * strategy['exit_target']:.4f}.",
+            f"{execution_message} Stop loss {stop_loss_price:.4f}; take-profit {take_profit_price:.4f}.",
             {
                 "allocated_capital": allocation,
                 "paper_only": True,
-                "stop_loss_price": item["stop_loss_price"],
-                "take_profit_price": entry_price * strategy["exit_target"],
+                "stop_loss_price": stop_loss_price,
+                "take_profit_price": take_profit_price,
                 "side": strategy["position"],
                 "leverage": strategy["leverage"],
                 "research_input": strategy.get("research_input"),
@@ -2469,9 +2619,17 @@ async def main() -> None:
     while True:
         now = time.monotonic()
         if now - last_news_fetch >= settings.news_interval_seconds:
-            await run_hourly_news_fetch()
             last_news_fetch = time.monotonic()
-        if claim_due_research_cycle():
+            try:
+                await run_hourly_news_fetch()
+            except Exception:
+                logger.exception("Scheduled news fetch failed; continuing scheduler loop")
+        try:
+            cycle_due = claim_due_research_cycle()
+        except Exception:
+            logger.exception("Could not check whether a scheduled research cycle is due")
+            cycle_due = False
+        if cycle_due:
             logger.info("Scheduled research cycle starting")
             try:
                 await run_trading_cycle()

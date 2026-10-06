@@ -13,3 +13,289 @@
   $ xcode-select --install
   $ pip install watchdog
             
+INFO:makemoney:Audit complete: 5 trades audited. Log: /Users/hive/git/finbot/audit_logs/oversight_20261005_200528.jsonl
+2026-10-05 22:19:12.293 Script compilation error
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 743, in _run_script
+    code = self._script_cache.get_bytecode(script_path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_cache.py", line 72, in get_bytecode
+    filebody = magic.add_magic(filebody, script_path)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/magic.py", line 45, in add_magic
+    tree = ast.parse(code, script_path, "exec")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.2/Frameworks/Python.framework/Versions/3.12/lib/python3.12/ast.py", line 52, in parse
+    return compile(source, filename, mode, flags,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 282
+    def get_cookie_manager(    or not hasattr(backend_module, "get_latest_research_cycle_status")
+                               ^^
+SyntaxError: invalid syntax
+2026-10-05 22:19:22.298 Script compilation error
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 743, in _run_script
+    code = self._script_cache.get_bytecode(script_path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_cache.py", line 72, in get_bytecode
+    filebody = magic.add_magic(filebody, script_path)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/magic.py", line 45, in add_magic
+    tree = ast.parse(code, script_path, "exec")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.2/Frameworks/Python.framework/Versions/3.12/lib/python3.12/ast.py", line 52, in parse
+    return compile(source, filename, mode, flags,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 282
+    def get_cookie_manager(    or not hasattr(backend_module, "get_latest_research_cycle_status")
+                               ^^
+SyntaxError: invalid syntax
+2026-10-05 22:19:32.300 Script compilation error
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 743, in _run_script
+    code = self._script_cache.get_bytecode(script_path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_cache.py", line 72, in get_bytecode
+    filebody = magic.add_magic(filebody, script_path)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/magic.py", line 45, in add_magic
+    tree = ast.parse(code, script_path, "exec")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.2/Frameworks/Python.framework/Versions/3.12/lib/python3.12/ast.py", line 52, in parse
+    return compile(source, filename, mode, flags,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 282
+    def get_cookie_manager(    or not hasattr(backend_module, "get_latest_research_cycle_status")
+                               ^^
+SyntaxError: invalid syntax
+2026-10-05 22:19:42.601 Script compilation error
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 743, in _run_script
+    code = self._script_cache.get_bytecode(script_path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_cache.py", line 72, in get_bytecode
+    filebody = magic.add_magic(filebody, script_path)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/magic.py", line 45, in add_magic
+    tree = ast.parse(code, script_path, "exec")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.2/Frameworks/Python.framework/Versions/3.12/lib/python3.12/ast.py", line 52, in parse
+    return compile(source, filename, mode, flags,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 282
+    def get_cookie_manager(    or not hasattr(backend_module, "get_latest_research_cycle_status")
+                               ^^
+SyntaxError: invalid syntax
+2026-10-05 22:19:52.570 Script compilation error
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 743, in _run_script
+    code = self._script_cache.get_bytecode(script_path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_cache.py", line 72, in get_bytecode
+    filebody = magic.add_magic(filebody, script_path)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/magic.py", line 45, in add_magic
+    tree = ast.parse(code, script_path, "exec")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.2/Frameworks/Python.framework/Versions/3.12/lib/python3.12/ast.py", line 52, in parse
+    return compile(source, filename, mode, flags,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 282
+    def get_cookie_manager(    or not hasattr(backend_module, "get_latest_research_cycle_status")
+                               ^^
+SyntaxError: invalid syntax
+2026-10-05 22:20:02.575 Script compilation error
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 743, in _run_script
+    code = self._script_cache.get_bytecode(script_path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_cache.py", line 72, in get_bytecode
+    filebody = magic.add_magic(filebody, script_path)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/magic.py", line 45, in add_magic
+    tree = ast.parse(code, script_path, "exec")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.2/Frameworks/Python.framework/Versions/3.12/lib/python3.12/ast.py", line 52, in parse
+    return compile(source, filename, mode, flags,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 282
+    def get_cookie_manager(    or not hasattr(backend_module, "get_latest_research_cycle_status")
+                               ^^
+SyntaxError: invalid syntax
+2026-10-05 22:20:12.310 Script compilation error
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 743, in _run_script
+    code = self._script_cache.get_bytecode(script_path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_cache.py", line 72, in get_bytecode
+    filebody = magic.add_magic(filebody, script_path)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/magic.py", line 45, in add_magic
+    tree = ast.parse(code, script_path, "exec")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.2/Frameworks/Python.framework/Versions/3.12/lib/python3.12/ast.py", line 52, in parse
+    return compile(source, filename, mode, flags,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 282
+    def get_cookie_manager(    or not hasattr(backend_module, "get_latest_research_cycle_status")
+                               ^^
+SyntaxError: invalid syntax
+2026-10-05 22:20:22.298 Script compilation error
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 743, in _run_script
+    code = self._script_cache.get_bytecode(script_path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_cache.py", line 72, in get_bytecode
+    filebody = magic.add_magic(filebody, script_path)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/magic.py", line 45, in add_magic
+    tree = ast.parse(code, script_path, "exec")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.2/Frameworks/Python.framework/Versions/3.12/lib/python3.12/ast.py", line 52, in parse
+    return compile(source, filename, mode, flags,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 282
+    def get_cookie_manager(    or not hasattr(backend_module, "get_latest_research_cycle_status")
+                               ^^
+SyntaxError: invalid syntax
+2026-10-05 22:20:32.291 Script compilation error
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 743, in _run_script
+    code = self._script_cache.get_bytecode(script_path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_cache.py", line 72, in get_bytecode
+    filebody = magic.add_magic(filebody, script_path)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/magic.py", line 45, in add_magic
+    tree = ast.parse(code, script_path, "exec")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.2/Frameworks/Python.framework/Versions/3.12/lib/python3.12/ast.py", line 52, in parse
+    return compile(source, filename, mode, flags,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 282
+    def get_cookie_manager(    or not hasattr(backend_module, "get_latest_research_cycle_status")
+                               ^^
+SyntaxError: invalid syntax
+2026-10-05 22:20:52.666 Uncaught app execution
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/exec_code.py", line 136, in exec_func_with_error_handling
+    result = func()
+             ^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 924, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1889, in <module>
+    main()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1777, in main
+    render_research_actions()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 501, in render_research_actions
+    st.caption(f"Available paper cash: ${portfolio['available_cash']:,.2f}")
+                                         ~~~~~~~~~^^^^^^^^^^^^^^^^^^
+KeyError: 'available_cash'
+2026-10-05 22:20:53.338 Uncaught app execution
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/exec_code.py", line 136, in exec_func_with_error_handling
+    result = func()
+             ^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 924, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1889, in <module>
+    main()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1777, in main
+    render_research_actions()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 501, in render_research_actions
+    st.caption(f"Available paper cash: ${portfolio['available_cash']:,.2f}")
+                                         ~~~~~~~~~^^^^^^^^^^^^^^^^^^
+KeyError: 'available_cash'
+2026-10-05 22:21:20.604 Uncaught app execution
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/exec_code.py", line 136, in exec_func_with_error_handling
+    result = func()
+             ^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 924, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1889, in <module>
+    main()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1777, in main
+    render_research_actions()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 501, in render_research_actions
+    st.caption(f"Available paper cash: ${portfolio['available_cash']:,.2f}")
+                                         ~~~~~~~~~^^^^^^^^^^^^^^^^^^
+KeyError: 'available_cash'
+2026-10-05 22:21:21.070 Uncaught app execution
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/exec_code.py", line 136, in exec_func_with_error_handling
+    result = func()
+             ^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 924, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1889, in <module>
+    main()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 1777, in main
+    render_research_actions()
+  File "/Users/hive/git/finbot/streamlit_app.py", line 501, in render_research_actions
+    st.caption(f"Available paper cash: ${portfolio['available_cash']:,.2f}")
+                                         ~~~~~~~~~^^^^^^^^^^^^^^^^^^
+KeyError: 'available_cash'
+2026-10-05 22:21:44.208 Serialization of dataframe to Arrow table was unsuccessful. Applying automatic fixes for column types to make the dataframe Arrow-compatible.
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/dataframe_util.py", line 957, in convert_pandas_df_to_arrow_table
+    return pa.Table.from_pandas(df, preserve_index=preserve_index)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pyarrow/table.pxi", line 4769, in pyarrow.lib.Table.from_pandas
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pyarrow/pandas_compat.py", line 656, in dataframe_to_arrays
+    arrays = [convert_column(c, f)
+              ^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pyarrow/pandas_compat.py", line 644, in convert_column
+    raise e
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pyarrow/pandas_compat.py", line 638, in convert_column
+    result = pa.array(col, type=type_, from_pandas=True, safe=safe)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pyarrow/array.pxi", line 408, in pyarrow.lib.array
+  File "pyarrow/array.pxi", line 91, in pyarrow.lib._ndarray_to_array
+  File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
+pyarrow.lib.ArrowInvalid: ("Could not convert 'Not checked' with type str: tried to convert to boolean", 'Conversion failed for column Stop loss valid with type object')
+2026-10-05 22:21:48.817 Serialization of dataframe to Arrow table was unsuccessful. Applying automatic fixes for column types to make the dataframe Arrow-compatible.
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/dataframe_util.py", line 957, in convert_pandas_df_to_arrow_table
+    return pa.Table.from_pandas(df, preserve_index=preserve_index)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pyarrow/table.pxi", line 4769, in pyarrow.lib.Table.from_pandas
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pyarrow/pandas_compat.py", line 656, in dataframe_to_arrays
+    arrays = [convert_column(c, f)
+              ^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pyarrow/pandas_compat.py", line 644, in convert_column
+    raise e
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pyarrow/pandas_compat.py", line 638, in convert_column
+    result = pa.array(col, type=type_, from_pandas=True, safe=safe)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pyarrow/array.pxi", line 408, in pyarrow.lib.array
+  File "pyarrow/array.pxi", line 91, in pyarrow.lib._ndarray_to_array
+  File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
+pyarrow.lib.ArrowInvalid: ("Could not convert 'Not checked' with type str: tried to convert to boolean", 'Conversion failed for column Stop loss valid with type object')
+2026-10-05 22:23:42.029 Serialization of dataframe to Arrow table was unsuccessful. Applying automatic fixes for column types to make the dataframe Arrow-compatible.
+Traceback (most recent call last):
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/streamlit/dataframe_util.py", line 957, in convert_pandas_df_to_arrow_table
+    return pa.Table.from_pandas(df, preserve_index=preserve_index)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pyarrow/table.pxi", line 4769, in pyarrow.lib.Table.from_pandas
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pyarrow/pandas_compat.py", line 656, in dataframe_to_arrays
+    arrays = [convert_column(c, f)
+              ^^^^^^^^^^^^^^^^^^^^
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pyarrow/pandas_compat.py", line 644, in convert_column
+    raise e
+  File "/Users/hive/git/finbot/.venv/lib/python3.12/site-packages/pyarrow/pandas_compat.py", line 638, in convert_column
+    result = pa.array(col, type=type_, from_pandas=True, safe=safe)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pyarrow/array.pxi", line 408, in pyarrow.lib.array
+  File "pyarrow/array.pxi", line 91, in pyarrow.lib._ndarray_to_array
+  File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
+pyarrow.lib.ArrowInvalid: ("Could not convert 'Not checked' with type str: tried to convert to boolean", 'Conversion failed for column Stop loss valid with type object')
+  Stopping...
+Starting research scheduler daemon...
+Scheduler daemon started (PID: 90947)
+Starting Streamlit on port 8501...
+Stopping scheduler daemon...

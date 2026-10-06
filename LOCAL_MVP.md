@@ -28,11 +28,13 @@ The image installs Python dependencies at build time. It runs the existing backg
 - Available cash is starting capital less open-position allocations plus realized P&L.
 - Invested capital is cash allocated as margin to open paper positions.
 - Gross exposure is invested capital multiplied by position leverage.
+- The dashboard's Decisions over time chart has an independent quick range: 24 hours, 3 days, 7 days, 1 month, or 3 months.
 - Each research candidate has its own trade ID and ordered Research, Strategy, Risk, Execution, and optional Exit events.
-- Every trade records a default 2% protective stop and a side-aware take-profit target; the selected prices are included in the trade event log.
+- Every trade uses a 2% base stop and 5% base take-profit distance at 1x. Both price distances are divided by leverage, so at 2x the stop is 1% from entry and the target is 2.5% from entry, preserving the same account-level risk/reward thresholds.
+- Trade lifecycles and Companies → Related Trades show projected P&L at the take-profit price using the recorded quantity (and therefore leverage); this estimate is before fees and slippage. Realized P&L is separate and is recorded when a paper position closes.
 - Positions remain open across app restarts until manually closed in the trade panel.
 
-The current simulator uses feed confidence and simple deterministic checks. Stop and target prices are recorded but are not automatically triggered because the dummy provider supplies no live price updates. It does not calculate real market P&L or send brokerage orders. The displayed values are operational scaffolding, not a trading recommendation or estimate of real returns.
+The current simulator uses feed confidence and simple deterministic checks. Stop and target prices are recorded but are not automatically triggered because the dummy provider supplies no live price updates. It does not calculate real market P&L or send brokerage orders. The displayed estimates are operational scaffolding, not a trading recommendation or estimate of real returns.
 
 ## Provider scaffolding
 
@@ -45,3 +47,9 @@ The **OpenAI API spend** panel uses the organization Costs endpoint and requires
 The Strategist still applies deterministic confidence and direction rules, the Risk Manager remains the deterministic final threshold gate, and execution remains paper-only. OpenAI does not place orders and no live brokerage orders are available. Interactive Brokers remains a separate execution/account integration and is not used as a news source. IBKR news/data availability depends on supported services, subscriptions, and account permissions. Keep provider credentials in `.env.config`; no key is required for the Yahoo screener/news packages.
 
 Before using broker credentials, use a dedicated paper account, restrict permissions, never enable withdrawals, and keep `.env.config` out of source control.
+
+## Automatic research and oversight
+
+Use **Research Actions** in the sidebar to choose automatic mode, set its interval, and see the next scheduled run. The panel also shows the latest completed analysis outcome, rejection reasons, and available paper cash. A cycle can run successfully without opening a trade: strategist/risk rules may reject every candidate, or execution may reject new positions when available cash is insufficient. Existing positions remain open until manually closed, so allocated cash may stay unavailable.
+
+The **Oversight** tab displays saved Overwatcher audit reports, including per-trade leverage and stop-loss checks, issues, and audit timestamps. Select an older log to review it, or choose **Run audit now** to create another report. JSONL files are stored in `audit_logs/`. The scheduler daemon writes operational output to `scheduler.log` when started with `run_streamlit.py`.

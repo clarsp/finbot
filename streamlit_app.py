@@ -2,9 +2,12 @@ import asyncio
 import html
 import importlib
 import inspect
+import json
+import math
 import os
+from pathlib import Path
 from datetime import datetime, time, timedelta, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import extra_streamlit_components as stx
 import integrations as integrations_module
@@ -23,6 +26,7 @@ if (
     or not hasattr(backend_module, "get_openai_usage_summary")
     or not hasattr(backend_module, "validate_trade_outcome")
     or not hasattr(backend_module, "get_company_analytics")
+    or not hasattr(backend_module, "get_latest_research_cycle_status")
 ):
     backend_module = importlib.reload(backend_module)
 
@@ -42,6 +46,7 @@ from makemoney import (
     get_openai_usage_summary,
     get_portfolio_summary,
     get_research_schedule,
+    get_latest_research_cycle_status,
     get_user_profile,
     list_users,
     revoke_session_token,
@@ -86,6 +91,7 @@ AGENT_RULE_HELP = {
     "require_company_specific_news_for_countertrend_short": "Require a directly company-linked bearish headline before shorting against strong fundamentals or bullish news.",
     "require_company_specific_news_for_countertrend_long": "Require a directly company-linked bullish headline before going long against weak fundamentals or bearish news.",
     "require_current_market_quote": "Block paper trade progression unless a current Yahoo Finance quote is available.",
+    "default_leverage": "Starting leverage for a candidate; the Strategist's final leverage is persisted with its exits.",
     "max_leverage": "Upper leverage limit for the strategist's proposed position.",
     "position_limit": "Maximum fraction of starting capital allocated to one trade.",
     "max_drawdown": "Risk rejection threshold for modeled account drawdown.",
@@ -487,6 +493,122 @@ def render_research_actions() -> None:
                 refresh_dashboard_end_time()
                 st.rerun()
 
+        cycle_status = get_latest_research_cycle_status()
+        if cycle_status:
+            started_at = datetime.fromisoformat(cycle_status["started_at"])
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            st.caption(f"Latest analysis started: {started_at.astimezone():%Y-%m-%d %H:%M:%S %Z}")
+            portfolio = get_portfolio_summary()
+            st.caption(f"Available paper cash: ${portfolio['cash_available']:,.2f}")
+            if cycle_status["outcome_message"]:
+                st.write(cycle_status["outcome_message"])
+            else:
+                st.warning("The latest analysis has not recorded a completed outcome.")
+            if cycle_status["rejections"]:
+                with st.expander("Latest cycle rejection reasons"):
+                    for rejection in cycle_status["rejections"]:
+                        agent_label = rejection["agent_name"].replace("_", " ").title()
+                        st.write(f"**{agent_label}**: {rejection['message']}")
+
+
+def render_oversight_dashboard() -> None:
+    st.subheader("Trade oversight")
+    st.write(
+        "Review Overwatcher audits and the configuration checks performed for each trade. "
+        "Audit reports are stored locally as JSONL files."
+    )
+    if st.button("🔍 Run audit now", key="oversight_dashboard_run_audit"):
+        with st.spinner("Auditing recent trades..."):
+            audit_result = OverwatcherAgent().audit_all_trades()
+        st.success(f"Audit complete: {audit_result['total_trades_audited']} trades checked.")
+        st.rerun()
+
+    audit_dir = Path(__file__).resolve().parent / "audit_logs"
+    audit_files = sorted(
+        audit_dir.glob("oversight_*.jsonl"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    ) if audit_dir.exists() else []
+    if not audit_files:
+        st.info("No audit logs yet. Run an audit to create the first report.")
+        return
+
+    selected_file = st.selectbox(
+        "Audit log",
+        audit_files,
+        format_func=lambda path: path.name,
+        key="oversight_log_selector",
+    )
+    records = []
+    try:
+        with selected_file.open(encoding="utf-8") as log_file:
+            for line_number, line in enumerate(log_file, start=1):
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as error:
+                    st.error(f"Invalid JSON in {selected_file.name}, line {line_number}: {error}")
+                    return
+    except OSError as error:
+        st.error(f"Could not read audit log {selected_file.name}: {error}")
+        return
+
+    summary = next((record["summary"] for record in reversed(records) if "summary" in record), {})
+    trade_records = [record for record in records if "trade_id" in record]
+    issue_count = sum(bool(record.get("issues")) for record in trade_records)
+    audit_timestamp = summary.get("timestamp")
+    if audit_timestamp:
+        parsed_timestamp = datetime.fromisoformat(audit_timestamp)
+        if parsed_timestamp.tzinfo is None:
+            parsed_timestamp = parsed_timestamp.replace(tzinfo=timezone.utc)
+        audit_timestamp = parsed_timestamp.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    metric_columns = st.columns(3)
+    metric_columns[0].metric("Trades audited", f"{summary.get('total_trades_audited', len(trade_records)):,}")
+    metric_columns[1].metric("Trades with issues", f"{issue_count:,}")
+    metric_columns[2].metric("Audit created", audit_timestamp or "Unavailable")
+
+    if trade_records:
+        def check_label(check: Dict[str, Any]) -> str:
+            valid = check.get("valid")
+            if valid is True:
+                return "Pass"
+            if valid is False:
+                return "Fail"
+            return "Not checked"
+
+        table_rows = []
+        for record in trade_records:
+            checks = record.get("configuration_checks", {})
+            leverage_check = checks.get("leverage", {})
+            stop_loss_check = checks.get("stop_loss", {})
+            take_profit_check = checks.get("take_profit", {})
+            actual_leverage = leverage_check.get("actual")
+            leverage_label = (
+                f"{float(actual_leverage):.1f}x"
+                if actual_leverage is not None
+                else "Not checked"
+            )
+            table_rows.append({
+                "Trade": record["trade_id"],
+                "Ticker": record.get("ticker", ""),
+                "Status": record.get("status", ""),
+                "Leverage": leverage_label,
+                "Leverage valid": check_label(leverage_check),
+                "Stop loss valid": check_label(stop_loss_check),
+                "Take profit valid": check_label(take_profit_check),
+                "Issues": " · ".join(record.get("issues", [])) or "None",
+            })
+        st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch")
+        for record in trade_records:
+            trade_issue_count = len(record.get("issues", []))
+            issue_label = f"{trade_issue_count} issue(s)" if trade_issue_count else "No issues"
+            with st.expander(
+                f"Trade {record['trade_id']} · {record.get('ticker', 'Unknown')} · {issue_label}"
+            ):
+                st.code(format_json_readable(record), language="json")
+    else:
+        st.info("This audit log contains no individual trade records.")
+
 
 def render_agent_decision_trend(events: list[Dict[str, Any]]) -> None:
     stage_order = ["researcher", "strategist", "risk_manager", "execution"]
@@ -571,14 +693,33 @@ def render_portfolio_charts(summary: Dict[str, Any]) -> None:
             st.caption("No open positions yet.")
     with trend_col:
         st.markdown("#### Decisions over time · by agent")
+        decision_ranges = {
+            "24 hours": timedelta(hours=24),
+            "3 days": timedelta(days=3),
+            "7 days": timedelta(days=7),
+            "1 month": timedelta(days=30),
+            "3 months": timedelta(days=90),
+        }
+        selected_range = st.selectbox(
+            "Show decisions from",
+            list(decision_ranges),
+            index=2,
+            key="decision_trend_range",
+        )
+        range_end = datetime.now(timezone.utc).replace(microsecond=0)
+        range_start = range_end - decision_ranges[selected_range]
+        events = backend_module.get_decision_timeline(
+            range_start.strftime("%Y-%m-%d %H:%M:%S"),
+            range_end.strftime("%Y-%m-%d %H:%M:%S"),
+        )
         events = [
-            event for event in summary.get("decision_timeline", [])
+            event for event in events
             if event["decision"] in {"accepted", "rejected"}
         ]
         if events:
             render_agent_decision_trend(events)
         else:
-            st.caption("Agent decision history will appear after the first research cycle.")
+            st.caption(f"No accepted/rejected agent decisions in the last {selected_range}.")
 
 
 def render_event_evidence(event: Dict[str, Any]) -> None:
@@ -1039,13 +1180,19 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                         st.error(f"Validation failed: {str(e)}")
                     st.rerun()
 
-            metrics = st.columns(6)
+            metrics = st.columns(7)
             metrics[0].metric("Allocated", f"${trade['allocated_capital']:,.2f}")
             metrics[1].metric("Entry", f"${(trade['entry_price'] or 0):,.4f}")
             metrics[2].metric("Quantity", f"{trade['quantity']:,.4f}")
             metrics[3].metric("Leverage", f"{trade['leverage']:,.1f}x")
             metrics[4].metric("Stop loss", f"${trade['stop_loss_price']:,.4f}" if trade["stop_loss_price"] else "N/A")
             metrics[5].metric("Take profit", f"${trade['take_profit_price']:,.4f}" if trade["take_profit_price"] else "N/A")
+            target_pnl = projected_target_pnl(trade)
+            metrics[6].metric(
+                "Target P&L (pre-fee)",
+                f"${target_pnl:,.2f}" if target_pnl is not None else "N/A",
+                help="Projected dollar P&L if the stored take-profit price is reached, using the recorded quantity. Before fees and slippage; not realized.",
+            )
 
             events = trade["events"]
             if events:
@@ -1141,6 +1288,44 @@ def render_research_headlines(summary: Dict[str, Any]) -> None:
         st.info("No dynamic headlines in this range yet. The backend checks Yahoo Finance hourly; dummy research data remains available.")
 
 
+def format_trade_price(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    price = float(value)
+    return f"${price:,.2f}" if math.isfinite(price) and price > 0 else "N/A"
+
+
+def projected_target_pnl(trade: Dict[str, Any]) -> Optional[float]:
+    if trade.get("status") not in {"OPEN", "CLOSED"}:
+        return None
+
+    entry_price = trade.get("entry_price")
+    take_profit_price = trade.get("take_profit_price")
+    quantity = trade.get("quantity")
+    side = trade.get("side")
+    if (
+        entry_price is None
+        or take_profit_price is None
+        or quantity is None
+        or side not in {"LONG", "SHORT"}
+    ):
+        return None
+
+    entry_price = float(entry_price)
+    take_profit_price = float(take_profit_price)
+    quantity = float(quantity)
+    if (
+        not all(map(math.isfinite, (entry_price, take_profit_price, quantity)))
+        or entry_price <= 0
+        or take_profit_price <= 0
+        or quantity <= 0
+    ):
+        return None
+
+    direction = 1 if side == "LONG" else -1
+    return (take_profit_price - entry_price) * quantity * direction
+
+
 def render_companies_dashboard() -> None:
     st.subheader("Companies Analytics")
     st.caption("Aggregated analysis history and performance per company")
@@ -1223,17 +1408,43 @@ def render_companies_dashboard() -> None:
             st.write("**Related Trades**")
             trades_df = pd.DataFrame(history["trades"])
             trades_df["Created"] = pd.to_datetime(trades_df["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
-            trades_df["Entry"] = trades_df["entry_price"].apply(lambda x: f"${x:.2f}" if x else "N/A")
-            trades_df["Current"] = trades_df["current_price"].apply(lambda x: f"${x:.2f}" if x else "N/A")
+            trades_df["Entry"] = trades_df["entry_price"].apply(format_trade_price)
+            trades_df["Current"] = trades_df["current_price"].apply(format_trade_price)
             if "leverage" in trades_df.columns:
-                trades_df["Leverage"] = trades_df["leverage"].apply(lambda x: f"{x:.1f}x" if x else "1.0x")
+                trades_df["Leverage"] = trades_df["leverage"].apply(
+                    lambda value: f"{value:.1f}x" if pd.notna(value) else "Unknown"
+                )
             else:
-                trades_df["Leverage"] = "1.0x"
-            trades_df["P&L"] = trades_df["realized_pnl"].apply(lambda x: f"${x:.2f}" if x else "-")
+                trades_df["Leverage"] = "Unknown"
+            trades_df["Target P&L (pre-fee)"] = trades_df.apply(
+                lambda trade: (
+                    f"${profit:,.2f}"
+                    if (profit := projected_target_pnl(trade.to_dict())) is not None
+                    else "—"
+                ),
+                axis=1,
+            )
+            trades_df["Realized P&L"] = trades_df.apply(
+                lambda trade: (
+                    f"${float(trade['realized_pnl']):,.2f}"
+                    if trade["status"] == "CLOSED" and pd.notna(trade["realized_pnl"])
+                    else "—"
+                ),
+                axis=1,
+            )
             st.dataframe(
-                trades_df[["Created", "side", "Leverage", "status", "Entry", "Current", "P&L"]],
+                trades_df[
+                    [
+                        "Created", "side", "Leverage", "Target P&L (pre-fee)",
+                        "status", "Entry", "Current", "Realized P&L",
+                    ]
+                ],
                 hide_index=True,
                 width="stretch",
+            )
+            st.caption(
+                "Target P&L is projected for executed positions using the recorded quantity and take-profit price, "
+                "so leverage is included. It is before fees and slippage; Realized P&L is recorded only after closing."
             )
     
     st.divider()
@@ -1582,6 +1793,7 @@ def refresh_stale_backend_import() -> None:
         and hasattr(backend_module, "validate_trade_outcome")
         and hasattr(backend_module, "get_user_profile")
         and hasattr(backend_module, "change_user_password")
+        and hasattr(backend_module, "get_latest_research_cycle_status")
     ):
         return
     integrations_module = importlib.import_module("integrations")
@@ -1592,6 +1804,7 @@ def refresh_stale_backend_import() -> None:
         "close_paper_trade", "create_session_token", "get_dashboard_summary",
         "get_ai_research_enabled", "get_portfolio_summary", "revoke_session_token",
         "get_openai_usage_summary", "get_research_schedule", "run_hourly_news_fetch",
+        "get_latest_research_cycle_status",
         "get_user_profile", "list_users", "update_user_avatar", "change_user_password",
         "run_trading_cycle", "set_ai_research_enabled", "set_starting_capital",
         "configure_research_schedule", "suspend_research_schedule",
@@ -1674,7 +1887,7 @@ def main() -> None:
     with navigation_col:
         selected_view = st.segmented_control(
             "Main navigation",
-            ["Dashboard", "Trade lifecycles", "Research", "Companies", "Profile", "How it works"],
+            ["Dashboard", "Trade lifecycles", "Research", "Companies", "Oversight", "Profile", "How it works"],
             default="Dashboard",
             label_visibility="collapsed",
             key="main_navigation",
@@ -1771,6 +1984,8 @@ def main() -> None:
         render_research_headlines(summary)
     elif selected_view == "Companies":
         render_companies_dashboard()
+    elif selected_view == "Oversight":
+        render_oversight_dashboard()
     elif selected_view == "Profile":
         render_profile_page(st.session_state.get("username", ""))
     else:
