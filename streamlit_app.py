@@ -17,7 +17,11 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-integrations_refresh_needed = not hasattr(integrations_module, "validate_trade_price_path")
+integrations_refresh_needed = (
+    not hasattr(integrations_module, "validate_trade_price_path")
+    or not hasattr(integrations_module, "validate_etoro_credentials")
+    or not hasattr(integrations_module, "get_portfolio_account_snapshot")
+)
 if integrations_refresh_needed:
     integrations_module = importlib.reload(integrations_module)
 
@@ -105,6 +109,53 @@ AGENT_RULE_HELP = {
     "max_trades_per_cycle": "Maximum number of risk-approved candidates the paper execution stage may open in one cycle; highest direction-neutral evidence scores are selected first.",
     "allowed_side": "Trade directions permitted by paper execution.",
 }
+
+ENV_CONFIG_PATH = Path(__file__).resolve().parent / ".env.config"
+PORTFOLIO_ACCOUNT_OPTIONS = {
+    "paper": "Paper portfolio",
+    "etoro_demo": "eToro demo account",
+    "etoro_main": "eToro main account",
+    "ibkr_demo": "IBKR demo account",
+    "ibkr_main": "IBKR main account",
+}
+
+
+def load_env_config() -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    if not ENV_CONFIG_PATH.exists():
+        return values
+    with ENV_CONFIG_PATH.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key] = value
+    return values
+
+
+def save_env_config(updates: Dict[str, str]) -> None:
+    existing_lines: list[str] = []
+    if ENV_CONFIG_PATH.exists():
+        existing_lines = ENV_CONFIG_PATH.read_text(encoding="utf-8").splitlines()
+    seen = set()
+    rewritten: list[str] = []
+    for raw_line in existing_lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            rewritten.append(raw_line)
+            continue
+        key, _ = line.split("=", 1)
+        if key in updates:
+            rewritten.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            rewritten.append(raw_line)
+    for key, value in updates.items():
+        if key not in seen:
+            rewritten.append(f"{key}={value}")
+    ENV_CONFIG_PATH.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+    os.environ.update(updates)
 
 st.markdown(
     """
@@ -679,6 +730,17 @@ def render_portfolio(summary: Dict[str, Any]) -> None:
     for index, (label, value) in enumerate(values):
         with metrics[index % 2]:
             st.metric(label, value)
+    portfolio_source = os.getenv("FINBOT_PORTFOLIO_ACCOUNT_SOURCE", "paper").lower()
+    if portfolio_source != "paper":
+        snapshot = st.session_state.get(f"portfolio_account_snapshot::{portfolio_source}")
+        source_label = PORTFOLIO_ACCOUNT_OPTIONS.get(portfolio_source, portfolio_source)
+        if snapshot and snapshot.get("available"):
+            currency = snapshot.get("currency") or "USD"
+            balance = snapshot.get("balance")
+            balance_text = f"{currency} {float(balance):,.2f}" if balance is not None else "unavailable"
+            st.caption(f"Portfolio source: {source_label} · Selected balance: {balance_text}")
+        else:
+            st.caption(f"Portfolio source: {source_label}")
 
 
 def render_portfolio_charts(summary: Dict[str, Any]) -> None:
@@ -1469,8 +1531,8 @@ def render_how_it_works() -> None:
     st.subheader("How it works")
     st.caption("Research informs a proposal; strategy and risk gates decide whether the paper simulator records it.")
     st.warning(
-        "This application is paper-only. It does not submit brokerage orders, attach exchange stop/target orders, "
-        "or continuously monitor live positions."
+        "This application is paper-first. It can still run local paper execution, and when configured for eToro "
+        "it can query market data and submit demo orders with the API keys in .env.config."
     )
 
     agent_columns = st.columns(4)
@@ -1695,32 +1757,81 @@ def refresh_dashboard_end_time() -> None:
 
 def render_trade_search(trades: list[Dict[str, Any]]) -> None:
     st.subheader("Trade lifecycles")
-    batch_col, batch_help = st.columns([2, 5], vertical_alignment="center")
+    age_range_col, batch_col = st.columns([3, 2], vertical_alignment="center")
+    with age_range_col:
+        min_age_days, max_age_days = st.slider(
+            "Batch validation opportunity age (days)",
+            min_value=1,
+            max_value=18,
+            value=(1, 18),
+            step=1,
+            key="batch_validation_age_range",
+            help="Only opportunities whose decision age falls within this inclusive range are selected.",
+        )
     with batch_col:
         if st.button(
-            "Batch validate 4–18 day opportunities",
+            f"Batch validate {min_age_days}–{max_age_days} day opportunities",
             icon=":material/fact_check:",
             key="batch_validate_trade_paths",
+            use_container_width=True,
         ):
-            with st.spinner("Validating unvalidated opportunities against up to 14 days of Yahoo 5-minute history..."):
-                st.session_state["trade_validation_batch_result"] = asyncio.run(
+            with st.status("Selecting eligible opportunities...", expanded=True) as validation_status:
+                validation_progress = st.progress(0, text="Selecting eligible opportunities...")
+                available_so_far = 0
+
+                def update_validation_progress(
+                    index: int,
+                    total: int,
+                    trade_id: int,
+                    available: Optional[bool],
+                ) -> None:
+                    nonlocal available_so_far
+                    if available is None:
+                        fraction = (index - 1) / total
+                        label = f"Fetching historical bars for trade #{trade_id} ({index}/{total})..."
+                    else:
+                        available_so_far += int(available)
+                        fraction = index / total
+                        outcome = "available" if available else "unavailable"
+                        label = (
+                            f"Completed {index}/{total} · {available_so_far} with data · "
+                            f"trade #{trade_id} {outcome}"
+                        )
+                    validation_progress.progress(fraction, text=label)
+                    validation_status.update(label=label, state="running", expanded=True)
+
+                batch_result = asyncio.run(
                     validate_pending_trade_outcomes(
-                        min_age_days=4,
-                        max_age_days=18,
+                        min_age_days=min_age_days,
+                        max_age_days=max_age_days,
                         max_validation_days=14,
+                        progress_callback=update_validation_progress,
                     )
                 )
+                st.session_state["trade_validation_batch_result"] = batch_result
+                completion = (
+                    f"Batch complete: {batch_result['selected_count']} selected · "
+                    f"{batch_result['available_count']} with historical data · "
+                    f"{batch_result['unavailable_count']} unavailable."
+                )
+                validation_progress.progress(1.0, text=completion)
+                validation_status.update(label=completion, state="complete", expanded=True)
             st.rerun()
-    with batch_help:
-        st.caption("Runs across all eligible records, regardless of the current dashboard date or status filters.")
+    st.caption("Runs across all eligible records, regardless of the current dashboard date or status filters.")
 
-    batch_result = st.session_state.pop("trade_validation_batch_result", None)
+    batch_result = st.session_state.get("trade_validation_batch_result")
     if batch_result:
+        age_range = batch_result["age_range_days"]
         st.info(
-            f"Batch complete: {batch_result['selected_count']} selected · "
-            f"{batch_result['available_count']} validated · "
+            f"Batch complete for {age_range['older_than']:g}–{age_range['younger_than']:g} days: "
+            f"{batch_result['selected_count']} selected · "
+            f"{batch_result['available_count']} with historical data · "
             f"{batch_result['unavailable_count']} unavailable."
         )
+
+    st.divider()
+    render_trade_validation_chart(trades)
+    st.divider()
 
     search_col, status_col = st.columns([3, 1])
     with search_col:
@@ -1741,8 +1852,55 @@ def render_trade_search(trades: list[Dict[str, Any]]) -> None:
             or any(query in event["message"].casefold() for event in trade["events"])
         )
     ]
-    st.caption(f"{len(filtered)} trade(s) in the selected time range")
-    render_trade_lifecycles(filtered)
+    page_size_option = st.selectbox(
+        "Trades per page",
+        [10, 25, 50, 100, "All"],
+        index=1,
+        key="trade_lifecycle_page_size",
+    )
+    if page_size_option == "All":
+        page_trades = filtered
+        st.caption(f"Showing all {len(filtered)} trade(s) in the selected time range")
+    elif not filtered:
+        page_trades = []
+        st.session_state["trade_lifecycle_page"] = 1
+        st.caption("0 trades in the selected time range")
+    else:
+        page_size = int(page_size_option)
+        page_count = math.ceil(len(filtered) / page_size)
+        current_page = min(
+            max(1, int(st.session_state.get("trade_lifecycle_page", 1))),
+            page_count,
+        )
+        st.session_state["trade_lifecycle_page"] = current_page
+        start_index = (current_page - 1) * page_size
+        end_index = min(start_index + page_size, len(filtered))
+        page_trades = filtered[start_index:end_index]
+
+        previous_col, page_col, next_col = st.columns([1, 2, 1])
+        with previous_col:
+            if st.button(
+                "Previous",
+                key="trade_lifecycle_previous",
+                disabled=current_page == 1,
+            ):
+                st.session_state["trade_lifecycle_page"] = current_page - 1
+                st.rerun()
+        with page_col:
+            st.caption(
+                f"Showing trades {start_index + 1}–{end_index} of {len(filtered)} "
+                f"· page {current_page} of {page_count}"
+            )
+        with next_col:
+            if st.button(
+                "Next",
+                key="trade_lifecycle_next",
+                disabled=current_page == page_count,
+            ):
+                st.session_state["trade_lifecycle_page"] = current_page + 1
+                st.rerun()
+
+    render_trade_lifecycles(page_trades)
 
 
 def refresh_stale_backend_import() -> None:
@@ -1849,7 +2007,67 @@ def main() -> None:
                 st.rerun()
             except ValueError as error:
                 st.error(str(error))
-        
+
+        st.divider()
+        st.caption("Choose the account whose balance should populate the dashboard portfolio setting.")
+        portfolio_source = st.selectbox(
+            "Portfolio account",
+            list(PORTFOLIO_ACCOUNT_OPTIONS),
+            index=list(PORTFOLIO_ACCOUNT_OPTIONS).index(
+                os.getenv("FINBOT_PORTFOLIO_ACCOUNT_SOURCE", "paper").lower()
+            )
+            if os.getenv("FINBOT_PORTFOLIO_ACCOUNT_SOURCE", "paper").lower() in PORTFOLIO_ACCOUNT_OPTIONS
+            else 0,
+            format_func=lambda key: PORTFOLIO_ACCOUNT_OPTIONS[key],
+            help="This selection is stored in .env.config and used when syncing the portfolio capital.",
+        )
+        portfolio_source_key = f"portfolio_account_snapshot::{portfolio_source}"
+        if st.button("Save portfolio account", key="save_portfolio_account"):
+            try:
+                save_env_config({"FINBOT_PORTFOLIO_ACCOUNT_SOURCE": portfolio_source})
+                st.success("Portfolio account saved.")
+                st.rerun()
+            except Exception as error:
+                st.error(f"Could not save portfolio account: {error}")
+
+        selected_snapshot = st.session_state.get(portfolio_source_key)
+        if portfolio_source != "paper":
+            if st.button("Fetch selected account balance", key="fetch_portfolio_account_balance"):
+                try:
+                    selected_snapshot = integrations_module.get_portfolio_account_snapshot(portfolio_source)
+                    st.session_state[portfolio_source_key] = selected_snapshot
+                    st.rerun()
+                except Exception as error:
+                    selected_snapshot = {
+                        "available": False,
+                        "source": portfolio_source,
+                        "message": str(error),
+                    }
+                    st.session_state[portfolio_source_key] = selected_snapshot
+
+            if selected_snapshot:
+                if selected_snapshot.get("available"):
+                    balance = selected_snapshot.get("balance")
+                    cash_available = selected_snapshot.get("cash_available")
+                    currency = selected_snapshot.get("currency") or "USD"
+                    if balance is not None:
+                        st.caption(f"Selected balance: {currency} {float(balance):,.2f}")
+                    if cash_available is not None and cash_available != balance:
+                        st.caption(f"Available cash: {currency} {float(cash_available):,.2f}")
+                    if st.button(
+                        "Sync capital from selected account",
+                        key="sync_portfolio_capital",
+                        disabled=balance is None,
+                    ):
+                        try:
+                            set_starting_capital(float(balance))
+                            st.success("Starting capital updated from the selected account balance.")
+                            st.rerun()
+                        except ValueError as error:
+                            st.error(str(error))
+                else:
+                    st.warning(selected_snapshot.get("message", "Selected account balance is unavailable."))
+
         st.divider()
         st.subheader("Trade Oversight")
         if st.button("🔍 Audit all trades", key="run_overwatcher_audit"):
@@ -1859,6 +2077,143 @@ def main() -> None:
             st.success(f"✓ Audit complete: {audit_result['total_trades_audited']} trades checked")
             st.caption(f"Log file: audit_logs/{audit_result['audit_log_file'].split('/')[-1]}")
             st.rerun()
+
+    with st.sidebar.expander("Broker settings", expanded=False):
+        with st.form("broker_settings"):
+            broker_provider = st.selectbox(
+                "Broker provider",
+                ["dummy", "etoro", "ibkr"],
+                index=["dummy", "etoro", "ibkr"].index(os.getenv("FINBOT_BROKER_PROVIDER", "dummy").lower())
+                if os.getenv("FINBOT_BROKER_PROVIDER", "dummy").lower() in {"dummy", "etoro", "ibkr"}
+                else 0,
+                help="Choose which broker adapter the execution flow uses.",
+            )
+            st.caption("Changing the provider updates the live environment and persists to .env.config.")
+            st.markdown("**eToro**")
+            st.caption("eToro API access requires both the public API key and the user key; demo balance checks can also use an optional demo account ID.")
+            etoro_base_url = st.text_input(
+                "eToro API base URL",
+                value=os.getenv("ETORO_API_BASE_URL", "https://public-api.etoro.com"),
+                help="Leave unchanged unless your account uses a different eToro API host.",
+            )
+            etoro_api_key = st.text_input(
+                "eToro public API key",
+                value=os.getenv("ETORO_API_KEY", ""),
+                type="password",
+            )
+            etoro_user_key = st.text_input(
+                "eToro user key",
+                value=os.getenv("ETORO_USER_KEY", ""),
+                type="password",
+            )
+            etoro_main_account_id = st.text_input(
+                "eToro main account ID",
+                value=os.getenv("ETORO_MAIN_ACCOUNT_ID", ""),
+                help="Optional. Required only if you want to sync the main/live eToro account balance.",
+            )
+            etoro_demo_account_id = st.text_input(
+                "eToro demo account ID",
+                value=os.getenv("ETORO_DEMO_ACCOUNT_ID", ""),
+                help="Optional. Needed only if you want to test the demo balance endpoint as well.",
+            )
+            etoro_demo_trading = st.checkbox(
+                "Use eToro demo trading",
+                value=os.getenv("ETORO_DEMO_TRADING", "true").lower() in {"1", "true", "yes", "on"},
+                help="Disable only if you explicitly intend to route to the live trading endpoint.",
+            )
+            st.markdown("**Interactive Brokers**")
+            ibkr_host = st.text_input("IBKR host", value=os.getenv("IBKR_HOST", "127.0.0.1"))
+            ibkr_port = st.number_input("IBKR port", min_value=1, max_value=65535, value=int(os.getenv("IBKR_PORT", "7497")))
+            ibkr_client_id = st.number_input("IBKR client id", min_value=0, value=int(os.getenv("IBKR_CLIENT_ID", "1")))
+            ibkr_main_account_id = st.text_input(
+                "IBKR main account ID",
+                value=os.getenv("IBKR_MAIN_ACCOUNT_ID", os.getenv("IBKR_ACCOUNT_ID", "")),
+            )
+            ibkr_demo_account_id = st.text_input(
+                "IBKR demo account ID",
+                value=os.getenv("IBKR_DEMO_ACCOUNT_ID", ""),
+            )
+            ibkr_paper_trading = st.checkbox(
+                "Use IBKR paper trading",
+                value=os.getenv("IBKR_PAPER_TRADING", "true").lower() in {"1", "true", "yes", "on"},
+            )
+            if st.form_submit_button("Save broker settings"):
+                try:
+                    save_env_config({
+                        "FINBOT_BROKER_PROVIDER": broker_provider,
+                        "ETORO_API_BASE_URL": etoro_base_url.strip(),
+                        "ETORO_API_KEY": etoro_api_key.strip(),
+                        "ETORO_USER_KEY": etoro_user_key.strip(),
+                        "ETORO_MAIN_ACCOUNT_ID": etoro_main_account_id.strip(),
+                        "ETORO_DEMO_ACCOUNT_ID": etoro_demo_account_id.strip(),
+                        "ETORO_DEMO_TRADING": "true" if etoro_demo_trading else "false",
+                        "IBKR_HOST": ibkr_host.strip(),
+                        "IBKR_PORT": str(int(ibkr_port)),
+                        "IBKR_CLIENT_ID": str(int(ibkr_client_id)),
+                        "IBKR_ACCOUNT_ID": ibkr_main_account_id.strip(),
+                        "IBKR_MAIN_ACCOUNT_ID": ibkr_main_account_id.strip(),
+                        "IBKR_DEMO_ACCOUNT_ID": ibkr_demo_account_id.strip(),
+                        "IBKR_PAPER_TRADING": "true" if ibkr_paper_trading else "false",
+                    })
+                    st.success("Broker settings saved.")
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Could not save broker settings: {error}")
+
+        validate_clicked = st.button(
+            "Validate eToro credentials",
+            key="validate_etoro_credentials",
+            help="Runs a read-only eToro market-data lookup using the configured public API key and user key.",
+        )
+        if validate_clicked:
+            with st.spinner("Checking eToro authentication and market-data access..."):
+                try:
+                    validation = asyncio.run(integrations_module.validate_etoro_credentials())
+                    st.session_state["etoro_validation_result"] = validation
+                except Exception as error:
+                    st.session_state["etoro_validation_result"] = {
+                        "available": False,
+                        "status": "error",
+                        "message": str(error),
+                        "source": "eToro Public API",
+                    }
+
+        validation_result = st.session_state.get("etoro_validation_result")
+        if validation_result:
+            if validation_result.get("available"):
+                st.success(validation_result.get("message", "eToro credentials validated."))
+            else:
+                st.warning(validation_result.get("message", "Some eToro read-only checks failed."))
+
+            checks = validation_result.get("checks", {})
+            market_check = checks.get("market_data", {})
+            portfolio_check = checks.get("demo_portfolio", {})
+            balance_check = checks.get("demo_balance", {})
+
+            st.markdown("**Validation results**")
+            st.write(
+                f"Market data lookup: {'passed' if market_check.get('available') else 'failed'}"
+            )
+            if market_check.get("available"):
+                market_bits = [f"Symbol {market_check.get('quote_symbol') or market_check.get('symbol')}"]
+                if market_check.get("instrument_id") is not None:
+                    market_bits.append(f"Instrument ID {market_check['instrument_id']}")
+                if market_check.get("quote_type"):
+                    market_bits.append(f"Quote type {market_check['quote_type']}")
+                st.caption(" · ".join(market_bits))
+            else:
+                st.caption(market_check.get("error", "No market-data details returned."))
+
+            st.write(f"Demo portfolio snapshot: {'passed' if portfolio_check.get('available') else 'failed'}")
+            if not portfolio_check.get("available"):
+                st.caption(portfolio_check.get("error", "No portfolio details returned."))
+
+            if balance_check.get("skipped"):
+                st.caption(balance_check.get("message", "Demo balance check skipped."))
+            else:
+                st.write(f"Demo balance endpoint: {'passed' if balance_check.get('available') else 'failed'}")
+                if not balance_check.get("available"):
+                    st.caption(balance_check.get("error", "No demo balance details returned."))
 
     with st.sidebar.expander("AI research settings", expanded=False):
         ai_enabled = get_ai_research_enabled()
@@ -1879,7 +2234,7 @@ def main() -> None:
             sync_openai_token_allowance()
             st.rerun()
 
-    st.caption("Paper portfolio · simulated research and execution · no live brokerage orders")
+    st.caption("Paper portfolio · simulated research and execution · optional eToro demo trading")
 
     render_research_actions()
 

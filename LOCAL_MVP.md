@@ -28,7 +28,11 @@ The image installs Python dependencies at build time. It runs the existing backg
 - Available cash is starting capital less open-position allocations plus realized P&L.
 - Invested capital is cash allocated as margin to open paper positions.
 - Gross exposure is invested capital multiplied by position leverage.
+- The sidebar now includes a portfolio-account selector so you can sync the paper capital setting from an external account balance.
+- eToro demo balance syncing is currently wired; the eToro main and IBKR account slots are present in the UI/config so they can be filled in when those balances are available.
 - The dashboard's Decisions over time chart has an independent quick range: 24 hours, 3 days, 7 days, 1 month, or 3 months.
+- Trade lifecycles lets you choose an inclusive 1–18 day opportunity-age range for batch historical validation; it reports progress per opportunity, and the price-path validation window remains capped at 14 days.
+- The planned-vs-historical-result chart is available on both Dashboard and Trade lifecycles. Lifecycle entries are paged for responsiveness, with an option to show all entries.
 - Each research candidate has its own trade ID and ordered Research, Strategy, Risk, Execution, and optional Exit events.
 - Every trade uses a 2% base stop and 5% base take-profit distance at 1x. Both price distances are divided by leverage, so at 2x the stop is 1% from entry and the target is 2.5% from entry, preserving the same account-level risk/reward thresholds.
 - Trade lifecycles and Companies → Related Trades show projected P&L at the take-profit price using the recorded quantity (and therefore leverage); this estimate is before fees and slippage. Realized P&L is separate and is recorded when a paper position closes.
@@ -44,7 +48,7 @@ OpenAI research is disabled by default and can be enabled in the sidebar. When e
 
 The **OpenAI API spend** panel uses the organization Costs endpoint and requires an organization admin key (`OPENAI_ADMIN_KEY`) plus organization ID (`OPENAI_ORGANIZATION_ID`) in `.env.config`. It reports month-to-date usage cost, not remaining prepaid credit; the project API key alone cannot retrieve billing costs.
 
-The Strategist still applies deterministic confidence and direction rules, the Risk Manager remains the deterministic final threshold gate, and execution remains paper-only. OpenAI does not place orders and no live brokerage orders are available. Interactive Brokers remains a separate execution/account integration and is not used as a news source. IBKR news/data availability depends on supported services, subscriptions, and account permissions. Keep provider credentials in `.env.config`; no key is required for the Yahoo screener/news packages.
+The Strategist still applies deterministic confidence and direction rules, the Risk Manager remains the deterministic final threshold gate, and execution remains paper-only unless you explicitly switch the broker provider to eToro. OpenAI does not place orders. When `FINBOT_BROKER_PROVIDER=etoro`, the app can resolve instrument IDs, query eToro market data, submit demo orders with the configured eToro API keys in `.env.config`, and read the demo trading balance used by the dashboard portfolio selector. Interactive Brokers remains a separate execution/account integration and is not used as a news source. IBKR news/data availability depends on supported services, subscriptions, and account permissions. Keep provider credentials in `.env.config`; no key is required for the Yahoo screener/news packages.
 
 Before using broker credentials, use a dedicated paper account, restrict permissions, never enable withdrawals, and keep `.env.config` out of source control.
 

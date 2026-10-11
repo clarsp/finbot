@@ -1,18 +1,16 @@
 INFO:__main__:Starting hourly news polling every 3600 seconds
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 10 new, 17 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
-INFO:__main__:Hourly Yahoo news fetch completed: 27 fetched, 0 new, 27 refreshed
+INFO:__main__:Headline classification after fetch: 128 relevant, 72 not relevant
+INFO:__main__:Hourly Yahoo news fetch completed: 30 fetched, 0 new, 30 refreshed
+INFO:__main__:Scheduled research cycle starting
+ERROR:yfinance:HTTP Error 404: {"quoteSummary":{"result":null,"error":{"code":"Not Found","description":"Quote not found for symbol: USOIL"}}}
+WARNING:integrations:eToro quote unavailable for USOIL: ValueError
+INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+WARNING:integrations:eToro quote unavailable for META: ValueError
+INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+INFO:__main__:Analyzing market data and forming strategy...
+WARNING:integrations:eToro quote unavailable for CL: ValueError
+INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+INFO:__main__:Analyzing market data and forming strategy...
+WARNING:integrations:eToro quote unavailable for AAPL: ValueError
+INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+INFO:__main__:Analyzing market data and forming strategy...

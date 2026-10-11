@@ -11,7 +11,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Load environment variables from .env.config if it exists
 env_config_path = Path(__file__).resolve().parent / ".env.config"
@@ -30,6 +30,7 @@ from integrations import (
     fetch_company_fundamentals,
     fetch_market_quote,
     fetch_market_trends,
+    submit_broker_order,
     validate_trade_price_path,
 )
 
@@ -1138,13 +1139,16 @@ async def validate_trade_outcome(trade_id: int, max_days: int = 14) -> Dict[str,
 
 
 async def validate_pending_trade_outcomes(
-    min_age_days: float = 4,
+    min_age_days: float = 1,
     max_age_days: float = 18,
     max_validation_days: int = 14,
+    progress_callback: Optional[Callable[[int, int, int, Optional[bool]], None]] = None,
 ) -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
-    low_age = max(0.0, float(min_age_days))
-    high_age = min(18.0, float(max_age_days))
+    low_age = float(min_age_days)
+    high_age = float(max_age_days)
+    if not 1.0 <= low_age <= high_age <= 18.0:
+        raise ValueError("Opportunity age range must be within 1–18 days and in ascending order.")
     eligible_ids = []
     for trade in get_trade_history():
         if trade["status"] not in VALIDATION_STAGE_FOR_STATUS:
@@ -1168,13 +1172,18 @@ async def validate_pending_trade_outcomes(
         if decision_time.tzinfo is None:
             decision_time = decision_time.replace(tzinfo=timezone.utc)
         age_days = (now - decision_time.astimezone(timezone.utc)).total_seconds() / 86400
-        if low_age < age_days < high_age:
+        if low_age <= age_days <= high_age:
             eligible_ids.append(int(trade["id"]))
 
     results = []
-    for trade_id in eligible_ids:
+    total = len(eligible_ids)
+    for index, trade_id in enumerate(eligible_ids, start=1):
+        if progress_callback:
+            progress_callback(index, total, trade_id, None)
         result = await validate_trade_outcome(trade_id, max_days=max_validation_days)
         results.append({"trade_id": trade_id, **result})
+        if progress_callback:
+            progress_callback(index, total, trade_id, bool(result.get("available")))
     return {
         "selected_count": len(eligible_ids),
         "available_count": sum(bool(result.get("available")) for result in results),
@@ -2415,8 +2424,8 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
 
         if not bool(execution_rules.get("enabled", True)):
             execution_readiness_error = "Execution agent is disabled by its rule set."
-        elif not bool(execution_rules.get("paper_trading_only", True)):
-            execution_readiness_error = "Non-paper execution is not implemented; trade blocked."
+        elif not bool(execution_rules.get("paper_trading_only", True)) and settings.broker_provider != "etoro":
+            execution_readiness_error = "Non-eToro live execution is not implemented; trade blocked."
         elif strategy["position"] not in execution_rules.get("allowed_side", ["LONG", "SHORT"]):
             execution_readiness_error = "Execution side is disabled by the current rules."
         else:
@@ -2540,10 +2549,53 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
             cycle_trades.append(trade_result)
             continue
 
-        execution_message = f"Paper position opened with {allocation:.2f} allocated to {candidate['ticker']}."
         entry_price = item["entry_price"]
         stop_loss_price = item["stop_loss_price"]
         take_profit_price = item["take_profit_price"]
+        broker_order = None
+        paper_only = True
+        if settings.broker_provider == "etoro":
+            try:
+                broker_order = await submit_broker_order(
+                    {
+                        "symbol": candidate["ticker"],
+                        "side": strategy["position"],
+                        "amount": allocation,
+                        "leverage": strategy["leverage"],
+                        "currency": candidate.get("market_quote", {}).get("currency") or candidate.get("fundamentals", {}).get("currency") or "usd",
+                    }
+                )
+                paper_only = False
+                execution_message = (
+                    f"eToro {broker_order['mode']} order opened with {allocation:.2f} allocated to {candidate['ticker']}."
+                )
+            except Exception as error:
+                execution_message = f"eToro order failed for {candidate['ticker']}: {error}"
+                conn = get_connection()
+                conn.execute(
+                    "UPDATE trades SET side = ?, status = 'REJECTED_EXECUTION', notes = ? WHERE id = ?",
+                    (strategy["position"], execution_message, trade_id),
+                )
+                conn.commit()
+                conn.close()
+                record_trade_event(
+                    trade_id, "execution", "execution", "completed", "rejected",
+                    execution_message, {**selection_details, "paper_only": False},
+                )
+                record_agent_event(
+                    "execution", "completed", "trade_execution", execution_message,
+                    "rejected", {"trade_id": trade_id, "symbol": candidate["ticker"], **selection_details},
+                )
+                trade_result.update({
+                    "status": "REJECTED_EXECUTION",
+                    "reason": execution_message,
+                    "selection_rank": rank,
+                    "selection_score": selection_score,
+                })
+                cycle_trades.append(trade_result)
+                continue
+        else:
+            execution_message = f"Paper position opened with {allocation:.2f} allocated to {candidate['ticker']}."
         conn = get_connection()
         conn.execute(
             "UPDATE trades SET side = ?, leverage = ?, exit_target = ?, status = 'OPEN', allocated_capital = ?, entry_price = ?, current_price = ?, quantity = ?, take_profit_price = ?, stop_loss_price = ?, notes = ? WHERE id = ?",
@@ -2564,7 +2616,8 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
             f"{execution_message} Stop loss {stop_loss_price:.4f}; take-profit {take_profit_price:.4f}.",
             {
                 "allocated_capital": allocation,
-                "paper_only": True,
+                "paper_only": paper_only,
+                "broker_order": broker_order,
                 "stop_loss_price": stop_loss_price,
                 "take_profit_price": take_profit_price,
                 "side": strategy["position"],
@@ -2584,6 +2637,7 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
             "allocated_capital": allocation,
             "selection_rank": rank,
             "selection_score": selection_score,
+            "broker_order": broker_order,
         })
         cycle_trades.append(trade_result)
         opened_count += 1

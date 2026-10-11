@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional, Protocol
@@ -35,11 +36,21 @@ class IntegrationSettings:
     openai_organization_id: str
     openai_model: str
     broker_provider: str
+    etoro_api_base_url: str
+    etoro_api_key: str
+    etoro_user_key: str
+    etoro_user_agent: str
+    etoro_demo_trading: bool
+    etoro_demo_account_id: str
+    etoro_main_account_id: str
     ibkr_host: str
     ibkr_port: int
     ibkr_client_id: int
     ibkr_account_id: str
+    ibkr_demo_account_id: str
+    ibkr_main_account_id: str
     ibkr_paper_trading: bool
+    portfolio_account_source: str
 
     @classmethod
     def from_environment(cls) -> "IntegrationSettings":
@@ -61,12 +72,165 @@ class IntegrationSettings:
             openai_organization_id=os.getenv("OPENAI_ORGANIZATION_ID", ""),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             broker_provider=os.getenv("FINBOT_BROKER_PROVIDER", "dummy").lower(),
+            etoro_api_base_url=os.getenv("ETORO_API_BASE_URL", "https://public-api.etoro.com"),
+            etoro_api_key=os.getenv("ETORO_API_KEY", ""),
+            etoro_user_key=os.getenv("ETORO_USER_KEY", ""),
+            etoro_user_agent=os.getenv(
+                "ETORO_USER_AGENT",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ),
+            etoro_demo_trading=os.getenv("ETORO_DEMO_TRADING", "true").lower() in {"1", "true", "yes", "on"},
+            etoro_demo_account_id=os.getenv("ETORO_DEMO_ACCOUNT_ID", ""),
+            etoro_main_account_id=os.getenv("ETORO_MAIN_ACCOUNT_ID", ""),
             ibkr_host=os.getenv("IBKR_HOST", "127.0.0.1"),
             ibkr_port=int(os.getenv("IBKR_PORT", "7497")),
             ibkr_client_id=int(os.getenv("IBKR_CLIENT_ID", "1")),
             ibkr_account_id=os.getenv("IBKR_ACCOUNT_ID", ""),
+            ibkr_demo_account_id=os.getenv("IBKR_DEMO_ACCOUNT_ID", ""),
+            ibkr_main_account_id=os.getenv("IBKR_MAIN_ACCOUNT_ID", os.getenv("IBKR_ACCOUNT_ID", "")),
             ibkr_paper_trading=os.getenv("IBKR_PAPER_TRADING", "true").lower() in {"1", "true", "yes", "on"},
+            portfolio_account_source=os.getenv("FINBOT_PORTFOLIO_ACCOUNT_SOURCE", "paper").lower(),
         )
+
+
+def _coerce_money(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _first_numeric_by_keys(payload: Any, preferred_keys: tuple[str, ...]) -> Optional[float]:
+    if isinstance(payload, dict):
+        for key in preferred_keys:
+            if key in payload:
+                numeric = _coerce_money(payload.get(key))
+                if numeric is not None:
+                    return numeric
+        for value in payload.values():
+            nested = _first_numeric_by_keys(value, preferred_keys)
+            if nested is not None:
+                return nested
+    elif isinstance(payload, list):
+        for item in payload:
+            nested = _first_numeric_by_keys(item, preferred_keys)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _normalize_portfolio_balance(payload: Dict[str, Any], *, source: str, provider: str) -> Dict[str, Any]:
+    balance = _first_numeric_by_keys(
+        payload,
+        (
+            "displayBalance",
+            "totalBalance",
+            "balance",
+            "portfolioValue",
+            "accountValue",
+            "netEquity",
+            "totalAmount",
+            "credit",
+        ),
+    )
+    cash_available = _first_numeric_by_keys(
+        payload,
+        ("available", "availableAmount", "availableCash", "cash", "spendableBalanceInFiat"),
+    )
+    currency = (
+        str(payload.get("displayCurrency") or payload.get("currency") or "").upper() or None
+    )
+    if cash_available is None and isinstance(payload.get("equityDetails"), dict):
+        cash_available = _first_numeric_by_keys(
+            payload["equityDetails"],
+            ("available", "spendableBalanceInFiat", "cash"),
+        )
+        if not currency:
+            nested_currency = payload["equityDetails"].get("currency")
+            currency = str(nested_currency).upper() if nested_currency else None
+    if balance is None and cash_available is not None:
+        balance = cash_available
+    if balance is None and cash_available is None:
+        return {
+            "available": False,
+            "provider": provider,
+            "source": source,
+            "message": "The eToro response did not expose a recognizable balance field.",
+            "payload": payload,
+        }
+    return {
+        "available": balance is not None,
+        "provider": provider,
+        "source": source,
+        "balance": balance,
+        "cash_available": cash_available,
+        "currency": currency,
+        "payload": payload,
+    }
+
+
+def get_portfolio_account_snapshot(source: Optional[str] = None) -> Dict[str, Any]:
+    settings = IntegrationSettings.from_environment()
+    selected_source = (source or settings.portfolio_account_source or "paper").lower()
+    if selected_source == "paper":
+        from makemoney import get_portfolio_summary as _get_portfolio_summary
+
+        summary = {"starting_capital": _get_portfolio_summary()["starting_capital"]}
+        return {
+            "available": True,
+            "provider": "paper",
+            "source": "paper",
+            "balance": summary["starting_capital"],
+            "cash_available": summary["starting_capital"],
+            "currency": "USD",
+            "payload": summary,
+        }
+    if selected_source.startswith("etoro"):
+        adapter = EtoroBrokerAdapter(settings)
+        if selected_source == "etoro_demo":
+            payload = adapter._request_json("GET", "/api/v1/trading/info/demo/portfolio")
+            return _normalize_portfolio_balance(payload, source=selected_source, provider="eToro")
+        if selected_source == "etoro_main":
+            if not settings.etoro_main_account_id:
+                return {
+                    "available": False,
+                    "provider": "eToro",
+                    "source": selected_source,
+                    "message": "ETORO_MAIN_ACCOUNT_ID is not configured.",
+                }
+            payload = adapter._request_json(
+                "GET",
+                f"/api/v1/balances/trading/{settings.etoro_main_account_id}",
+                params={"displayCurrency": "USD", "expand": "equityDetails"},
+            )
+            return _normalize_portfolio_balance(payload, source=selected_source, provider="eToro")
+        return {
+            "available": False,
+            "provider": "eToro",
+            "source": selected_source,
+            "message": f"Unsupported eToro portfolio source: {selected_source}",
+        }
+    if selected_source.startswith("ibkr"):
+        account_id = settings.ibkr_demo_account_id if selected_source == "ibkr_demo" else settings.ibkr_main_account_id
+        return {
+            "available": False,
+            "provider": "IBKR",
+            "source": selected_source,
+            "message": (
+                "IBKR portfolio balance syncing is not wired yet."
+                if not account_id
+                else "IBKR balance syncing is not wired yet, even though an account ID is configured."
+            ),
+        }
+    return {
+        "available": False,
+        "provider": "unknown",
+        "source": selected_source,
+        "message": f"Unsupported portfolio source: {selected_source}",
+    }
 
 
 async def fetch_company_fundamentals(ticker: str) -> Dict[str, Any]:
@@ -75,6 +239,14 @@ async def fetch_company_fundamentals(ticker: str) -> Dict[str, Any]:
 
 async def fetch_market_quote(ticker: str) -> Dict[str, Any]:
     return await asyncio.to_thread(_fetch_market_quote, ticker)
+
+
+async def submit_broker_order(order: Dict[str, Any]) -> Dict[str, Any]:
+    return await asyncio.to_thread(_submit_broker_order, order)
+
+
+async def validate_etoro_credentials(symbol: str = "AAPL") -> Dict[str, Any]:
+    return await asyncio.to_thread(_validate_etoro_credentials, symbol)
 
 
 async def fetch_market_trends(ticker: str) -> Dict[str, Any]:
@@ -351,6 +523,10 @@ def _fetch_market_trends(ticker: str) -> Dict[str, Any]:
 
 
 def _fetch_market_quote(ticker: str) -> Dict[str, Any]:
+    settings = IntegrationSettings.from_environment()
+    if settings.broker_provider == "etoro":
+        return _fetch_etoro_market_quote(settings, ticker)
+
     yahoo_symbol = {"USOIL": "CL=F"}.get(ticker.upper(), ticker.upper())
     fetched_at = datetime.now(timezone.utc).isoformat()
     try:
@@ -388,6 +564,52 @@ def _fetch_market_quote(ticker: str) -> Dict[str, Any]:
             "source": "Yahoo Finance",
             "fetched_at": fetched_at,
             "available": False,
+        }
+
+
+def _fetch_etoro_market_quote(settings: IntegrationSettings, ticker: str) -> Dict[str, Any]:
+    symbol = ticker.upper()
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    try:
+        instrument = _etoro_find_instrument(settings, symbol)
+        rate = _etoro_get_rate(settings, _etoro_instrument_id(instrument))
+        bid = _coerce_optional_float(rate.get("bid"))
+        ask = _coerce_optional_float(rate.get("ask"))
+        last_execution = _coerce_optional_float(
+            rate.get("lastExecution")
+            or rate.get("lastExecutionPrice")
+            or rate.get("last_execution")
+        )
+        price = last_execution
+        if price is None and bid is not None and ask is not None:
+            price = (bid + ask) / 2.0
+        if price is None:
+            price = ask if ask is not None else bid
+        if price is None or not math.isfinite(price) or price <= 0:
+            raise ValueError("eToro returned a non-positive quote")
+        return {
+            "ticker": symbol,
+            "quote_symbol": str(instrument.get("internalSymbolFull") or symbol).upper(),
+            "instrument_id": _etoro_instrument_id(instrument),
+            "price": price,
+            "bid": bid,
+            "ask": ask,
+            "last_execution": last_execution,
+            "quote_type": rate.get("quoteType"),
+            "source": "eToro Public API",
+            "fetched_at": fetched_at,
+            "available": True,
+        }
+    except Exception as error:
+        logger.warning("eToro quote unavailable for %s: %s", ticker, type(error).__name__)
+        return {
+            "ticker": symbol,
+            "quote_symbol": symbol,
+            "price": None,
+            "source": "eToro Public API",
+            "fetched_at": fetched_at,
+            "available": False,
+            "reason": str(error),
         }
 
 
@@ -720,6 +942,108 @@ class BrokerAdapter(Protocol):
     def get_positions(self) -> Dict[str, Any]: ...
 
 
+class EtoroBrokerAdapter:
+    def __init__(self, settings: IntegrationSettings) -> None:
+        if not settings.etoro_api_key or not settings.etoro_user_key:
+            raise ValueError("ETORO_API_KEY and ETORO_USER_KEY are required when the eToro provider is selected.")
+        self.settings = settings
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "x-api-key": self.settings.etoro_api_key,
+            "x-user-key": self.settings.etoro_user_key,
+            "x-request-id": str(uuid.uuid4()),
+            "User-Agent": self.settings.etoro_user_agent,
+        }
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        base_url = self.settings.etoro_api_base_url.rstrip("/")
+        url = f"{base_url}{path}"
+        if params:
+            url = f"{url}?{urlencode(params, doseq=True)}"
+        headers = self._headers()
+        data = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(payload).encode("utf-8")
+        request = Request(url, data=data, headers=headers, method=method)
+        try:
+            with urlopen(request, timeout=20) as response:
+                body = response.read().decode("utf-8")
+                return json.loads(body) if body else {}
+        except HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace") if hasattr(error, "read") else ""
+            message = body.strip() or error.reason or f"HTTP {error.code}"
+            raise ValueError(f"eToro request failed with HTTP {error.code}: {message}") from error
+
+    def _find_instrument(self, symbol: str) -> Dict[str, Any]:
+        payload = self._request_json(
+            "GET",
+            "/api/v1/market-data/search",
+            params={"internalSymbolFull": symbol.upper()},
+        )
+        items = payload.get("items") or payload.get("results") or []
+        for item in items:
+            if str(item.get("internalSymbolFull", "")).upper() == symbol.upper():
+                return item
+        raise ValueError(f"eToro could not resolve instrument ID for {symbol}.")
+
+    def _get_rate(self, instrument_id: int) -> Dict[str, Any]:
+        payload = self._request_json(
+            "GET",
+            "/api/v2/market-data/rates",
+            params={"instrumentIds": [instrument_id]},
+        )
+        results = payload.get("results") or payload.get("rates") or []
+        for result in results:
+            result_id = _etoro_instrument_id(result)
+            if result_id == instrument_id:
+                return result
+        raise ValueError(f"eToro did not return market data for instrument {instrument_id}.")
+
+    def submit_order(self, order: Dict[str, Any]) -> Dict[str, Any]:
+        symbol = str(order["symbol"]).upper()
+        side = str(order.get("side", "LONG")).upper()
+        amount = order.get("amount")
+        units = order.get("units")
+        if amount is None and units is None:
+            raise ValueError("eToro orders require an amount or units value.")
+        instrument = self._find_instrument(symbol)
+        instrument_id = _etoro_instrument_id(instrument)
+        payload: Dict[str, Any] = {
+            "action": "open",
+            "transaction": "buy" if side == "LONG" else "sell",
+            "symbol": symbol,
+            "instrumentId": instrument_id,
+            "orderType": "mkt",
+            "leverage": float(order.get("leverage", 1.0)),
+        }
+        if amount is not None:
+            payload["amount"] = float(amount)
+            payload["orderCurrency"] = str(order.get("currency") or instrument.get("currency") or "usd").lower()
+        if units is not None:
+            payload["units"] = float(units)
+        endpoint = "/api/v2/trading/execution/demo/orders" if self.settings.etoro_demo_trading else "/api/v2/trading/execution/orders"
+        response = self._request_json("POST", endpoint, payload=payload)
+        return {
+            "provider": "etoro",
+            "mode": "demo" if self.settings.etoro_demo_trading else "live",
+            "symbol": symbol,
+            "instrument_id": instrument_id,
+            "request": payload,
+            "response": response,
+        }
+
+    def get_positions(self) -> Dict[str, Any]:
+        raise NotImplementedError("eToro position reconciliation has not been wired into this MVP yet.")
+
+
 class OpenAIResearchAdapter:
     def __init__(
         self,
@@ -1006,3 +1330,115 @@ class InteractiveBrokersAdapter:
 
     def get_positions(self) -> Dict[str, Any]:
         raise NotImplementedError("Implement IBKR position reconciliation before enabling it.")
+
+
+def _submit_broker_order(order: Dict[str, Any]) -> Dict[str, Any]:
+    settings = IntegrationSettings.from_environment()
+    if settings.broker_provider == "etoro":
+        return EtoroBrokerAdapter(settings).submit_order(order)
+    if settings.broker_provider == "ibkr":
+        return InteractiveBrokersAdapter(settings).submit_order(order)
+    raise ValueError(f"Unsupported broker provider: {settings.broker_provider}")
+
+
+def _validate_etoro_credentials(symbol: str = "AAPL") -> Dict[str, Any]:
+    settings = IntegrationSettings.from_environment()
+    if not settings.etoro_api_key or not settings.etoro_user_key:
+        return {
+            "available": False,
+            "status": "missing_credentials",
+            "message": "ETORO_API_KEY and ETORO_USER_KEY are both required.",
+            "symbol": symbol.upper(),
+        }
+    try:
+        adapter = EtoroBrokerAdapter(settings)
+        checks: Dict[str, Any] = {}
+
+        try:
+            instrument = adapter._find_instrument(symbol)
+            instrument_id = _etoro_instrument_id(instrument)
+            rate = adapter._get_rate(instrument_id)
+            checks["market_data"] = {
+                "available": True,
+                "symbol": symbol.upper(),
+                "instrument_id": instrument_id,
+                "quote_symbol": str(instrument.get("internalSymbolFull") or symbol).upper(),
+                "quote_type": rate.get("quoteType"),
+                "bid": _coerce_optional_float(rate.get("bid")),
+                "ask": _coerce_optional_float(rate.get("ask")),
+            }
+        except Exception as error:
+            checks["market_data"] = {
+                "available": False,
+                "symbol": symbol.upper(),
+                "error": str(error),
+            }
+
+        try:
+            demo_portfolio = adapter._request_json("GET", "/api/v1/trading/info/demo/portfolio")
+            checks["demo_portfolio"] = {"available": True, "payload": demo_portfolio}
+        except Exception as error:
+            checks["demo_portfolio"] = {"available": False, "error": str(error)}
+
+        if settings.etoro_demo_account_id:
+            try:
+                demo_balance = adapter._request_json(
+                    "GET",
+                    f"/api/v1/balances/demo/{settings.etoro_demo_account_id}",
+                    params={"displayCurrency": "USD", "expand": "equityDetails"},
+                )
+                checks["demo_balance"] = {"available": True, "payload": demo_balance}
+            except Exception as error:
+                checks["demo_balance"] = {"available": False, "error": str(error)}
+        else:
+            checks["demo_balance"] = {
+                "available": False,
+                "skipped": True,
+                "message": "ETORO_DEMO_ACCOUNT_ID is not configured.",
+            }
+
+        overall_available = bool(checks["market_data"]["available"] and checks["demo_portfolio"]["available"])
+        return {
+            "available": overall_available,
+            "status": "complete" if overall_available else "partial_failure",
+            "message": (
+                f"Authenticated eToro access confirmed for {symbol.upper()} and the demo portfolio."
+                if overall_available else
+                "Some eToro read-only checks failed; see endpoint details."
+            ),
+            "symbol": symbol.upper(),
+            "checks": checks,
+            "source": "eToro Public API",
+        }
+    except Exception as error:
+        logger.warning("eToro credential validation failed for %s: %s", symbol, type(error).__name__)
+        return {
+            "available": False,
+            "status": "error",
+            "message": str(error),
+            "symbol": symbol.upper(),
+            "source": "eToro Public API",
+        }
+
+
+def _etoro_find_instrument(settings: IntegrationSettings, symbol: str) -> Dict[str, Any]:
+    return EtoroBrokerAdapter(settings)._find_instrument(symbol)
+
+
+def _etoro_get_rate(settings: IntegrationSettings, instrument_id: int) -> Dict[str, Any]:
+    return EtoroBrokerAdapter(settings)._get_rate(instrument_id)
+
+
+def _etoro_instrument_id(item: Dict[str, Any]) -> int:
+    instrument_id = item.get("instrumentId", item.get("instrumentID"))
+    if instrument_id is None:
+        raise ValueError("eToro response did not include an instrument ID.")
+    return int(instrument_id)
+
+
+def _coerce_optional_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
