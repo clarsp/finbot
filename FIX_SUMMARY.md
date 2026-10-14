@@ -1,3 +1,15 @@
+# Current repair — 14 October 2026
+
+The current implementation is documented in [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md) and [LOCAL_MVP.md](LOCAL_MVP.md). The older investigation below describes the October 5 implementation and is historical.
+
+- Two-direction news reaction plus measured conditional mean reversion; shared final execution gates.
+- Configurable default maximum 5 units and $200 capital/margin including a cost reserve; visible sizing explanations.
+- Minute-by-minute broker lifecycle maintenance; hourly reversible analysis archival after three days.
+- Durable order references, concurrency protection, broker outcome evidence, accurate dashboard states and worker supervision.
+- 63 offline regressions pass; profitability and actual new demo endpoint behavior remain unverified.
+
+---
+
 # Research Trading Pipeline Fix - October 5, 2026
 
 ## Problem Statement
@@ -142,3 +154,27 @@ The daemon will now automatically load these on startup, regardless of how it's 
 
 **Commit:** 1cb9c5f - "Fix daemon environment variable loading from .env.config"
 **Date:** 2026-10-05 16:30-16:35 UTC
+
+## Dashboard performance follow-up — 14 October 2026
+
+Batched/indexed SQLite reads, WAL initialization, compact metadata, SQL pagination, lazy lifecycle/evidence tabs, short UI caches and saved broker snapshots replace the expensive full dashboard loading path. See [DASHBOARD_PERFORMANCE.md](DASHBOARD_PERFORMANCE.md) for measured backend improvements and regression evidence.
+
+# Trade lifecycle analysis grouping
+
+- Analysis lifecycles now default to candidates that reached the Execution Agent, so failed submissions and final execution gate decisions are reviewed first.
+- Repeated runs are collapsed only when ticker, direction, stored status, terminal stage, terminal decision, and structured rejection reason (or terminal message) are unchanged.
+- The newest row shows the number of equivalent runs and their first/latest timestamps. The underlying lifecycle rows remain intact and can be shown with **Show every repeated analysis run**.
+- Stage filters expose execution, risk, strategy, research, or all analysis outcomes. Executed and submitted broker lifecycles remain ungrouped.
+
+## Successful trade email notifications
+
+- An eToro demo order acknowledged by the broker now triggers an optional SMTP email from the shared submission path, covering both automated and manually applied candidates.
+- Messages distinguish broker submission from confirmed fill/reconciliation, summarize every saved agent stage, and can attach the complete sanitized lifecycle evidence as JSON.
+- SMTP supports authenticated STARTTLS, implicit TLS, or an unencrypted connection. Host, port, sender, recipients, credentials, subject prefix, timeout, and attachment behavior are configurable through environment variables; the main sidebar exposes the common settings.
+- Credential-like fields are removed recursively from attached evidence. An email failure creates a notification event on the lifecycle and does not reinterpret or retry the broker order.
+- Risk sizing now skips unavailable inputs cleanly, so an unavailable eToro instrument/quote produces explicit blockers instead of an additional `float(None)` error.
+- Every lifecycle can now be downloaded as structured JSON or a standalone HTML report. Both exports use the same recursive credential redaction as email attachments.
+- SMTP settings include a no-message connection/TLS/authentication test and a separate, explicitly labeled sample trade-report delivery action.
+- Regression tests force external notifications off, preventing mocked broker submissions from contacting a configured SMTP service.
+- Execution readiness is now recorded as an accepted gate before the final broker recheck. Older lifecycles with a later submitted event are rendered the same way, replacing the misleading “checking readiness” pending label.
+- Reconciled open trades show a prominent broker-confirmed banner with order and position IDs, and maintenance replaces stale “reconciliation pending” notes once the broker position and protection are verified.

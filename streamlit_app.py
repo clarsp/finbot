@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
 
 import extra_streamlit_components as stx
@@ -16,11 +17,21 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+from email_notifications import (
+    build_trade_report_html,
+    load_trade_evidence,
+    parse_recipient_addresses,
+    send_trade_execution_email,
+    test_smtp_connection,
+)
+
+DISPLAY_TIMEZONE = ZoneInfo("Europe/Stockholm")
 
 integrations_refresh_needed = (
     not hasattr(integrations_module, "validate_trade_price_path")
     or not hasattr(integrations_module, "validate_etoro_credentials")
     or not hasattr(integrations_module, "get_portfolio_account_snapshot")
+    or not hasattr(integrations_module, "EtoroAPIError")
 )
 if integrations_refresh_needed:
     integrations_module = importlib.reload(integrations_module)
@@ -31,6 +42,13 @@ if (
     or not hasattr(backend_module, "validate_trade_outcome")
     or not hasattr(backend_module, "get_company_analytics")
     or not hasattr(backend_module, "get_latest_research_cycle_status")
+    or not hasattr(backend_module, "get_etoro_api_debug_logging")
+    or not hasattr(backend_module, "set_etoro_api_debug_logging")
+        or not hasattr(backend_module, "run_strategy_evaluation")
+        or not hasattr(backend_module, "get_strategy_evaluation")
+        or not hasattr(backend_module, "run_demo_test_workflow")
+        or not hasattr(backend_module, "get_sample_research_inputs")
+        or not hasattr(backend_module, "place_analysis_candidate_demo_order")
 ):
     backend_module = importlib.reload(backend_module)
 
@@ -43,6 +61,11 @@ from makemoney import (
     close_paper_trade,
     create_session_token,
     get_ai_research_enabled,
+    get_etoro_api_debug_logging,
+    get_strategy_evaluation,
+    get_demo_automated_trading_enabled,
+    get_test_workflow_runs,
+    get_sample_research_inputs,
     get_company_analytics,
     get_company_analysis_history,
     get_dashboard_summary,
@@ -56,8 +79,16 @@ from makemoney import (
     revoke_session_token,
     run_hourly_news_fetch,
     run_trading_cycle,
+    run_strategy_evaluation,
+    place_analysis_candidate_demo_order,
+    request_etoro_demo_close,
+    run_demo_test_workflow,
+    reconcile_demo_test_workflow,
+    close_demo_test_workflow,
     set_starting_capital,
     set_ai_research_enabled,
+    set_etoro_api_debug_logging,
+    set_demo_automated_trading_enabled,
     configure_research_schedule,
     change_user_password,
     delete_user,
@@ -65,6 +96,7 @@ from makemoney import (
     update_user_avatar,
     suspend_research_schedule,
     sync_openai_token_allowance,
+    update_etoro_demo_protection,
     update_agent_rules,
     validate_pending_trade_outcomes,
     OverwatcherAgent,
@@ -77,6 +109,22 @@ st.set_page_config(page_title="Finbot Local MVP", layout="wide")
 ENABLE_HTTPS = os.getenv("ENABLE_HTTPS", "false").lower() in {"1", "true", "yes", "on"}
 
 AGENT_RULE_HELP = {
+    "max_single_position_exposure_pct": "Maximum gross notional for one position as a fraction of account equity.",
+    "stress_gap_pct": "Additional adverse gap assumption, as a fraction of price, added to nominal stop risk. This is a scenario, not a loss guarantee.",
+    "max_stressed_loss_pct": "Maximum portfolio loss under the configured stop-plus-gap stress scenario, as a fraction of equity.",
+    "stop_atr_multiple": "Distance from entry to stop loss in ATR14 units. The current default is 2× ATR14.",
+    "target_reward_risk": "Take-profit distance as a multiple of stop distance. At 1.5 with a 2× ATR stop, take profit is 3× ATR14 from entry.",
+    "sector_exposure_enabled": "Optional sector concentration gate. Requires verified sector labels for every broker holding; unknown sectors block new orders when enabled.",
+    "max_sector_exposure_pct": "Maximum gross notional per sector as a fraction of equity when the sector gate is enabled.",
+    "max_order_units": "Hard quantity ceiling per new order. Fractional units are allowed. Default: 5 units.",
+    "max_order_spend_usd": "Maximum estimated account capital per order, including a reserve for costs. At 2× leverage, $200 margin can provide up to $400 exposure. The units cap also applies.",
+    "analysis_retention_days": "Archive never-submitted analysis after this many days. Broker orders, fills, uncertain submissions and open positions are preserved. Default: 3 days.",
+    "conditional_mean_reversion_confirmation_atr": "Required completed-bar recovery from the post-news extreme before entering the reversal.",
+    "conditional_mean_reversion_min_confidence": "Research confidence required for a temporary news reaction; technical distance never overrides it.",
+    "conditional_mean_reversion_stop_cushion_atr": "Place the protective stop this many ATR units beyond the measured news-reaction extreme.",
+    "max_research_age_hours": "A manual candidate older than this needs fresh research before submission.",
+    "news_max_hold_hours": "Automatically request a broker close when a new directional news trade exceeds this holding time.",
+    "mean_reversion_max_hold_hours": "Maximum holding time for a new conditional mean reversion trade.",
     "enabled": "Whether this agent participates in analysis cycles.",
     "min_confidence": "Minimum confidence, from 0.0 to 1.0, needed to pass this decision gate.",
     "allowed_sectors": "Research candidates outside these sectors are rejected.",
@@ -85,6 +133,7 @@ AGENT_RULE_HELP = {
     "fundamental_confirmation_min_confidence": "Minimum confidence when at least three company metrics and a directly matched headline support the proposed direction.",
     "countertrend_short_min_confidence": "Minimum confidence for a short that conflicts with strong fundamentals or company-specific bullish news.",
     "countertrend_long_min_confidence": "Minimum confidence for a long that conflicts with weak fundamentals or company-specific bearish news.",
+    "conditional_mean_reversion_min_atr_multiple": "Minimum measured post-news excursion from the pre-news price, in ATR14 multiples. A temporary news assessment and completed-bar reversal confirmation are also required.",
     "strong_fundamentals_min_revenue_growth_pct": "Revenue growth threshold for one of the metrics used to identify strong company fundamentals.",
     "strong_fundamentals_min_net_profit_margin_pct": "Net margin threshold for one of the metrics used to identify strong company fundamentals.",
     "strong_fundamentals_max_debt_to_equity": "Maximum debt/equity ratio for one of the metrics used to identify strong company fundamentals.",
@@ -94,7 +143,7 @@ AGENT_RULE_HELP = {
     "require_company_specific_news_for_fundamental_confirmation": "Require a company-specific headline in the same direction before lowering the confidence threshold for a fundamentals-aligned trade.",
     "require_company_specific_news_for_countertrend_short": "Require a directly company-linked bearish headline before shorting against strong fundamentals or bullish news.",
     "require_company_specific_news_for_countertrend_long": "Require a directly company-linked bullish headline before going long against weak fundamentals or bearish news.",
-    "require_current_market_quote": "Block paper trade progression unless a current Yahoo Finance quote is available.",
+    "require_current_market_quote": "Execution requires a fresh eToro quote. Missing quotes do not block news or company analysis.",
     "default_leverage": "Starting leverage for a candidate; the Strategist's final leverage is persisted with its exits.",
     "max_leverage": "Upper leverage limit for the strategist's proposed position.",
     "position_limit": "Maximum fraction of starting capital allocated to one trade.",
@@ -104,7 +153,7 @@ AGENT_RULE_HELP = {
     "exit_on_risk_breach": "Reject/exit if a configured risk threshold is breached. This safety gate is required.",
     "openai_trend_review_enabled": "After strategy approval, request an independent OpenAI review of Yahoo price trends over 1 hour, 24 hours, this week, this year, and 5 years. This uses additional API tokens.",
     "trend_opposition_min_confidence": "Reject a proposed position when the OpenAI trend review strongly opposes it at or above this confidence.",
-    "paper_trading_only": "Execution remains simulated; live broker orders are not implemented.",
+    "paper_trading_only": "Controls the local simulator. When eToro is the selected broker, approved trades are sent to the configured eToro demo or live endpoint.",
     "max_trade_value": "Maximum paper capital allocation for one trade.",
     "max_trades_per_cycle": "Maximum number of risk-approved candidates the paper execution stage may open in one cycle; highest direction-neutral evidence scores are selected first.",
     "allowed_side": "Trade directions permitted by paper execution.",
@@ -118,6 +167,21 @@ PORTFOLIO_ACCOUNT_OPTIONS = {
     "ibkr_demo": "IBKR demo account",
     "ibkr_main": "IBKR main account",
 }
+
+
+def integer_leverage(value: Any) -> Optional[int]:
+    try:
+        numeric = float(value)
+        if math.isfinite(numeric) and numeric.is_integer():
+            return int(numeric)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def format_leverage(value: Any) -> str:
+    integer_value = integer_leverage(value)
+    return f"{integer_value}x" if integer_value is not None else "Unknown"
 
 
 def load_env_config() -> Dict[str, str]:
@@ -156,6 +220,7 @@ def save_env_config(updates: Dict[str, str]) -> None:
             rewritten.append(f"{key}={value}")
     ENV_CONFIG_PATH.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
     os.environ.update(updates)
+    clear_dashboard_caches()
 
 st.markdown(
     """
@@ -173,7 +238,7 @@ st.markdown(
             margin: 0.1rem 0 0.35rem;
         }
         header[data-testid="stHeader"]::before {
-            content: "Trading Monitor";
+            content: "Trade Monitor";
             position: absolute;
             left: 1rem;
             top: 0.55rem;
@@ -181,6 +246,16 @@ st.markdown(
             font-size: 0.875rem;
             font-weight: 600;
             line-height: 2rem;
+            pointer-events: none;
+        }
+        .trade-monitor-clock {
+            position: fixed;
+            left: 8rem;
+            top: 1.05rem;
+            z-index: 1000000;
+            color: #94a3b8;
+            font-size: 0.72rem;
+            font-variant-numeric: tabular-nums;
             pointer-events: none;
         }
         .st-key-app_header_actions {
@@ -214,6 +289,11 @@ st.markdown(
             header[data-testid="stHeader"]::before {
                 left: 0.5rem;
                 font-size: 0.75rem;
+            }
+            .trade-monitor-clock {
+                left: 6.2rem;
+                top: 1.12rem;
+                font-size: 0.64rem;
             }
             .st-key-app_header_actions {
                 right: 6.5rem;
@@ -312,6 +392,18 @@ st.markdown(
         }
         .flow-item.pending {
             border-color: rgba(148, 163, 184, 0.4);
+        }
+        .flow-item.deferred {
+            border-color: rgba(245, 158, 11, 0.7);
+            box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.25);
+        }
+        .flow-item.unavailable {
+            border-color: rgba(168, 85, 247, 0.65);
+            box-shadow: inset 0 0 0 1px rgba(168, 85, 247, 0.25);
+        }
+        .flow-item.skipped {
+            border-style: dashed;
+            color: #94a3b8;
         }
         .flow-arrow {
             align-self: center;
@@ -468,99 +560,157 @@ def render_openai_usage() -> None:
 
 def render_research_actions() -> None:
     schedule = get_research_schedule()
-    with st.sidebar.expander("Research Actions", expanded=False):
-        mode_options = ["Manual", "Automatic"]
-        current_mode = schedule["mode"].title()
-        with st.form("research_schedule_settings"):
-            requested_mode = st.radio(
-                "Research mode", mode_options,
-                index=mode_options.index(current_mode) if current_mode in mode_options else 0,
-                horizontal=True,
-            )
-            interval = st.number_input(
-                "Automatic schedule interval (minutes)",
-                min_value=1,
-                max_value=1440,
-                value=schedule["interval_minutes"],
-                step=15,
-                disabled=requested_mode != "Automatic",
-            )
-            if st.form_submit_button("Save research mode"):
-                configure_research_schedule(requested_mode.lower(), int(interval))
-                st.rerun()
-
-        if schedule["mode"] == "automatic":
-            next_run = datetime.fromisoformat(schedule["next_run"]).astimezone()
-            st.caption(f"Schedule: every {schedule['interval_minutes']} minutes")
-            st.caption(f"Next run: {next_run:%Y-%m-%d %H:%M:%S %Z}")
-            if schedule["last_run"]:
-                last_run = datetime.fromisoformat(schedule["last_run"]).astimezone()
-                st.caption(f"Last run: {last_run:%Y-%m-%d %H:%M:%S %Z}")
-            if schedule["suspended"]:
-                resume_at = datetime.fromisoformat(schedule["suspended_until"]).astimezone()
-                st.warning(f"Suspended until {resume_at:%Y-%m-%d %H:%M:%S %Z}")
-            with st.form("suspend_research_schedule"):
-                resume_date = st.date_input("Resume date")
-                resume_time = st.time_input("Resume time")
-                suspend_col, resume_col = st.columns(2)
-                suspend = suspend_col.form_submit_button("Suspend until")
-                resume = resume_col.form_submit_button("Resume now")
-            if suspend:
-                local_resume = datetime.combine(resume_date, resume_time).astimezone()
-                if local_resume <= datetime.now().astimezone():
-                    st.error("Choose a resume date and time in the future.")
-                else:
-                    suspend_research_schedule(local_resume.astimezone(timezone.utc).isoformat())
+    with st.sidebar.expander('Research Actions', expanded=False, key='lazy_render_research_actions_1', on_change="rerun") as lazy_panel:
+        if lazy_panel.open:
+            mode_options = ["Manual", "Automatic"]
+            current_mode = schedule["mode"].title()
+            with st.form("research_schedule_settings"):
+                requested_mode = st.radio(
+                    "Research mode", mode_options,
+                    index=mode_options.index(current_mode) if current_mode in mode_options else 0,
+                    horizontal=True,
+                )
+                interval = st.number_input(
+                    "Automatic schedule interval (minutes)",
+                    min_value=1,
+                    max_value=1440,
+                    value=schedule["interval_minutes"],
+                    step=15,
+                    disabled=requested_mode != "Automatic",
+                )
+                if st.form_submit_button("Save research mode"):
+                    configure_research_schedule(requested_mode.lower(), int(interval))
                     st.rerun()
-            if resume:
-                suspend_research_schedule(None)
-                st.rerun()
-            if st.button("Stop automatic schedule", key="stop_research_schedule"):
-                configure_research_schedule("manual", schedule["interval_minutes"])
-                suspend_research_schedule(None)
-                st.rerun()
-        else:
-            st.caption("Automatic research is stopped. Manual actions are available below.")
-            if st.button("Fetch news only", key="manual_fetch_news"):
-                with st.spinner("Fetching screened Yahoo Finance headlines..."):
-                    news_result = asyncio.run(run_hourly_news_fetch())
-                st.session_state["manual_research_result"] = {"news": news_result, "cycle": None}
-                refresh_dashboard_end_time()
-                st.rerun()
 
-            if st.button("Run agent analysis", key="manual_agent_analysis"):
-                with st.spinner("Running researcher, strategist, risk, and execution rules..."):
-                    cycle_result = run_agent_cycle_for_ui()
-                if cycle_result:
-                    st.session_state["manual_research_result"] = {"news": None, "cycle": cycle_result}
-                refresh_dashboard_end_time()
-                st.rerun()
-
-            if st.button("Fetch news + analyze", type="primary", key="manual_fetch_and_analyze"):
-                with st.spinner("Fetching news and running the agent cycle..."):
-                    news_result = asyncio.run(run_hourly_news_fetch())
-                    cycle_result = run_agent_cycle_for_ui()
-                st.session_state["manual_research_result"] = {"news": news_result, "cycle": cycle_result}
-                refresh_dashboard_end_time()
-                st.rerun()
-
-        cycle_status = get_latest_research_cycle_status()
-        if cycle_status:
-            started_at = datetime.fromisoformat(cycle_status["started_at"])
-            if started_at.tzinfo is None:
-                started_at = started_at.replace(tzinfo=timezone.utc)
-            st.caption(f"Latest analysis started: {started_at.astimezone():%Y-%m-%d %H:%M:%S %Z}")
-            portfolio = get_portfolio_summary()
-            st.caption(f"Available paper cash: ${portfolio['cash_available']:,.2f}")
-            if cycle_status["outcome_message"]:
-                st.write(cycle_status["outcome_message"])
+            if schedule["mode"] == "automatic":
+                next_run = datetime.fromisoformat(schedule["next_run"]).astimezone()
+                st.caption(f"Schedule: every {schedule['interval_minutes']} minutes")
+                st.caption(f"Next run: {next_run:%Y-%m-%d %H:%M:%S %Z}")
+                if schedule["last_run"]:
+                    last_run = datetime.fromisoformat(schedule["last_run"]).astimezone()
+                    st.caption(f"Last run: {last_run:%Y-%m-%d %H:%M:%S %Z}")
+                if schedule["suspended"]:
+                    resume_at = datetime.fromisoformat(schedule["suspended_until"]).astimezone()
+                    st.warning(f"Suspended until {resume_at:%Y-%m-%d %H:%M:%S %Z}")
+                with st.form("suspend_research_schedule"):
+                    resume_date = st.date_input("Resume date")
+                    resume_time = st.time_input("Resume time")
+                    suspend_col, resume_col = st.columns(2)
+                    suspend = suspend_col.form_submit_button("Suspend until")
+                    resume = resume_col.form_submit_button("Resume now")
+                if suspend:
+                    local_resume = datetime.combine(resume_date, resume_time).astimezone()
+                    if local_resume <= datetime.now().astimezone():
+                        st.error("Choose a resume date and time in the future.")
+                    else:
+                        suspend_research_schedule(local_resume.astimezone(timezone.utc).isoformat())
+                        st.rerun()
+                if resume:
+                    suspend_research_schedule(None)
+                    st.rerun()
+                if st.button("Stop automatic schedule", key="stop_research_schedule"):
+                    configure_research_schedule("manual", schedule["interval_minutes"])
+                    suspend_research_schedule(None)
+                    st.rerun()
             else:
-                st.warning("The latest analysis has not recorded a completed outcome.")
-            if cycle_status["rejections"]:
-                with st.expander("Latest cycle rejection reasons"):
-                    for rejection in cycle_status["rejections"]:
-                        agent_label = rejection["agent_name"].replace("_", " ").title()
-                        st.write(f"**{agent_label}**: {rejection['message']}")
+                st.caption("Automatic research is stopped. Manual actions are available below.")
+                if st.button("Fetch news only", key="manual_fetch_news"):
+                    with st.spinner("Fetching screened Yahoo Finance headlines..."):
+                        news_result = asyncio.run(run_hourly_news_fetch())
+                    st.session_state["manual_research_result"] = {"news": news_result, "cycle": None}
+                    refresh_dashboard_end_time()
+                    st.rerun()
+
+                if st.button("Run agent analysis", key="manual_agent_analysis"):
+                    with st.spinner("Running researcher, strategist, risk, and execution rules..."):
+                        cycle_result = run_agent_cycle_for_ui()
+                    if cycle_result:
+                        st.session_state["manual_research_result"] = {"news": None, "cycle": cycle_result}
+                    refresh_dashboard_end_time()
+                    st.rerun()
+
+                if st.button("Fetch news + analyze", type="primary", key="manual_fetch_and_analyze"):
+                    with st.spinner("Fetching news and running the agent cycle..."):
+                        if os.getenv("FINBOT_BROKER_PROVIDER", "dummy").strip().lower() == "etoro":
+                            cycle_result = run_agent_cycle_for_ui()
+                            news = (cycle_result or {}).get("news") or {}
+                            news_result = {
+                                "fetched": news.get("fetched", 0),
+                                "inserted": news.get("inserted", 0),
+                                "updated": news.get("updated", 0),
+                            }
+                        else:
+                            news_result = asyncio.run(run_hourly_news_fetch())
+                            cycle_result = run_agent_cycle_for_ui()
+                    st.session_state["manual_research_result"] = {"news": news_result, "cycle": cycle_result}
+                    refresh_dashboard_end_time()
+                    st.rerun()
+
+            cycle_status = get_latest_research_cycle_status()
+            if cycle_status:
+                started_at = datetime.fromisoformat(cycle_status["started_at"])
+                if started_at.tzinfo is None:
+                    started_at = started_at.replace(tzinfo=timezone.utc)
+                st.caption(f"Latest analysis started: {started_at.astimezone():%Y-%m-%d %H:%M:%S %Z}")
+                portfolio = get_portfolio_summary()
+                st.caption(f"Available paper cash: ${portfolio['cash_available']:,.2f}")
+                if cycle_status["outcome_message"]:
+                    st.write(cycle_status["outcome_message"])
+                else:
+                    st.warning("The latest analysis has not recorded a completed outcome.")
+                if cycle_status["rejections"]:
+                    with st.expander("Latest cycle rejection reasons"):
+                        for rejection in cycle_status["rejections"]:
+                            agent_label = rejection["agent_name"].replace("_", " ").title()
+                            st.write(f"**{agent_label}**: {rejection['message']}")
+
+            st.divider()
+            st.markdown("**Test purchase workflow**")
+            test_provider_ready = (
+                os.getenv("FINBOT_BROKER_PROVIDER", "dummy").strip().lower() == "etoro"
+                and os.getenv("ETORO_DEMO_TRADING", "true").strip().lower() in {"1", "true", "yes", "on"}
+            )
+            sample_inputs = get_sample_research_inputs()
+            test_symbols = list(dict.fromkeys(item["symbol"] for item in sample_inputs))
+            st.caption("Replays a saved bullish research fixture through the isolated demo-order test. It uses a 2×ATR stop and an explicit 1.5R target, then checks both levels against the broker-reported fill. Test orders are excluded from strategy performance stats.")
+            if not test_symbols:
+                st.warning("No valid saved bullish research fixtures are available.")
+                test_symbols = ["(no eligible sample)"]
+            test_symbol = st.selectbox("Test symbol", test_symbols, key="demo_test_symbol")
+            test_amount = st.number_input("Test stake (USD)", min_value=1.0, max_value=25.0, value=10.0, step=1.0, key="demo_test_amount")
+            st.warning("The next button sends a real order to the configured eToro DEMO account. It does not send a live order. Existing positions in this symbol prevent duplicate purchases.")
+            if st.button("Replay sample through demo workflow", key="run_demo_test_workflow", disabled=not test_provider_ready or test_symbol.startswith("("), type="primary"):
+                with st.spinner("Replaying saved research → strategy checks → eToro demo order → position reconciliation..."):
+                    try:
+                        st.session_state["demo_test_workflow_feedback"] = asyncio.run(run_demo_test_workflow(test_symbol, float(test_amount)))
+                    except Exception as error:
+                        st.session_state["demo_test_workflow_feedback"] = {"status": "BLOCKED", "symbol": test_symbol, "amount": float(test_amount), "reason": f"{type(error).__name__}: {error}"}
+            if not test_provider_ready:
+                st.caption("Select the eToro provider and keep ETORO_DEMO_TRADING=true to enable this test action.")
+            feedback = st.session_state.get("demo_test_workflow_feedback")
+            if feedback:
+                st.write(f"Latest test workflow: **{feedback.get('status')}** · run {feedback.get('workflow_id')}")
+                if feedback.get("reason"):
+                    st.error(feedback["reason"])
+                st.json(feedback.get("details", {}))
+            for test_run in get_test_workflow_runs(limit=5):
+                with st.expander(f"Test #{test_run['id']} · {test_run['symbol']} · {test_run['status']}"):
+                    st.caption(f"Stake ${test_run['amount']:,.2f} · order {test_run.get('broker_order_id') or 'pending'} · position {test_run.get('broker_position_id') or 'pending'} · updated {test_run['updated_at']}")
+                    st.json(test_run["details"])
+                    if test_run["status"] in {"OPEN", "SUBMITTED_PENDING_RECONCILIATION"}:
+                        refresh_col, close_col = st.columns(2)
+                        if refresh_col.button("Refresh broker state", key=f"reconcile_test_{test_run['id']}"):
+                            try:
+                                st.session_state["demo_test_workflow_feedback"] = asyncio.run(reconcile_demo_test_workflow(int(test_run["id"])))
+                            except Exception as error:
+                                st.error(f"Test reconciliation failed: {error}")
+                            st.rerun()
+                        if test_run["status"] == "OPEN" and close_col.button("Close test position", key=f"close_test_{test_run['id']}"):
+                            try:
+                                st.session_state["demo_test_workflow_feedback"] = asyncio.run(close_demo_test_workflow(int(test_run["id"])))
+                            except Exception as error:
+                                st.error(f"Test close failed: {error}")
+                            st.rerun()
 
 
 def render_oversight_dashboard() -> None:
@@ -575,7 +725,7 @@ def render_oversight_dashboard() -> None:
         st.success(f"Audit complete: {audit_result['total_trades_audited']} trades checked.")
         st.rerun()
 
-    audit_dir = Path(__file__).resolve().parent / "audit_logs"
+    audit_dir = backend_module.DB_PATH.parent / "audit_logs"
     audit_files = sorted(
         audit_dir.glob("oversight_*.jsonl"),
         key=lambda path: path.stat().st_mtime,
@@ -635,7 +785,7 @@ def render_oversight_dashboard() -> None:
             take_profit_check = checks.get("take_profit", {})
             actual_leverage = leverage_check.get("actual")
             leverage_label = (
-                f"{float(actual_leverage):.1f}x"
+                format_leverage(actual_leverage)
                 if actual_leverage is not None
                 else "Not checked"
             )
@@ -711,25 +861,54 @@ def render_agent_decision_trend(events: list[Dict[str, Any]]) -> None:
     )
     figure.update_yaxes(title_text="Count", rangemode="tozero")
     figure.update_xaxes(title_text="Time", row=4, col=1)
-    st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+    render_expandable_plotly_chart(figure, "Decisions over time · by agent", "agent_decision_trend")
+
+
+def render_expandable_plotly_chart(figure: Any, title: str, key: str) -> None:
+    """Render a chart with a large dialog view and Plotly's fullscreen toolbar."""
+    if st.button("Expand chart", key=f"{key}_expand", help=f"Open {title} in a larger view"):
+        dialog = getattr(st, "dialog", None)
+        if dialog is None:
+            st.info("This Streamlit version has no chart dialog. Use the chart toolbar's fullscreen control.")
+        else:
+            @dialog(title, width="large")
+            def show_chart_dialog() -> None:
+                st.plotly_chart(
+                    figure,
+                    width="stretch",
+                    height=760,
+                    key=f"{key}_expanded",
+                    config={"displayModeBar": True, "displaylogo": False, "responsive": True},
+                )
+            show_chart_dialog()
+    st.plotly_chart(
+        figure,
+        width="stretch",
+        key=key,
+        config={"displayModeBar": True, "displaylogo": False, "responsive": True},
+    )
 
 
 def render_portfolio(summary: Dict[str, Any]) -> None:
     portfolio = summary["portfolio"]
-    open_trades = [trade for trade in summary["trades"] if trade["status"] == "OPEN"]
+    open_trades = summary.get("open_positions", [trade for trade in summary["trades"] if trade["status"] == "OPEN"])
     st.markdown("#### Portfolio")
     metrics = st.columns(2, gap="small")
     values = (
-        ("Starting capital", f"${portfolio['starting_capital']:,.2f}"),
+        ("First observed equity" if portfolio.get("source") else "Local starting capital", f"${portfolio['starting_capital']:,.2f}"),
         ("Available cash", f"${portfolio['cash_available']:,.2f}"),
         ("Invested", f"${portfolio['invested_capital']:,.2f}"),
         ("Gross exposure", f"${portfolio['gross_exposure']:,.2f}"),
         ("Net equity", f"${portfolio['account_equity']:,.2f}"),
-        ("Open positions", f"{len(open_trades):,}"),
+        ("Tracked open positions", f"{len(open_trades):,}"),
     )
     for index, (label, value) in enumerate(values):
         with metrics[index % 2]:
             st.metric(label, value)
+    if portfolio.get("source"):
+        st.caption(f"{portfolio['source']} · {format_local_timestamp(portfolio.get('as_of'))}")
+    elif os.getenv("FINBOT_BROKER_PROVIDER", "dummy").lower() == "etoro":
+        st.caption("No broker equity snapshot yet; these figures describe local records, not verified eToro account equity.")
     portfolio_source = os.getenv("FINBOT_PORTFOLIO_ACCOUNT_SOURCE", "paper").lower()
     if portfolio_source != "paper":
         snapshot = st.session_state.get(f"portfolio_account_snapshot::{portfolio_source}")
@@ -743,16 +922,101 @@ def render_portfolio(summary: Dict[str, Any]) -> None:
             st.caption(f"Portfolio source: {source_label}")
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def get_dashboard_etoro_positions() -> Dict[str, Any]:
+    settings = integrations_module.IntegrationSettings.from_environment()
+    if settings.broker_provider != "etoro" or not settings.etoro_demo_trading:
+        return {"available": False, "reason": "eToro demo mode is not selected."}
+    try:
+        return integrations_module.EtoroBrokerAdapter(settings).get_positions()
+    except Exception as error:
+        return {"available": False, "reason": f"{type(error).__name__}: broker position snapshot unavailable."}
+
+
 def render_portfolio_charts(summary: Dict[str, Any]) -> None:
-    open_trades = [trade for trade in summary["trades"] if trade["status"] == "OPEN"]
+    open_trades = summary.get("open_positions", [trade for trade in summary["trades"] if trade["status"] == "OPEN"])
     chart_col, trend_col = st.columns([1, 2])
     with chart_col:
         st.markdown("#### Capital by open position")
-        if open_trades:
-            exposure = pd.DataFrame(open_trades).groupby("symbol")["allocated_capital"].sum()
-            st.bar_chart(exposure, color="#38bdf8")
+        broker_snapshot = None
+        chart_positions: list[Dict[str, Any]] = open_trades
+        position_source = "Finbot tracked positions"
+        if os.getenv("FINBOT_BROKER_PROVIDER", "dummy").strip().lower() == "etoro":
+            broker_snapshot=(summary.get("broker_performance") or {}).get("positions_snapshot") or {"available":False}
+            if st.button("Refresh eToro positions", key="refresh_capital_positions"):
+                get_dashboard_etoro_positions.clear()
+                st.session_state["explicit_broker_snapshot"]=get_dashboard_etoro_positions()
+            override=st.session_state.get("explicit_broker_snapshot")
+            if override and override.get("fetched_at"):
+                fetched=datetime.fromisoformat(override["fetched_at"].replace("Z","+00:00"))
+                if (datetime.now(timezone.utc)-fetched).total_seconds() < 60:
+                    broker_snapshot=override
+            if broker_snapshot.get("fetched_at"):
+                st.caption(f"Broker snapshot: {format_local_timestamp(broker_snapshot['fetched_at'])}")
+            elif not broker_snapshot.get("available"):
+                st.caption("No saved broker snapshot yet. The worker updates it, or use Refresh eToro positions.")
+            if broker_snapshot.get("available"):
+                linked_trades = {
+                    str(trade.get("broker_position_id")): trade
+                    for trade in open_trades if trade.get("broker_position_id")
+                }
+                chart_positions = []
+                for position in broker_snapshot.get("positions", []):
+                    amount = position.get("amount")
+                    units = position.get("units")
+                    open_rate = position.get("open_rate")
+                    leverage = position.get("leverage") or 1
+                    if amount is None and units is not None and open_rate is not None:
+                        amount = abs(float(units) * float(open_rate)) / max(1.0, float(leverage))
+                    if amount is None:
+                        continue
+                    amount = abs(float(amount))
+                    linked = linked_trades.get(str(position.get("position_id")))
+                    chart_positions.append({
+                        "id": position.get("position_id") or f"{position.get('symbol')}:{len(chart_positions)}",
+                        "symbol": position.get("symbol") or (linked or {}).get("symbol") or "Unknown",
+                        "allocated_capital": float(amount),
+                        "status": linked.get("status") if linked else "eToro open · unlinked",
+                    })
+                position_source = "eToro demo positions"
+            else:
+                st.caption("eToro positions could not be refreshed; showing locally tracked positions instead.")
+
+        if chart_positions:
+            positions_frame = pd.DataFrame(chart_positions)
+            exposure = positions_frame.groupby("symbol", as_index=False).agg(
+                allocated_capital=("allocated_capital", "sum"),
+                position_count=("id", "count"),
+                states=("status", lambda values: ", ".join(sorted(set(map(str, values))))),
+            )
+            figure = go.Figure(go.Bar(
+                x=exposure["symbol"],
+                y=exposure["allocated_capital"],
+                marker_color="#38bdf8",
+                customdata=exposure[["position_count", "states"]],
+                hovertemplate=(
+                    "%{x}<br>Allocated capital: $%{y:,.2f}"
+                    "<br>Tracked positions: %{customdata[0]}"
+                    "<br>State: %{customdata[1]}<extra></extra>"
+                ),
+            ))
+            figure.update_layout(
+                title="Capital allocated to current open positions",
+                height=340,
+                margin={"l": 20, "r": 15, "t": 45, "b": 35},
+                xaxis_title="Symbol",
+                yaxis_title="Allocated capital (USD)",
+            )
+            render_expandable_plotly_chart(figure, "Capital by open position", "capital_by_open_position")
+            if position_source == "eToro demo positions":
+                st.caption(f"Live eToro demo positions ({len(broker_snapshot.get('positions', []))} positions), grouped by ticker. Capital uses the broker amount, or units × open price ÷ leverage when amount is unavailable; unlinked positions are included.")
+            else:
+                st.caption("Includes local open positions and broker-linked positions awaiting reconciliation. A reconciliation state is shown in the hover details; these count as potentially still open until closure is confirmed.")
         else:
-            st.caption("No open positions yet.")
+            if position_source == "eToro demo positions" and broker_snapshot and broker_snapshot.get("positions"):
+                st.caption("The broker returned open positions, but no capital amounts could be calculated from their reported fields.")
+            else:
+                st.caption("No open positions yet.")
     with trend_col:
         st.markdown("#### Decisions over time · by agent")
         decision_ranges = {
@@ -789,13 +1053,30 @@ def render_event_evidence(event: Dict[str, Any]) -> None:
     st.markdown(f"**Outcome: {event['decision'].title()}**")
     st.write(event["message"])
 
+    broker_order = details.get("broker_order") or {}
+    api_logs = details.get("broker_api_logs") or broker_order.get("api_logs") or []
+    if api_logs:
+        with st.expander(f'eToro API log · {len(api_logs)} request(s) · credentials masked', expanded=False, key=f"event_details_{event['id']}_1", on_change="rerun") as lazy_panel:
+            if lazy_panel.open:
+                for api_log in api_logs:
+                    st.caption(
+                        f"{api_log.get('request', {}).get('method', 'API')} "
+                        f"{api_log.get('request', {}).get('url', '')} · "
+                        f"request ID {api_log.get('request_id', 'unavailable')}"
+                    )
+                    st.code(format_json_readable(api_log), language="json")
+
     decision_data = {
         key: value for key, value in details.items()
-        if key not in {"related_news", "news_context", "ai_analysis", "trend_review", "validation_type"}
+        if key not in {
+            "related_news", "news_context", "ai_analysis", "trend_review", "validation_type",
+            "broker_order", "broker_api_logs",
+        }
     }
     if decision_data:
-        with st.expander("Decision inputs and rule checks", expanded=False):
-            st.code(format_json_readable(decision_data), language="json")
+        with st.expander('Decision inputs and rule checks', expanded=False, key=f"event_details_{event['id']}_2", on_change="rerun") as lazy_panel:
+            if lazy_panel.open:
+                st.code(format_json_readable(decision_data), language="json")
 
     headlines = details.get("related_news") or details.get("news_context") or []
     if headlines:
@@ -811,13 +1092,14 @@ def render_event_evidence(event: Dict[str, Any]) -> None:
             }
             for item in headlines
         ])
-        with st.expander(f"Headline evidence · {len(headlines)} article(s)", expanded=False):
-            st.dataframe(
-                headline_frame,
-                hide_index=True,
-                width="stretch",
-                column_config={"url": st.column_config.LinkColumn("Article")},
-            )
+        with st.expander(f'Headline evidence · {len(headlines)} article(s)', expanded=False, key=f"event_details_{event['id']}_3", on_change="rerun") as lazy_panel:
+            if lazy_panel.open:
+                st.dataframe(
+                    headline_frame,
+                    hide_index=True,
+                    width="stretch",
+                    column_config={"url": st.column_config.LinkColumn("Article")},
+                )
     elif event["agent_name"] in {"researcher", "strategist", "risk_manager"}:
         st.caption("No stored headlines were attached to this decision.")
 
@@ -828,20 +1110,21 @@ def render_event_evidence(event: Dict[str, Any]) -> None:
             f"{float(ai_analysis.get('confidence', 0)):.0%} confidence · "
             f"{ai_analysis.get('catalyst', 'No catalyst returned')}"
         )
-        with st.expander("OpenAI research details", expanded=False):
-            st.write(ai_analysis.get("summary", "No summary returned."))
-            fundamentals = {
-                key: "Unavailable" if value is None else value
-                for key, value in (ai_analysis.get("fundamentals") or {}).items()
-            }
-            st.code(format_json_readable({
-                "provider": ai_analysis.get("provider"),
-                "model": ai_analysis.get("model"),
-                "fundamentals": fundamentals,
-                "fundamental_analysis": ai_analysis.get("fundamental_analysis"),
-                "fundamental_grade": ai_analysis.get("fundamental_grade", "unknown"),
-                "fundamental_grades": ai_analysis.get("fundamental_grades", {}),
-            }), language="json")
+        with st.expander('OpenAI research details', expanded=False, key=f"event_details_{event['id']}_4", on_change="rerun") as lazy_panel:
+            if lazy_panel.open:
+                st.write(ai_analysis.get("summary", "No summary returned."))
+                fundamentals = {
+                    key: "Unavailable" if value is None else value
+                    for key, value in (ai_analysis.get("fundamentals") or {}).items()
+                }
+                st.code(format_json_readable({
+                    "provider": ai_analysis.get("provider"),
+                    "model": ai_analysis.get("model"),
+                    "fundamentals": fundamentals,
+                    "fundamental_analysis": ai_analysis.get("fundamental_analysis"),
+                    "fundamental_grade": ai_analysis.get("fundamental_grade", "unknown"),
+                    "fundamental_grades": ai_analysis.get("fundamental_grades", {}),
+                }), language="json")
     elif "ai_analysis" in details:
         st.caption("OpenAI research was disabled for this cycle; the decision used the configured rules and dummy baseline.")
 
@@ -916,6 +1199,73 @@ def render_event_evidence(event: Dict[str, Any]) -> None:
             )
 
 
+def _lifecycle_event_decision(event: Dict[str, Any]) -> str:
+    decision = str(event.get("decision", "pending"))
+    details = event.get("details") or {}
+    reasons = details.get("reasons") or details.get("execution_reasons") or []
+    capacity_phrases = (
+        "open position limit reached",
+        "position in this instrument is already open",
+        "no risk budget remains",
+        "portfolio exposure capacity",
+        "per-cycle order limit reached",
+    )
+    if event.get("stage") == "execution" and decision == "pending" and any(
+        phrase in str(reason).casefold()
+        for reason in reasons
+        for phrase in capacity_phrases
+    ):
+        return "deferred"
+    return decision
+
+
+def _trade_chart_events(trade: Dict[str, Any]) -> tuple[Dict[str, Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Return decision events for each agent, excluding later reconciliation outcomes."""
+    stage_for_agent = {
+        "researcher": "research",
+        "strategist": "strategy",
+        "risk_manager": "risk",
+        "execution": "execution",
+    }
+    latest_by_agent: Dict[str, Dict[str, Any]] = {}
+    latest_reconciliation = None
+    for event in trade.get("events", []):
+        if event.get("stage") == "reconciliation":
+            latest_reconciliation = event
+            continue
+        agent = event.get("agent_name")
+        if agent not in stage_for_agent or event.get("stage") != stage_for_agent[agent]:
+            continue
+        if event.get("status") == "skipped":
+            continue
+        valid_decisions = {"accepted", "rejected"}
+        if agent == "execution":
+            valid_decisions.update({"submitted", "deferred"})
+            if _lifecycle_event_decision(event) == "deferred":
+                event = {**event, "chart_decision": "deferred"}
+                valid_decisions.add("pending")
+        if event.get("decision") in valid_decisions:
+            latest_by_agent[agent] = event
+
+    # A submitted event is the execution result. If eToro returned a fill,
+    # display that more precise outcome while retaining reconciliation context.
+    execution = latest_by_agent.get("execution")
+    if execution and execution.get("decision") == "submitted":
+        if trade.get("broker_order_id") and trade.get("broker_fill_price") is not None:
+            execution = {**execution, "chart_decision": "executed"}
+        else:
+            execution = {**execution, "chart_decision": "submitted"}
+        if latest_reconciliation:
+            details = execution.get("details") or {}
+            execution = {
+                **execution,
+                "chart_reconciliation": latest_reconciliation.get("message", ""),
+                "details": details,
+            }
+        latest_by_agent["execution"] = execution
+    return latest_by_agent, latest_reconciliation
+
+
 def render_trade_processing_chart(trades: list[Dict[str, Any]]) -> None:
     agent_rows = {
         "researcher": "Researcher",
@@ -931,12 +1281,7 @@ def render_trade_processing_chart(trades: list[Dict[str, Any]]) -> None:
         created_at = pd.to_datetime(trade["created_at"]).strftime("%b %d %H:%M")
         trade_label = f"#{trade['id']} · {created_at} · {trade['symbol']}"
         trade_labels[trade["id"]] = trade_label
-        latest_by_agent = {}
-        for event in trade["events"]:
-            stage = agent_rows.get(event["agent_name"])
-            if not stage or event["status"] == "skipped" or event["decision"] not in {"accepted", "rejected"}:
-                continue
-            latest_by_agent[event["agent_name"]] = event
+        latest_by_agent, _ = _trade_chart_events(trade)
 
         stages = []
         for agent_name, event in latest_by_agent.items():
@@ -945,9 +1290,10 @@ def render_trade_processing_chart(trades: list[Dict[str, Any]]) -> None:
         stages.sort(key=lambda item: item[0], reverse=True)
         for _, stage, event in stages:
             details = event.get("details") or {}
+            decision = event.get("chart_decision", event["decision"])
             hover_parts = [
                 f"<b>Trade {trade['id']} · {html.escape(trade.get('company_name') or trade['symbol'])} ({html.escape(trade['symbol'])})</b>",
-                f"<b>{html.escape(stage)} · {html.escape(event['decision'].title())}</b>",
+                f"<b>{html.escape(stage)} · {html.escape(decision.title())}</b>",
                 html.escape(event["message"]),
             ]
             headlines = details.get("related_news") or details.get("news_context") or []
@@ -967,17 +1313,19 @@ def render_trade_processing_chart(trades: list[Dict[str, Any]]) -> None:
                 )
             if details.get("thresholds"):
                 hover_parts.append("Risk thresholds: " + html.escape(str(details["thresholds"])))
+            if event.get("chart_reconciliation"):
+                hover_parts.append("Reconciliation warning: " + html.escape(event["chart_reconciliation"]))
             plotted_events.append({
                 "trade_id": trade["id"],
                 "x": trade_label,
                 "y": stage,
-                "decision": event["decision"],
-                "letter": "A" if event["decision"] == "accepted" else "R",
+                "decision": decision,
+                "letter": {"accepted": "A", "rejected": "R", "submitted": "S", "executed": "E", "deferred": "D"}.get(decision, "?"),
                 "hover": "<br><br>".join(hover_parts),
             })
 
     if not plotted_events:
-        st.info("No accepted or rejected trade-stage decisions in this time range.")
+        st.info("No agent decisions or submitted orders in this time range.")
         return
 
     figure = go.Figure()
@@ -993,14 +1341,14 @@ def render_trade_processing_chart(trades: list[Dict[str, Any]]) -> None:
                 showlegend=False,
             ))
 
-    for decision, color in (("accepted", "#22c55e"), ("rejected", "#ef4444")):
+    for decision, color in (("accepted", "#22c55e"), ("rejected", "#ef4444"), ("submitted", "#3b82f6"), ("executed", "#22c55e"), ("deferred", "#f59e0b")):
         points = [point for point in plotted_events if point["decision"] == decision]
         if points:
             figure.add_trace(go.Scatter(
                 x=[point["x"] for point in points],
                 y=[point["y"] for point in points],
                 mode="markers+text",
-                name="Accepted (A)" if decision == "accepted" else "Rejected (R)",
+                name={"accepted": "Accepted (A)", "rejected": "Rejected (R)", "submitted": "Order submitted (S)", "executed": "Executed (E)", "deferred": "Deferred by risk capacity (D)"}[decision],
                 text=[point["letter"] for point in points],
                 textposition="middle center",
                 textfont={"color": "#ffffff", "size": 12},
@@ -1018,7 +1366,7 @@ def render_trade_processing_chart(trades: list[Dict[str, Any]]) -> None:
         xaxis={"title": "Trade number · research time · ticker", "type": "category", "categoryorder": "array", "categoryarray": list(trade_labels.values()), "tickangle": -35},
         yaxis={"title": "Agent stage", "type": "category", "categoryorder": "array", "categoryarray": y_order},
     )
-    st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+    render_expandable_plotly_chart(figure, "Trade processing by agent", "trade_processing_chart")
 
 
 def render_trade_agent_flow(trades: list[Dict[str, Any]]) -> None:
@@ -1033,20 +1381,11 @@ def render_trade_agent_flow(trades: list[Dict[str, Any]]) -> None:
     trade_labels = []
 
     for trade in sorted(trades, key=lambda item: (item["created_at"], item["id"])):
-        execution_event = next(
-            (event for event in reversed(trade["events"]) if event["agent_name"] == "execution" and event["decision"] in {"accepted", "rejected"}),
-            None,
-        )
+        latest_by_agent, latest_reconciliation = _trade_chart_events(trade)
+        execution_event = latest_by_agent.get("execution")
         time_value = execution_event["created_at"] if execution_event else trade["created_at"]
         label = f"#{trade['id']} · {pd.to_datetime(time_value).strftime('%b %d %H:%M')} · {trade['symbol']}"
         trade_labels.append(label)
-
-        latest_by_agent = {}
-        for event in trade["events"]:
-            if event["agent_name"] not in agent_rows or event["status"] == "skipped":
-                continue
-            if event["decision"] in {"accepted", "rejected"}:
-                latest_by_agent[event["agent_name"]] = event
 
         ordered_events = [
             (agent, latest_by_agent[agent])
@@ -1057,7 +1396,7 @@ def render_trade_agent_flow(trades: list[Dict[str, Any]]) -> None:
             details = event.get("details") or {}
             hover_parts = [
                 f"<b>Trade #{trade['id']} · {html.escape(trade.get('company_name') or trade['symbol'])} ({html.escape(trade['symbol'])})</b>",
-                f"{html.escape(event['created_at'])} · {html.escape(agent_rows[agent])} · {html.escape(event['decision'].title())}",
+                f"{html.escape(event['created_at'])} · {html.escape(agent_rows[agent])} · {html.escape(event.get('chart_decision', event['decision']).title())}",
                 html.escape(event["message"]),
             ]
             for headline in (details.get("related_news") or details.get("news_context") or [])[:5]:
@@ -1070,12 +1409,14 @@ def render_trade_agent_flow(trades: list[Dict[str, Any]]) -> None:
                 hover_parts.append("OpenAI · " + html.escape(str(ai.get("summary", ""))))
             if details.get("thresholds"):
                 hover_parts.append("Risk thresholds · " + html.escape(str(details["thresholds"])))
+            if event.get("chart_reconciliation"):
+                hover_parts.append("Reconciliation warning · " + html.escape(event["chart_reconciliation"]))
             plotted.append({
                 "trade_id": trade["id"],
                 "trade_label": label,
                 "agent": agent_rows[agent],
-                "decision": event["decision"],
-                "mark": "A" if event["decision"] == "accepted" else "R",
+                "decision": event.get("chart_decision", event["decision"]),
+                "mark": {"accepted": "A", "rejected": "R", "submitted": "S", "executed": "E", "deferred": "D"}.get(event.get("chart_decision", event["decision"]), "?"),
                 "hover": "<br><br>".join(hover_parts),
             })
 
@@ -1099,6 +1440,9 @@ def render_trade_agent_flow(trades: list[Dict[str, Any]]) -> None:
     for decision, color, marker_text in (
         ("accepted", "#22c55e", "A · Accepted"),
         ("rejected", "#ef4444", "R · Rejected"),
+        ("submitted", "#3b82f6", "S · Order submitted"),
+        ("executed", "#22c55e", "E · Executed"),
+        ("deferred", "#f59e0b", "D · Deferred by risk capacity"),
     ):
         points = [item for item in plotted if item["decision"] == decision]
         if points:
@@ -1123,7 +1467,7 @@ def render_trade_agent_flow(trades: list[Dict[str, Any]]) -> None:
         xaxis={"title": "Trade number · execution time · ticker", "type": "category", "categoryorder": "array", "categoryarray": trade_labels, "tickangle": -35},
         yaxis={"title": "Agent", "type": "category", "categoryorder": "array", "categoryarray": ["Execution", "Risk Manager", "Strategist", "Researcher"]},
     )
-    st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+    render_expandable_plotly_chart(figure, "Trade agent flow", "trade_agent_flow_chart")
 
 
 def render_trade_validation_chart(trades: list[Dict[str, Any]]) -> None:
@@ -1200,12 +1544,166 @@ def render_trade_validation_chart(trades: list[Dict[str, Any]]) -> None:
         yaxis_title="Return from entry (%)",
         legend={"orientation": "h", "y": 1.12, "x": 1, "xanchor": "right"},
     )
-    st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+    render_expandable_plotly_chart(figure, "Historical validation: planned vs result", "trade_validation_chart")
     st.caption(
         "**Blue bars** = Planned target return you set. **Green bars** = Actual result from historical price data "
         "(what would have happened). Rejected/deferred trades are counterfactual outcomes. Results apply stop-loss and "
         "take-profit rules to Yahoo 5-minute bars; they are not actual fills or net returns."
     )
+
+
+def account_controls_allowed() -> bool:
+    profile = get_user_profile(st.session_state.get("username", ""))
+    return bool(profile and profile.get("is_admin"))
+
+
+@st.cache_data(ttl=5, max_entries=32, show_spinner=False)
+def get_ui_dashboard_summary(db_path: str, start_at=None, end_at=None):
+    return backend_module.get_dashboard_summary(start_at,end_at,include_details=False)
+
+
+@st.cache_data(ttl=5, max_entries=64, show_spinner=False)
+def get_ui_trade_page(db_path: str, trade_ids: tuple, limit: int, offset: int, end_at=None):
+    return backend_module.get_trade_history(end_at=end_at,trade_ids=list(trade_ids),limit=limit,offset=offset,include_details=False)
+
+
+@st.cache_data(ttl=5, max_entries=64, show_spinner=False)
+def get_ui_trade_evidence(db_path: str, trade_id: int, end_at=None):
+    rows=backend_module.get_trade_history(end_at=end_at,trade_ids=[trade_id],limit=1)
+    return rows[0] if rows else None
+
+
+def clear_dashboard_caches():
+    get_ui_dashboard_summary.clear()
+    get_ui_trade_page.clear()
+    get_ui_trade_evidence.clear()
+
+
+def lifecycle_page(items, limit, offset):
+    return get_ui_trade_page(str(backend_module.DB_PATH),tuple(t["id"] for t in items),limit,offset,st.session_state.get("lifecycle_end_at"))
+
+
+_LIFECYCLE_STAGE_RANK = {"execution": 0, "risk": 1, "strategy": 2, "research": 3}
+
+
+def lifecycle_terminal_event(trade: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the stage that actually decided how far a candidate progressed.
+
+    Every lifecycle contains downstream placeholder events.  A skipped execution
+    placeholder must not make a research or strategy rejection look as though it
+    reached execution.
+    """
+    events = trade.get("events") or []
+    latest = {}
+    for event in events:
+        stage = str(event.get("stage") or "").lower()
+        if stage in _LIFECYCLE_STAGE_RANK and int(event.get("id") or 0) >= int(
+            latest.get(stage, {}).get("id") or 0
+        ):
+            latest[stage] = event
+
+    last_accepted = {}
+    for stage in ("research", "strategy", "risk"):
+        event = latest.get(stage)
+        if not event:
+            return last_accepted
+        decision = str(event.get("decision") or "").lower()
+        status = str(event.get("status") or "").lower()
+        if decision != "accepted" or status == "skipped":
+            return event
+        last_accepted = event
+
+    # Passing risk means the candidate reached the execution gate even when
+    # execution was subsequently deferred, unavailable, or rejected.
+    return latest.get("execution") or last_accepted
+
+
+def lifecycle_event_labels(events: list[Dict[str, Any]]) -> list[str]:
+    """Name repeated gates by purpose instead of showing duplicate agent names."""
+    totals: Dict[str, int] = {}
+    seen: Dict[str, int] = {}
+    for event in events:
+        stage = str(event.get("stage") or "").lower()
+        totals[stage] = totals.get(stage, 0) + 1
+    labels = []
+    for event in events:
+        stage = str(event.get("stage") or "").lower()
+        seen[stage] = seen.get(stage, 0) + 1
+        occurrence = seen[stage]
+        if stage == "strategy" and totals[stage] > 1:
+            label = "Initial strategy" if occurrence == 1 else "Pre-order strategy recheck"
+        elif stage == "risk" and totals[stage] > 1:
+            label = "Initial risk" if occurrence == 1 else "Pre-order risk recheck"
+        elif stage == "execution":
+            label = "Broker submission" if str(event.get("decision") or "").lower() == "submitted" else "Execution readiness"
+        elif stage == "notification":
+            label = "Email notification"
+        elif stage == "reconciliation":
+            label = "Broker reconciliation"
+        elif stage == "protection":
+            label = "Protection update"
+        else:
+            label = stage.replace("_", " ").title()
+        labels.append(label)
+    return labels
+
+
+def lifecycle_outcome_key(trade: Dict[str, Any]) -> tuple:
+    """Group repeated analysis only when its material outcome is unchanged."""
+    terminal = lifecycle_terminal_event(trade)
+    details = terminal.get("details") or {}
+    reasons = details.get("execution_reasons") or details.get("reasons") or []
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    outcome_detail = tuple(sorted(str(reason).strip() for reason in reasons if str(reason).strip()))
+    if not outcome_detail:
+        outcome_detail = (" ".join(str(terminal.get("message") or "").split()),)
+    return (
+        str(trade.get("symbol") or "").upper(),
+        str(trade.get("side") or "").upper(),
+        str(trade.get("status") or "").upper(),
+        str(terminal.get("stage") or "").lower(),
+        str(terminal.get("decision") or "").lower(),
+        outcome_detail,
+    )
+
+
+def collapse_repeated_analysis(trades: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """Keep the newest row for each equivalent outcome and annotate its history."""
+    groups: Dict[tuple, list[Dict[str, Any]]] = {}
+    for trade in sorted(trades, key=lambda item: int(item.get("id") or 0), reverse=True):
+        groups.setdefault(lifecycle_outcome_key(trade), []).append(trade)
+    collapsed = []
+    for rows in groups.values():
+        representative = dict(rows[0])
+        timestamps = [str(row.get("created_at") or "") for row in rows if row.get("created_at")]
+        representative["repeat_count"] = len(rows)
+        representative["repeat_first_at"] = min(timestamps) if timestamps else None
+        representative["repeat_last_at"] = max(timestamps) if timestamps else None
+        representative["repeat_trade_ids"] = [int(row["id"]) for row in rows]
+        collapsed.append(representative)
+    return sorted(
+        collapsed,
+        key=lambda trade: (
+            _LIFECYCLE_STAGE_RANK.get(
+                str(lifecycle_terminal_event(trade).get("stage") or "").lower(), 9
+            ),
+            -int(trade.get("id") or 0),
+        ),
+    )
+
+
+def filter_analysis_stage(trades: list[Dict[str, Any]], focus: str) -> list[Dict[str, Any]]:
+    stage_for = lambda trade: str(lifecycle_terminal_event(trade).get("stage") or "").lower()
+    if focus == "Reached execution":
+        return [trade for trade in trades if stage_for(trade) == "execution"]
+    if focus == "Stopped at risk":
+        return [trade for trade in trades if stage_for(trade) == "risk"]
+    if focus == "Stopped at strategy":
+        return [trade for trade in trades if stage_for(trade) == "strategy"]
+    if focus == "Stopped at research":
+        return [trade for trade in trades if stage_for(trade) == "research"]
+    return trades
 
 
 def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
@@ -1214,8 +1712,70 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
         return
     for trade in trades:
         company_name = trade.get("company_name") or trade["symbol"]
-        label = f"#{trade['id']} · {company_name} ({trade['symbol']}) · {trade['side']} · {trade['status']}"
-        with st.expander(label, expanded=trade["status"] == "OPEN"):
+        timestamp = format_local_timestamp(trade.get("created_at"))
+        repeat_count = int(trade.get("repeat_count") or 1)
+        if repeat_count > 1:
+            first_seen = format_local_timestamp(trade.get("repeat_first_at"))
+            duplicate = f" · REPEATED {repeat_count} runs · first {first_seen} · latest"
+        else:
+            duplicate = (
+                f" · DUPLICATE of #{trade['duplicate_of_trade_id']}"
+                if trade.get("is_duplicate") else ""
+            )
+        label = f"#{trade['id']} · {timestamp}{duplicate} · {company_name} ({trade['symbol']}) · {trade['side']} · {trade['status']}"
+        panel=st.expander(label,expanded=False,key=f"lifecycle_panel_{trade['id']}",on_change="rerun")
+        if not panel.open:
+            continue
+        with panel:
+            if not trade.get("evidence_loaded", True):
+                full_trade=get_ui_trade_evidence(str(backend_module.DB_PATH),int(trade["id"]),st.session_state.get("lifecycle_end_at"))
+                if not full_trade:
+                    st.info("This lifecycle is no longer in active history. Refresh the page.")
+                    continue
+                trade=full_trade
+            try:
+                downloadable_evidence = load_trade_evidence(
+                    Path(backend_module.DB_PATH), int(trade["id"])
+                )
+                report_name = f"finbot-trade-{trade['id']}-{str(trade['symbol']).lower()}"
+                download_json, download_html = st.columns(2)
+                download_json.download_button(
+                    "Download JSON report",
+                    data=json.dumps(
+                        downloadable_evidence, indent=2, sort_keys=True, default=str
+                    ).encode("utf-8"),
+                    file_name=f"{report_name}.json",
+                    mime="application/json",
+                    key=f"download_trade_json_{trade['id']}",
+                    on_click="ignore",
+                    use_container_width=True,
+                )
+                download_html.download_button(
+                    "Download HTML report",
+                    data=build_trade_report_html(downloadable_evidence).encode("utf-8"),
+                    file_name=f"{report_name}.html",
+                    mime="text/html",
+                    key=f"download_trade_html_{trade['id']}",
+                    on_click="ignore",
+                    use_container_width=True,
+                )
+                st.caption("Downloaded reports include sanitized lifecycle stages and supporting data; credentials are redacted.")
+            except Exception as error:
+                st.warning(f"Trade report is unavailable: {error}")
+            if trade.get("status") == "OPEN" and trade.get("broker_position_id"):
+                st.success(
+                    f"eToro demo position confirmed · order {trade.get('broker_order_id') or 'not returned'} · "
+                    f"position {trade['broker_position_id']} · reconciliation {trade.get('reconciliation_status') or 'unknown'}"
+                )
+            elif trade.get("broker_order_id") or trade.get("broker_position_id"):
+                st.info(
+                    f"Broker-linked lifecycle · order {trade.get('broker_order_id') or 'not returned'} · "
+                    f"position {trade.get('broker_position_id') or 'pending'} · status {trade.get('status')}"
+                )
+            if trade.get("status_inferred_from_events"):
+                st.caption(
+                    f"Status derived from this lifecycle’s saved agent decisions; the older record remains stored as {trade.get('stored_status')} in the database."
+                )
             validation_statuses = {
                 "OPEN", "CLOSED", "REJECTED_RESEARCH", "REJECTED_STRATEGY",
                 "REJECTED_RISK", "REJECTED_EXECUTION", "DEFERRED_CAPACITY",
@@ -1246,7 +1806,7 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
             metrics[0].metric("Allocated", f"${trade['allocated_capital']:,.2f}")
             metrics[1].metric("Entry", f"${(trade['entry_price'] or 0):,.4f}")
             metrics[2].metric("Quantity", f"{trade['quantity']:,.4f}")
-            metrics[3].metric("Leverage", f"{trade['leverage']:,.1f}x")
+            metrics[3].metric("Leverage", format_leverage(trade.get("leverage")))
             metrics[4].metric("Stop loss", f"${trade['stop_loss_price']:,.4f}" if trade["stop_loss_price"] else "N/A")
             metrics[5].metric("Take profit", f"${trade['take_profit_price']:,.4f}" if trade["take_profit_price"] else "N/A")
             target_pnl = projected_target_pnl(trade)
@@ -1255,15 +1815,75 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                 f"${target_pnl:,.2f}" if target_pnl is not None else "N/A",
                 help="Projected dollar P&L if the stored take-profit price is reached, using the recorded quantity. Before fees and slippage; not realized.",
             )
+            risk_event = next((e for e in reversed(trade.get("events", [])) if e.get("stage") == "risk"), None)
+            risk_details = (risk_event or {}).get("details", {})
+            sizing = risk_details.get("sizing")
+            if sizing:
+                with st.expander("How the number of units was determined"):
+                    st.write(sizing["formula"])
+                    st.dataframe(pd.DataFrame([
+                        {"Constraint": key, "Maximum units": value}
+                        for key, value in sizing["limits_units"].items()
+                    ]), hide_index=True)
+                    st.caption(f"Selected {sizing['units']:.6f} units; binding limit: {sizing['binding_limit']}. Spend means account margin/capital, with estimated costs reserved.")
+                    st.json({key: risk_event["details"].get(key) for key in ("required_margin", "notional", "planned_stop_risk", "estimated_costs", "estimated_total_spend", "estimated_net_target_profit")})
+            policy = json.loads(trade.get("policy_json") or "{}")
+            protection = risk_details.get("protection") or {}
+            atr14 = protection.get("atr14") or risk_details.get("atr14") or policy.get("atr14")
+            protection_entry = protection.get("entry_price") or trade.get("entry_price")
+            protection_stop = protection.get("stop_loss_price") or trade.get("stop_loss_price")
+            protection_target = protection.get("take_profit_price") or trade.get("take_profit_price")
+            if atr14 and protection_entry and protection_stop and protection_target:
+                stop_distance = abs(float(protection_entry) - float(protection_stop))
+                target_distance = abs(float(protection_target) - float(protection_entry))
+                with st.expander("How stop loss and take profit were calculated"):
+                    protection_metrics = st.columns(4)
+                    protection_metrics[0].metric("ATR14", f"${float(atr14):,.4f}")
+                    protection_metrics[1].metric("Stop distance", f"{stop_distance / float(atr14):,.2f}× ATR")
+                    protection_metrics[2].metric("Target distance", f"{target_distance / float(atr14):,.2f}× ATR")
+                    protection_metrics[3].metric("Reward / risk", f"{target_distance / stop_distance:,.2f}:1" if stop_distance else "N/A")
+                    st.caption(
+                        f"Entry ${float(protection_entry):,.4f} · stop ${float(protection_stop):,.4f} · "
+                        f"take profit ${float(protection_target):,.4f}. "
+                        + str(protection.get("formula") or "Distances are calculated from the recorded entry using the ATR14 saved by the Risk Manager.")
+                    )
+            if trade.get("strategy_version"):
+                st.caption(f"Strategy {trade['strategy_version']} · {policy.get('framework', 'unknown')} · maximum hold {policy.get('holding_hours', 'unknown')} hours")
 
             events = trade["events"]
+            # Older automated lifecycles saved the readiness gate as pending
+            # before appending the actual broker submission. Present that gate
+            # as accepted once a later execution event proves submission.
+            has_submitted_execution = any(
+                event.get("stage") == "execution" and event.get("decision") == "submitted"
+                for event in events
+            )
+            if has_submitted_execution:
+                events = [
+                    {
+                        **event,
+                        "decision": "accepted",
+                        "message": "Execution readiness passed; final broker checks completed and the later execution event submitted the order.",
+                    }
+                    if (
+                        event.get("stage") == "execution"
+                        and event.get("decision") == "pending"
+                        and (event.get("details") or {}).get("status") == "ready"
+                    )
+                    else event
+                    for event in events
+                ]
             if events:
+                event_labels = lifecycle_event_labels(events)
                 flow = ""
-                for index, event in enumerate(events):
-                    decision = event["decision"]
-                    status_class = "accepted" if decision == "accepted" else "rejected" if decision == "rejected" else "pending"
+                for index, (event, event_label) in enumerate(zip(events, event_labels)):
+                    decision = _lifecycle_event_decision(event)
+                    status_class = (
+                        decision if decision in {"accepted", "rejected", "unavailable", "skipped", "deferred"}
+                        else "pending"
+                    )
                     flow += (
-                        f'<div class="flow-item {status_class}"><strong>{html.escape(event["stage"].title())}</strong>'
+                        f'<div class="flow-item {status_class}"><strong>{html.escape(event_label)}</strong>'
                         f'<br>{html.escape(event["agent_name"].replace("_", " ").title())}'
                         f'<br><small>{html.escape(decision.title())}</small></div>'
                     )
@@ -1271,27 +1891,206 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                         flow += '<div class="flow-arrow">→</div>'
                 st.markdown(f'<div class="flow-stream">{flow}</div>', unsafe_allow_html=True)
                 evidence_tabs = st.tabs([
-                    f"{event['stage'].title()} · {event['decision'].title()}"
-                    for event in events
-                ])
+                    f"{event_label} · {_lifecycle_event_decision(event).title()}"
+                    for event, event_label in zip(events, event_labels)
+                ], key=f"lifecycle_evidence_{trade['id']}", on_change="rerun")
                 for tab, event in zip(evidence_tabs, events):
+                    if not tab.open:
+                        continue
                     with tab:
-                        st.caption(event["created_at"])
+                        st.caption(format_local_timestamp(event["created_at"]))
                         render_event_evidence(event)
             else:
                 st.caption("Trade has no recorded lifecycle events.")
 
+            if trade.get("status") in {"ANALYSIS_ONLY", "DEFERRED_CAPACITY"} and account_controls_allowed():
+                research_ok = any(
+                    event.get("stage") == "research" and event.get("decision") == "accepted"
+                    for event in trade.get("events", [])
+                )
+                strategy_ok = any(
+                    event.get("stage") == "strategy" and event.get("decision") == "accepted"
+                    for event in trade.get("events", [])
+                )
+                if research_ok and strategy_ok:
+                    st.warning(
+                        "This submits an eToro demo order after fresh account, quote, strategy, risk, and stop checks. "
+                        "Direction-aware stops, targets and the configured units/spend caps are enforced."
+                    )
+                    confirmed = st.checkbox(
+                        "I confirm: submit this candidate to my eToro demo account",
+                        key=f"confirm_manual_demo_{trade['id']}",
+                    )
+                    if st.button(
+                        "Submit manual eToro demo order",
+                        key=f"submit_manual_demo_{trade['id']}",
+                        disabled=not confirmed,
+                    ):
+                        try:
+                            with st.spinner("Rechecking account, quote, research, and risk before demo submission..."):
+                                submission = asyncio.run(place_analysis_candidate_demo_order(int(trade["id"])))
+                                clear_dashboard_caches()
+                            st.success(
+                                f"Demo order submitted for {trade['symbol']}; order ID "
+                                f"{submission.get('order', {}).get('order_id') or 'pending'}; reconciliation is pending."
+                            )
+                        except Exception as error:
+                            st.error(f"Manual eToro demo order was not confirmed: {error}")
+                        clear_dashboard_caches()
+                        st.rerun()
+
             if trade["notes"]:
                 st.write(trade["notes"])
-            if trade["status"] == "OPEN":
+            broker_trade = bool(trade.get("broker_position_id"))
+            if trade.get("signal_provider") or trade.get("quote_provider"):
+                st.caption(
+                    f"Signal: {trade.get('signal_provider') or 'unknown'} at {trade.get('signal_timestamp') or 'unknown'} · "
+                    f"quote: {trade.get('quote_provider') or 'unknown'} at {trade.get('quote_timestamp') or 'unknown'}"
+                )
+            if broker_trade:
+                st.caption(
+                    f"eToro demo · order {trade.get('broker_order_id') or 'unknown'} · "
+                    f"position {trade.get('broker_position_id')} · fill "
+                    f"{trade.get('broker_fill_price') or 'pending'} × {trade.get('broker_fill_units') or 'pending'} · "
+                    f"fees {trade.get('broker_fees') if trade.get('broker_fees') is not None else 'not reported'} · "
+                    f"stop {trade.get('stop_state') or 'unknown'} · reconciliation {trade.get('reconciliation_status') or 'unknown'}"
+                )
+                if trade.get("status") in {"OPEN", "RECONCILIATION_REQUIRED"} and account_controls_allowed():
+                    with st.expander("Adjust eToro demo stop loss and take profit"):
+                        st.caption(
+                            "Submitting changes both protection prices once. Finbot then verifies the broker snapshot; "
+                            "it does not repeatedly resend the same requested pair."
+                        )
+                        with st.form(f"protection_form_{trade['id']}"):
+                            protection_stop, protection_target = st.columns(2)
+                            stop_value = protection_stop.number_input(
+                                "Stop loss price",
+                                min_value=0.000001,
+                                value=float(trade["stop_loss_price"]) if trade.get("stop_loss_price") else None,
+                                format="%.6f",
+                                key=f"protection_stop_{trade['id']}",
+                            )
+                            target_value = protection_target.number_input(
+                                "Take profit price",
+                                min_value=0.000001,
+                                value=float(trade["take_profit_price"]) if trade.get("take_profit_price") else None,
+                                format="%.6f",
+                                key=f"protection_target_{trade['id']}",
+                                help="Legacy positions without a stored target require you to enter one explicitly.",
+                            )
+                            update_protection = st.form_submit_button(
+                                "Submit protection update to eToro demo", type="primary"
+                            )
+                        if update_protection:
+                            try:
+                                if stop_value is None or target_value is None:
+                                    raise ValueError("Enter both a stop loss and take profit price.")
+                                with st.spinner("Submitting protection prices and awaiting later broker verification..."):
+                                    asyncio.run(update_etoro_demo_protection(
+                                        int(trade["id"]), float(stop_value), float(target_value)
+                                    ))
+                                clear_dashboard_caches()
+                                st.success("Protection update submitted. Reconciliation will verify the broker values.")
+                                st.rerun()
+                            except Exception as error:
+                                st.error(f"eToro protection update failed: {error}")
+                if trade.get("status") in {"OPEN", "RECONCILIATION_REQUIRED"} and account_controls_allowed() and st.button("Request eToro demo close", key=f"close_trade_{trade['id']}"):
+                    try:
+                        asyncio.run(request_etoro_demo_close(int(trade["id"])))
+                        clear_dashboard_caches()
+                        st.info("Close requested; position remains pending until broker reconciliation.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"eToro close request failed: {error}")
+            elif trade["status"] == "OPEN":
                 exit_price = st.number_input(
                     "Paper exit price", min_value=0.000001,
                     value=float(trade["current_price"] or trade["entry_price"] or 1),
                     key=f"exit_price_{trade['id']}",
                 )
-                if st.button("Close paper position", key=f"close_trade_{trade['id']}"):
+                if account_controls_allowed() and st.button("Close local simulation position", key=f"close_trade_{trade['id']}"):
                     close_paper_trade(int(trade["id"]), float(exit_price))
+                    clear_dashboard_caches()
                     st.rerun()
+
+
+def render_dashboard_lifecycle_panel(trades: list[Dict[str, Any]]) -> None:
+    st.subheader("Trade lifecycles")
+    st.caption("Pending/deferred analysis is not a queued broker order. Fresh scheduled analysis can produce a new executable opportunity when its constraints clear.")
+    search_col, status_col, count_col = st.columns([3, 2, 1])
+    search_text = search_col.text_input("Search ticker or company", key="dashboard_lifecycle_search")
+    statuses = ["All"] + sorted({trade["status"] for trade in trades})
+    selected_status = status_col.selectbox("Lifecycle status", statuses, key="dashboard_lifecycle_status")
+    page_size = count_col.selectbox("Rows", [10, 25, 50], index=0, key="dashboard_lifecycle_rows")
+    query = search_text.strip().casefold()
+    filtered = [
+        trade for trade in trades
+        if (selected_status == "All" or trade["status"] == selected_status)
+        and (not query or query in str(trade.get("company_name", "")).casefold() or query in trade["symbol"].casefold())
+    ]
+    executed_statuses = {
+        "OPEN", "CLOSED", "CLOSED_PNL_UNAVAILABLE", "EXIT_PENDING",
+        "SUBMITTED_PENDING_RECONCILIATION", "RECONCILIATION_REQUIRED",
+    }
+    executed = [
+        trade for trade in filtered
+        if trade.get("broker_order_id") or trade.get("broker_position_id")
+        or trade.get("status") in executed_statuses
+    ]
+    broker_linked_count = sum(
+        1 for trade in executed
+        if trade.get("broker_order_id") or trade.get("broker_position_id")
+    )
+    local_position_count = len(executed) - broker_linked_count
+    analysis = [trade for trade in filtered if trade not in executed]
+    show_repeated = st.toggle(
+        "Show every repeated analysis run",
+        value=False,
+        key="dashboard_show_repeated_analysis",
+        help="Off groups unchanged outcomes while retaining their run count and first/latest timestamps.",
+    )
+    analysis_focus = st.selectbox(
+        "Analysis focus",
+        ["Reached execution", "All stages", "Stopped at risk", "Stopped at strategy", "Stopped at research"],
+        key="dashboard_analysis_focus",
+    )
+    analysis = filter_analysis_stage(analysis, analysis_focus)
+    analysis_runs = len(analysis)
+    if not show_repeated:
+        analysis = collapse_repeated_analysis(analysis)
+    executed_tab, analysis_tab = st.tabs([
+        f"Positions / submissions · {len(executed)}", f"Analysis / not executed · {len(analysis)}",
+    ], key="dashboard_lifecycle_tabs", on_change="rerun")
+    st.caption(
+        f"eToro broker-linked: {broker_linked_count} · local simulation positions: {local_position_count}. "
+        "DUPLICATE marks a repeated ticker lifecycle. Broker-linked orders awaiting reconciliation remain here."
+    )
+    for tab, items, key, caption in (
+        (executed_tab, executed, "dashboard_executed", "Executed or submitted lifecycles"),
+        (analysis_tab, analysis, "dashboard_analysis", "Analyzed candidates without a broker order"),
+    ):
+        if not tab.open:
+            continue
+        with tab:
+            st.caption(caption)
+            if key == "dashboard_analysis" and not show_repeated:
+                st.caption(f"{analysis_runs} stored runs grouped into {len(analysis)} materially distinct outcomes. Execution-stage failures appear first.")
+            if not items:
+                st.info("No matching lifecycles.")
+                continue
+            page_count = max(1, math.ceil(len(items) / page_size))
+            page_key = f"{key}_page"
+            page = min(max(1, int(st.session_state.get(page_key, 1))), page_count)
+            st.session_state[page_key] = page
+            controls = st.columns([1, 2, 1])
+            if controls[0].button("Previous", key=f"{key}_previous", disabled=page <= 1):
+                st.session_state[page_key] = page - 1
+                st.rerun()
+            controls[1].caption(f"Page {page} of {page_count} · {len(items)} lifecycles")
+            if controls[2].button("Next", key=f"{key}_next", disabled=page >= page_count):
+                st.session_state[page_key] = page + 1
+                st.rerun()
+            render_trade_lifecycles(lifecycle_page(items,page_size,(page-1)*page_size))
 
 
 def render_summary(summary: Dict[str, Any]) -> None:
@@ -1310,6 +2109,10 @@ def render_summary(summary: Dict[str, Any]) -> None:
 def render_graphs(summary: Dict[str, Any]) -> None:
     st.divider()
     render_portfolio_charts(summary)
+    performance = summary.get("broker_performance") or {}
+    with st.expander("Broker performance evidence"):
+        st.caption("Equity change includes any account cash flows, manual trades and test trades. It is not a verified strategy return until those effects are reconciled.")
+        st.json({key: performance.get(key) for key in ("status", "reason", "strategy_outcomes", "snapshot_count", "closed_positions", "reported_closed_net_profit", "reported_closed_fees", "fees_complete", "equity_change_pct", "observed_equity_drawdown_pct", "benchmark_return_pct", "archived_analysis_count")})
     filter_col, count_col = st.columns([2, 1])
     statuses = ["All"] + sorted({trade["status"] for trade in summary["trades"]})
     selected_status = filter_col.selectbox("Trade status", statuses, key="trade_flow_status")
@@ -1329,7 +2132,7 @@ def render_graphs(summary: Dict[str, Any]) -> None:
         trades = trades[:entry_limit]
     render_trade_agent_flow(trades)
     st.divider()
-    render_trade_validation_chart(summary["trades"])
+    render_dashboard_lifecycle_panel(summary["trades"])
 
 
 def render_research_headlines(summary: Dict[str, Any]) -> None:
@@ -1473,8 +2276,9 @@ def render_companies_dashboard() -> None:
             trades_df["Entry"] = trades_df["entry_price"].apply(format_trade_price)
             trades_df["Current"] = trades_df["current_price"].apply(format_trade_price)
             if "leverage" in trades_df.columns:
-                trades_df["Leverage"] = trades_df["leverage"].apply(
-                    lambda value: f"{value:.1f}x" if pd.notna(value) else "Unknown"
+                trades_df["Leverage"] = pd.array(
+                    trades_df["leverage"].apply(integer_leverage),
+                    dtype="Int64",
                 )
             else:
                 trades_df["Leverage"] = "Unknown"
@@ -1529,29 +2333,26 @@ def render_companies_dashboard() -> None:
 
 def render_how_it_works() -> None:
     st.subheader("How it works")
-    st.caption("Research informs a proposal; strategy and risk gates decide whether the paper simulator records it.")
-    st.warning(
-        "This application is paper-first. It can still run local paper execution, and when configured for eToro "
-        "it can query market data and submit demo orders with the API keys in .env.config."
-    )
+    st.caption("Finbot has two execution modes: local simulation and eToro demo. Live execution is blocked.")
+    st.info("Historical evaluation reports strategy performance; it never blocks news analysis or eToro demo orders. Demo automation uses fresh per-order account, quote, sizing, and stop checks.")
 
     agent_columns = st.columns(4)
     agent_content = (
         (
             "Researcher",
-            "Builds candidates from the configured research feed, classifies relevant headlines, and optionally asks OpenAI for a company signal. Yahoo Finance supplies fundamentals, a quote, and adjusted price history when available.",
+            "In eToro mode, analyzes Yahoo headlines for dynamically screened companies with Yahoo fundamentals and available price context, then records OpenAI research. A missing publication timestamp or market quote does not stop the research pass.",
         ),
         (
             "Strategist",
-            "Maps the research signal to a proposed long or short, checks confidence and quote availability, and applies the configured countertrend-short gate when company fundamentals are strong.",
+            "Compares research direction with company financials and available price context. A missing live quote is recorded for execution and does not reject the research thesis.",
         ),
         (
             "Risk Manager",
-            "Applies deterministic drawdown and volatility thresholds. When enabled, a separate OpenAI review examines Yahoo price trends over the last hour, 24 hours, week-to-date, year-to-date, and five years; a sufficiently confident opposing trend can block the proposal.",
+            "Uses the SMA trend as one supporting factor. For execution it verifies demo equity, positions, a fresh eToro quote, ATR stop sizing, and portfolio risk; missing data pauses order submission but does not block candidate analysis.",
         ),
         (
             "Execution",
-            "Records an accepted paper position and its reference entry, stop, and target values in SQLite. Those reference levels are not sent to a broker or automatically triggered.",
+            "When eToro demo automation is enabled, submits Strategist and Risk Manager approved long or short candidates after fresh per-order broker checks. Historical evaluation is informational and does not authorize or block orders.",
         ),
     )
     for column, (agent, description) in zip(agent_columns, agent_content):
@@ -1560,6 +2361,10 @@ def render_how_it_works() -> None:
             st.write(description)
 
     st.divider()
+    st.subheader("Evaluation and execution")
+    st.write("Historical news-strategy evaluation is currently inconclusive because point-in-time research inputs are not archived. That limits performance measurement only; it does not gate demo automation. Orders remain off until eToro demo automation is enabled, then each order must pass fresh broker, quote, risk, and stop checks.")
+    st.write("eToro mode requires FINBOT_BROKER_PROVIDER=etoro and ETORO_DEMO_TRADING=true. The app never routes this strategy to live trading. A broker-reported position disappearance after a close request is recorded separately from realized P&L when close fills are unavailable.")
+
     st.subheader("What runs")
     run_columns = st.columns(3)
     run_columns[0].markdown("**Research inputs**")
@@ -1578,10 +2383,10 @@ def render_how_it_works() -> None:
     st.divider()
     st.subheader("Current limits")
     st.markdown(
-        "- Risk checks are not connected to a live account: the current cycle uses simulated P&L and volatility inputs.\n"
-        "- Open positions are not continuously repriced. Stops and targets are stored reference values; positions are closed manually in the dashboard.\n"
-        "- Yahoo data can be delayed, incomplete, or unavailable. OpenAI analyzes only the data supplied to it; it is not a market-data feed.\n"
-        "- A trend review or research signal is not a profit guarantee and does not replace testing for gaps, spread, slippage, fees, or event risk."
+        "- eToro stop changes after fill and definitive stop-hit reporting are not yet confirmed by this adapter; demo automation is therefore disabled.\n"
+        "- eToro closed-trade fill/fee history is not yet reconciled, so a position can be confirmed absent while realized P&L remains unavailable.\n"
+        "- Yahoo daily data may be delayed, corrected, or unavailable; only completed bars enter the signal.\n"
+        "- A backtest does not establish future profitability; gaps, model assumptions, universe selection, and changing market regimes remain risks."
     )
 
     st.divider()
@@ -1591,7 +2396,7 @@ def render_how_it_works() -> None:
         "2. Replace simulated risk inputs with account equity, current positions, real-time prices, and measured volatility.\n"
         "3. Add idempotent order handling, partial-fill/cancel recovery, native bracket orders, stale-data checks, and a kill switch.\n"
         "4. Run extended paper and shadow tests with fees and slippage, then review operational and risk results before considering any live account.\n\n"
-        "Live trading is not implemented or enabled in this application. A future broker adapter must be explicitly built and validated; changing the paper-trading rule alone cannot enable it."
+        "Live execution is blocked in code. Do not change credentials or mode to enable live orders; this strategy version has no live-order route."
     )
 
 
@@ -1712,10 +2517,15 @@ def render_profile_page(username: str) -> None:
 
 
 def render_time_range() -> tuple[str, str]:
-    now = datetime.now().replace(second=0, microsecond=0)
+    now = datetime.now(DISPLAY_TIMEZONE).replace(microsecond=0, tzinfo=None)
+    now = now.replace(second=now.second-now.second%5)
     default_start = now - timedelta(days=30)
     selected_start = st.session_state.get("dashboard_range_start", default_start)
     selected_end = st.session_state.get("dashboard_range_end", now)
+    if selected_start.tzinfo is not None:
+        selected_start = selected_start.astimezone(DISPLAY_TIMEZONE).replace(tzinfo=None)
+    if selected_end.tzinfo is not None:
+        selected_end = selected_end.astimezone(DISPLAY_TIMEZONE).replace(tzinfo=None)
     range_label = "Time"
     range_help = (
         f"Dashboard range: {selected_start:%b %d %H:%M} – {selected_end:%b %d %H:%M}. "
@@ -1746,13 +2556,41 @@ def render_time_range() -> tuple[str, str]:
                 selected_start = candidate_start
                 selected_end = candidate_end
 
-    start_utc = selected_start.astimezone(timezone.utc)
-    end_utc = selected_end.astimezone(timezone.utc)
+    start_utc = selected_start.replace(tzinfo=DISPLAY_TIMEZONE).astimezone(timezone.utc)
+    end_utc = selected_end.replace(tzinfo=DISPLAY_TIMEZONE).astimezone(timezone.utc)
     return start_utc.strftime("%Y-%m-%d %H:%M:%S"), end_utc.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def refresh_dashboard_end_time() -> None:
-    st.session_state["dashboard_range_end"] = datetime.now()
+    st.session_state["dashboard_range_end"] = datetime.now(DISPLAY_TIMEZONE).replace(tzinfo=None)
+
+
+def format_local_timestamp(value: Optional[str]) -> str:
+    if not value:
+        return "time unavailable"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)
+    # SQLite CURRENT_TIMESTAMP values are UTC even though they have no suffix.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def render_trade_monitor_clock() -> None:
+    def render_clock_value() -> None:
+        value = datetime.now(DISPLAY_TIMEZONE).strftime("%H:%M:%S %Z")
+        st.markdown(f'<div class="trade-monitor-clock">{html.escape(value)}</div>', unsafe_allow_html=True)
+
+    fragment = getattr(st, "fragment", None)
+    if fragment:
+        @fragment(run_every="1s")
+        def live_clock() -> None:
+            render_clock_value()
+        live_clock()
+    else:
+        render_clock_value()
 
 
 def render_trade_search(trades: list[Dict[str, Any]]) -> None:
@@ -1830,7 +2668,9 @@ def render_trade_search(trades: list[Dict[str, Any]]) -> None:
         )
 
     st.divider()
-    render_trade_validation_chart(trades)
+    if st.toggle("Show historical validation chart",value=False,key="show_validation_chart"):
+        full_trades=backend_module.get_trade_history(end_at=st.session_state.get("lifecycle_end_at"),trade_ids=[t["id"] for t in trades]) if trades else []
+        render_trade_validation_chart(full_trades)
     st.divider()
 
     search_col, status_col = st.columns([3, 1])
@@ -1838,7 +2678,7 @@ def render_trade_search(trades: list[Dict[str, Any]]) -> None:
         search_text = st.text_input("Search company, ticker, or decision", key="trade_search")
     with status_col:
         statuses = ["All"] + sorted({trade["status"] for trade in trades})
-        selected_status = st.selectbox("Status", statuses)
+        selected_status = st.selectbox("Status", statuses, key="trade_lifecycle_status")
 
     query = search_text.strip().casefold()
     filtered = [
@@ -1852,55 +2692,94 @@ def render_trade_search(trades: list[Dict[str, Any]]) -> None:
             or any(query in event["message"].casefold() for event in trade["events"])
         )
     ]
-    page_size_option = st.selectbox(
-        "Trades per page",
-        [10, 25, 50, 100, "All"],
-        index=1,
-        key="trade_lifecycle_page_size",
+    executed_statuses = {
+        "OPEN", "CLOSED", "CLOSED_PNL_UNAVAILABLE", "EXIT_PENDING",
+        "SUBMITTED_PENDING_RECONCILIATION", "RECONCILIATION_REQUIRED",
+    }
+    executed = [
+        trade for trade in filtered
+        if trade.get("broker_order_id") or trade.get("broker_position_id")
+        or trade.get("status") in executed_statuses
+    ]
+    broker_linked_count = sum(
+        1 for trade in executed
+        if trade.get("broker_order_id") or trade.get("broker_position_id")
     )
-    if page_size_option == "All":
-        page_trades = filtered
-        st.caption(f"Showing all {len(filtered)} trade(s) in the selected time range")
-    elif not filtered:
-        page_trades = []
-        st.session_state["trade_lifecycle_page"] = 1
-        st.caption("0 trades in the selected time range")
-    else:
-        page_size = int(page_size_option)
-        page_count = math.ceil(len(filtered) / page_size)
-        current_page = min(
-            max(1, int(st.session_state.get("trade_lifecycle_page", 1))),
-            page_count,
+    local_position_count = len(executed) - broker_linked_count
+    analysis = [trade for trade in filtered if trade not in executed]
+
+    def render_cycle_tab(cycles: list[Dict[str, Any]], key: str, kind: str) -> None:
+        page_size_option = st.selectbox(
+            "Trades per page", [10, 25, 50, 100, "All"], index=1,
+            key=f"{key}_page_size",
         )
-        st.session_state["trade_lifecycle_page"] = current_page
-        start_index = (current_page - 1) * page_size
-        end_index = min(start_index + page_size, len(filtered))
-        page_trades = filtered[start_index:end_index]
+        if page_size_option == "All":
+            page_cycles = cycles
+            st.caption(f"Showing all {len(cycles)} {kind} cycle(s) in the selected time range")
+        elif not cycles:
+            page_cycles = []
+            st.session_state[f"{key}_page"] = 1
+            st.caption(f"0 {kind} cycles in the selected time range")
+        else:
+            page_size = int(page_size_option)
+            page_count = math.ceil(len(cycles) / page_size)
+            current_page = min(max(1, int(st.session_state.get(f"{key}_page", 1))), page_count)
+            st.session_state[f"{key}_page"] = current_page
+            start_index = (current_page - 1) * page_size
+            end_index = min(start_index + page_size, len(cycles))
+            page_cycles = cycles[start_index:end_index]
+            previous_col, page_col, next_col = st.columns([1, 2, 1])
+            with previous_col:
+                if st.button("Previous", key=f"{key}_previous", disabled=current_page == 1):
+                    st.session_state[f"{key}_page"] = current_page - 1
+                    st.rerun()
+            with page_col:
+                st.caption(
+                    f"Showing {kind} cycles {start_index + 1}–{end_index} of {len(cycles)} "
+                    f"· page {current_page} of {page_count}"
+                )
+            with next_col:
+                if st.button("Next", key=f"{key}_next", disabled=current_page == page_count):
+                    st.session_state[f"{key}_page"] = current_page + 1
+                    st.rerun()
+        if page_size_option == "All":
+            page_cycles=lifecycle_page(cycles,max(1,len(cycles)),0) if cycles else []
+        elif cycles:
+            page_cycles=lifecycle_page(cycles,page_size,start_index)
+        render_trade_lifecycles(page_cycles)
 
-        previous_col, page_col, next_col = st.columns([1, 2, 1])
-        with previous_col:
-            if st.button(
-                "Previous",
-                key="trade_lifecycle_previous",
-                disabled=current_page == 1,
-            ):
-                st.session_state["trade_lifecycle_page"] = current_page - 1
-                st.rerun()
-        with page_col:
-            st.caption(
-                f"Showing trades {start_index + 1}–{end_index} of {len(filtered)} "
-                f"· page {current_page} of {page_count}"
+    executed_tab, analysis_tab = st.tabs([
+        f"Positions / submissions · {len(executed)}", f"Analysis / not executed · {len(analysis)}",
+    ], key="trade_search_tabs", on_change="rerun")
+    st.caption(
+        f"eToro broker-linked: {broker_linked_count} · local simulation positions: {local_position_count}. "
+        "A DUPLICATE lifecycle marker means an earlier cycle exists for the same ticker."
+    )
+    with executed_tab:
+        if executed_tab.open:
+            st.caption("Includes opened or closed local simulation positions and broker-linked orders, including submissions awaiting reconciliation. Check each lifecycle status for confirmed broker state.")
+            render_cycle_tab(executed, "executed_cycles", "executed")
+    with analysis_tab:
+        if analysis_tab.open:
+            focus = st.selectbox(
+                "Analysis focus",
+                ["Reached execution", "All stages", "Stopped at risk", "Stopped at strategy", "Stopped at research"],
+                key="trade_analysis_focus",
             )
-        with next_col:
-            if st.button(
-                "Next",
-                key="trade_lifecycle_next",
-                disabled=current_page == page_count,
-            ):
-                st.session_state["trade_lifecycle_page"] = current_page + 1
-                st.rerun()
-
-    render_trade_lifecycles(page_trades)
+            show_repeated = st.toggle(
+                "Show every repeated analysis run",
+                value=False,
+                key="trade_show_repeated_analysis",
+                help="Off groups unchanged outcomes while retaining their run count and first/latest timestamps.",
+            )
+            focused_analysis = filter_analysis_stage(analysis, focus)
+            displayed_analysis = focused_analysis if show_repeated else collapse_repeated_analysis(focused_analysis)
+            if not show_repeated:
+                st.caption(
+                    f"{len(focused_analysis)} stored runs grouped into {len(displayed_analysis)} materially distinct outcomes. "
+                    "Execution-stage failures appear first."
+                )
+            render_cycle_tab(displayed_analysis, "analysis_cycles", "analysis outcome")
 
 
 def refresh_stale_backend_import() -> None:
@@ -1927,6 +2806,8 @@ def refresh_stale_backend_import() -> None:
         and hasattr(backend_module, "evaluate_strategist_gate")
         and "countertrend_short_min_confidence" in strategist_defaults
         and "countertrend_long_min_confidence" in strategist_defaults
+        and "conditional_mean_reversion_min_atr_multiple" in strategist_defaults
+        and hasattr(backend_module, "manage_etoro_demo_positions")
         and "fundamental_confirmation_min_confidence" in strategist_defaults
         and "weak_fundamentals_max_revenue_growth_pct" in strategist_defaults
         and "require_current_market_quote" in strategist_defaults
@@ -1969,13 +2850,20 @@ def refresh_stale_backend_import() -> None:
         "sync_openai_token_allowance", "update_agent_rules", "validate_trade_outcome",
         "validate_pending_trade_outcomes", "validate_session_token", "set_user_admin",
         "delete_user",
+        "run_strategy_evaluation", "get_strategy_evaluation",
+        "get_demo_automated_trading_enabled", "set_demo_automated_trading_enabled",
+        "place_analysis_candidate_demo_order",
+        "get_test_workflow_runs", "get_sample_research_inputs", "run_demo_test_workflow", "reconcile_demo_test_workflow", "close_demo_test_workflow",
+        "request_etoro_demo_close",
     ):
         globals()[name] = getattr(refreshed, name)
 
 
 def run_agent_cycle_for_ui() -> Dict[str, Any] | None:
     try:
-        return asyncio.run(run_trading_cycle())
+        result=asyncio.run(run_trading_cycle())
+        clear_dashboard_caches()
+        return result
     except Exception as error:
         st.session_state["manual_research_error"] = str(error)
         return None
@@ -1983,7 +2871,10 @@ def run_agent_cycle_for_ui() -> Dict[str, Any] | None:
 
 def main() -> None:
     refresh_stale_backend_import()
-    ensure_db()
+    db_path=str(backend_module.DB_PATH)
+    if st.session_state.get("initialized_db_path") != db_path:
+        ensure_db()
+        st.session_state["initialized_db_path"]=db_path
     cookie_manager = get_cookie_manager()
 
     if not st.session_state.authenticated:
@@ -1996,245 +2887,492 @@ def main() -> None:
             st.stop()
 
     render_header_actions(cookie_manager)
+    render_trade_monitor_clock()
+    if not account_controls_allowed():
+        st.caption("Read-only account access. Administrators control trading, settings and cleanup.")
+        st.session_state["lifecycle_end_at"]=None
+        summary = get_ui_dashboard_summary(str(backend_module.DB_PATH))
+        render_summary(summary)
+        render_graphs(summary)
+        return
     st.sidebar.title("Navigation")
-
-    current_capital = get_portfolio_summary()["starting_capital"]
-    with st.sidebar.expander("Portfolio settings"):
-        capital = st.number_input("Starting capital", min_value=1.0, value=float(current_capital), step=500.0)
-        if st.button("Save capital", key="save_starting_capital"):
-            try:
-                set_starting_capital(capital)
+    with st.sidebar.expander('Analysis cleanup and restore', key='lazy_main_1', on_change="rerun") as lazy_panel:
+        if lazy_panel.open:
+            retention = backend_module.get_agent_rules()["execution"].get("analysis_retention_days", 3)
+            st.caption(f"The worker archives never-submitted analysis older than {retention} days, checking hourly. Change retention under Execution rules. Broker-linked records are preserved.")
+            if st.button("Archive stale analysis now", key="cleanup_analysis_now"):
+                result = backend_module.cleanup_stale_analysis()
+                clear_dashboard_caches()
+                st.success(f"Archived {result['archived']} stale lifecycles.")
                 st.rerun()
-            except ValueError as error:
-                st.error(str(error))
-
-        st.divider()
-        st.caption("Choose the account whose balance should populate the dashboard portfolio setting.")
-        portfolio_source = st.selectbox(
-            "Portfolio account",
-            list(PORTFOLIO_ACCOUNT_OPTIONS),
-            index=list(PORTFOLIO_ACCOUNT_OPTIONS).index(
-                os.getenv("FINBOT_PORTFOLIO_ACCOUNT_SOURCE", "paper").lower()
-            )
-            if os.getenv("FINBOT_PORTFOLIO_ACCOUNT_SOURCE", "paper").lower() in PORTFOLIO_ACCOUNT_OPTIONS
-            else 0,
-            format_func=lambda key: PORTFOLIO_ACCOUNT_OPTIONS[key],
-            help="This selection is stored in .env.config and used when syncing the portfolio capital.",
-        )
-        portfolio_source_key = f"portfolio_account_snapshot::{portfolio_source}"
-        if st.button("Save portfolio account", key="save_portfolio_account"):
-            try:
-                save_env_config({"FINBOT_PORTFOLIO_ACCOUNT_SOURCE": portfolio_source})
-                st.success("Portfolio account saved.")
-                st.rerun()
-            except Exception as error:
-                st.error(f"Could not save portfolio account: {error}")
-
-        selected_snapshot = st.session_state.get(portfolio_source_key)
-        if portfolio_source != "paper":
-            if st.button("Fetch selected account balance", key="fetch_portfolio_account_balance"):
+            restore_id = st.number_input("Archived trade ID to restore", min_value=1, value=1, step=1, key="restore_analysis_id")
+            if st.button("Restore lifecycle", key="restore_analysis_button"):
                 try:
-                    selected_snapshot = integrations_module.get_portfolio_account_snapshot(portfolio_source)
-                    st.session_state[portfolio_source_key] = selected_snapshot
-                    st.rerun()
-                except Exception as error:
-                    selected_snapshot = {
-                        "available": False,
-                        "source": portfolio_source,
-                        "message": str(error),
-                    }
-                    st.session_state[portfolio_source_key] = selected_snapshot
-
-            if selected_snapshot:
-                if selected_snapshot.get("available"):
-                    balance = selected_snapshot.get("balance")
-                    cash_available = selected_snapshot.get("cash_available")
-                    currency = selected_snapshot.get("currency") or "USD"
-                    if balance is not None:
-                        st.caption(f"Selected balance: {currency} {float(balance):,.2f}")
-                    if cash_available is not None and cash_available != balance:
-                        st.caption(f"Available cash: {currency} {float(cash_available):,.2f}")
-                    if st.button(
-                        "Sync capital from selected account",
-                        key="sync_portfolio_capital",
-                        disabled=balance is None,
-                    ):
-                        try:
-                            set_starting_capital(float(balance))
-                            st.success("Starting capital updated from the selected account balance.")
-                            st.rerun()
-                        except ValueError as error:
-                            st.error(str(error))
-                else:
-                    st.warning(selected_snapshot.get("message", "Selected account balance is unavailable."))
-
-        st.divider()
-        st.subheader("Trade Oversight")
-        if st.button("🔍 Audit all trades", key="run_overwatcher_audit"):
-            with st.spinner("Running trade configuration audit..."):
-                overwatcher = OverwatcherAgent()
-                audit_result = overwatcher.audit_all_trades()
-            st.success(f"✓ Audit complete: {audit_result['total_trades_audited']} trades checked")
-            st.caption(f"Log file: audit_logs/{audit_result['audit_log_file'].split('/')[-1]}")
-            st.rerun()
-
-    with st.sidebar.expander("Broker settings", expanded=False):
-        with st.form("broker_settings"):
-            broker_provider = st.selectbox(
-                "Broker provider",
-                ["dummy", "etoro", "ibkr"],
-                index=["dummy", "etoro", "ibkr"].index(os.getenv("FINBOT_BROKER_PROVIDER", "dummy").lower())
-                if os.getenv("FINBOT_BROKER_PROVIDER", "dummy").lower() in {"dummy", "etoro", "ibkr"}
-                else 0,
-                help="Choose which broker adapter the execution flow uses.",
-            )
-            st.caption("Changing the provider updates the live environment and persists to .env.config.")
-            st.markdown("**eToro**")
-            st.caption("eToro API access requires both the public API key and the user key; demo balance checks can also use an optional demo account ID.")
-            etoro_base_url = st.text_input(
-                "eToro API base URL",
-                value=os.getenv("ETORO_API_BASE_URL", "https://public-api.etoro.com"),
-                help="Leave unchanged unless your account uses a different eToro API host.",
-            )
-            etoro_api_key = st.text_input(
-                "eToro public API key",
-                value=os.getenv("ETORO_API_KEY", ""),
-                type="password",
-            )
-            etoro_user_key = st.text_input(
-                "eToro user key",
-                value=os.getenv("ETORO_USER_KEY", ""),
-                type="password",
-            )
-            etoro_main_account_id = st.text_input(
-                "eToro main account ID",
-                value=os.getenv("ETORO_MAIN_ACCOUNT_ID", ""),
-                help="Optional. Required only if you want to sync the main/live eToro account balance.",
-            )
-            etoro_demo_account_id = st.text_input(
-                "eToro demo account ID",
-                value=os.getenv("ETORO_DEMO_ACCOUNT_ID", ""),
-                help="Optional. Needed only if you want to test the demo balance endpoint as well.",
-            )
-            etoro_demo_trading = st.checkbox(
-                "Use eToro demo trading",
-                value=os.getenv("ETORO_DEMO_TRADING", "true").lower() in {"1", "true", "yes", "on"},
-                help="Disable only if you explicitly intend to route to the live trading endpoint.",
-            )
-            st.markdown("**Interactive Brokers**")
-            ibkr_host = st.text_input("IBKR host", value=os.getenv("IBKR_HOST", "127.0.0.1"))
-            ibkr_port = st.number_input("IBKR port", min_value=1, max_value=65535, value=int(os.getenv("IBKR_PORT", "7497")))
-            ibkr_client_id = st.number_input("IBKR client id", min_value=0, value=int(os.getenv("IBKR_CLIENT_ID", "1")))
-            ibkr_main_account_id = st.text_input(
-                "IBKR main account ID",
-                value=os.getenv("IBKR_MAIN_ACCOUNT_ID", os.getenv("IBKR_ACCOUNT_ID", "")),
-            )
-            ibkr_demo_account_id = st.text_input(
-                "IBKR demo account ID",
-                value=os.getenv("IBKR_DEMO_ACCOUNT_ID", ""),
-            )
-            ibkr_paper_trading = st.checkbox(
-                "Use IBKR paper trading",
-                value=os.getenv("IBKR_PAPER_TRADING", "true").lower() in {"1", "true", "yes", "on"},
-            )
-            if st.form_submit_button("Save broker settings"):
-                try:
-                    save_env_config({
-                        "FINBOT_BROKER_PROVIDER": broker_provider,
-                        "ETORO_API_BASE_URL": etoro_base_url.strip(),
-                        "ETORO_API_KEY": etoro_api_key.strip(),
-                        "ETORO_USER_KEY": etoro_user_key.strip(),
-                        "ETORO_MAIN_ACCOUNT_ID": etoro_main_account_id.strip(),
-                        "ETORO_DEMO_ACCOUNT_ID": etoro_demo_account_id.strip(),
-                        "ETORO_DEMO_TRADING": "true" if etoro_demo_trading else "false",
-                        "IBKR_HOST": ibkr_host.strip(),
-                        "IBKR_PORT": str(int(ibkr_port)),
-                        "IBKR_CLIENT_ID": str(int(ibkr_client_id)),
-                        "IBKR_ACCOUNT_ID": ibkr_main_account_id.strip(),
-                        "IBKR_MAIN_ACCOUNT_ID": ibkr_main_account_id.strip(),
-                        "IBKR_DEMO_ACCOUNT_ID": ibkr_demo_account_id.strip(),
-                        "IBKR_PAPER_TRADING": "true" if ibkr_paper_trading else "false",
-                    })
-                    st.success("Broker settings saved.")
-                    st.rerun()
-                except Exception as error:
-                    st.error(f"Could not save broker settings: {error}")
-
-        validate_clicked = st.button(
-            "Validate eToro credentials",
-            key="validate_etoro_credentials",
-            help="Runs a read-only eToro market-data lookup using the configured public API key and user key.",
-        )
-        if validate_clicked:
-            with st.spinner("Checking eToro authentication and market-data access..."):
-                try:
-                    validation = asyncio.run(integrations_module.validate_etoro_credentials())
-                    st.session_state["etoro_validation_result"] = validation
-                except Exception as error:
-                    st.session_state["etoro_validation_result"] = {
-                        "available": False,
-                        "status": "error",
-                        "message": str(error),
-                        "source": "eToro Public API",
-                    }
-
-        validation_result = st.session_state.get("etoro_validation_result")
-        if validation_result:
-            if validation_result.get("available"):
-                st.success(validation_result.get("message", "eToro credentials validated."))
-            else:
-                st.warning(validation_result.get("message", "Some eToro read-only checks failed."))
-
-            checks = validation_result.get("checks", {})
-            market_check = checks.get("market_data", {})
-            portfolio_check = checks.get("demo_portfolio", {})
-            balance_check = checks.get("demo_balance", {})
-
-            st.markdown("**Validation results**")
-            st.write(
-                f"Market data lookup: {'passed' if market_check.get('available') else 'failed'}"
-            )
-            if market_check.get("available"):
-                market_bits = [f"Symbol {market_check.get('quote_symbol') or market_check.get('symbol')}"]
-                if market_check.get("instrument_id") is not None:
-                    market_bits.append(f"Instrument ID {market_check['instrument_id']}")
-                if market_check.get("quote_type"):
-                    market_bits.append(f"Quote type {market_check['quote_type']}")
-                st.caption(" · ".join(market_bits))
-            else:
-                st.caption(market_check.get("error", "No market-data details returned."))
-
-            st.write(f"Demo portfolio snapshot: {'passed' if portfolio_check.get('available') else 'failed'}")
-            if not portfolio_check.get("available"):
-                st.caption(portfolio_check.get("error", "No portfolio details returned."))
-
-            if balance_check.get("skipped"):
-                st.caption(balance_check.get("message", "Demo balance check skipped."))
-            else:
-                st.write(f"Demo balance endpoint: {'passed' if balance_check.get('available') else 'failed'}")
-                if not balance_check.get("available"):
-                    st.caption(balance_check.get("error", "No demo balance details returned."))
-
-    with st.sidebar.expander("AI research settings", expanded=False):
-        ai_enabled = get_ai_research_enabled()
-        with st.form("ai_research_settings"):
-            requested_ai_enabled = st.checkbox(
-                "Use OpenAI to analyze research",
-                value=ai_enabled,
-                help="When enabled, the selected dummy signal and recent headlines are sent to the configured OpenAI-compatible endpoint.",
-            )
-            st.caption("Disabled uses the existing dummy research signal. Risk and execution gates remain deterministic.")
-            if st.form_submit_button("Save AI setting"):
-                try:
-                    set_ai_research_enabled(requested_ai_enabled)
+                    backend_module.restore_archived_analysis(int(restore_id))
+                    clear_dashboard_caches()
                     st.rerun()
                 except ValueError as error:
                     st.error(str(error))
-        if st.button("Synchronize usage counter", icon=":material/sync:", key="ai_settings_sync_usage"):
-            sync_openai_token_allowance()
-            st.rerun()
 
-    st.caption("Paper portfolio · simulated research and execution · optional eToro demo trading")
+    current_capital = get_portfolio_summary()["starting_capital"]
+    with st.sidebar.expander('Portfolio settings', key='lazy_main_2', on_change="rerun") as lazy_panel:
+        if lazy_panel.open:
+            capital = st.number_input("Starting capital", min_value=1.0, value=float(current_capital), step=500.0)
+            if st.button("Save capital", key="save_starting_capital"):
+                try:
+                    set_starting_capital(capital)
+                    st.rerun()
+                except ValueError as error:
+                    st.error(str(error))
+
+            st.divider()
+            st.caption("Choose the account whose balance should populate the dashboard portfolio setting.")
+            portfolio_source = st.selectbox(
+                "Portfolio account",
+                list(PORTFOLIO_ACCOUNT_OPTIONS),
+                index=list(PORTFOLIO_ACCOUNT_OPTIONS).index(
+                    os.getenv("FINBOT_PORTFOLIO_ACCOUNT_SOURCE", "paper").lower()
+                )
+                if os.getenv("FINBOT_PORTFOLIO_ACCOUNT_SOURCE", "paper").lower() in PORTFOLIO_ACCOUNT_OPTIONS
+                else 0,
+                format_func=lambda key: PORTFOLIO_ACCOUNT_OPTIONS[key],
+                help="This selection is stored in .env.config and used when syncing the portfolio capital.",
+            )
+            portfolio_source_key = f"portfolio_account_snapshot::{portfolio_source}"
+            if st.button("Save portfolio account", key="save_portfolio_account"):
+                try:
+                    save_env_config({"FINBOT_PORTFOLIO_ACCOUNT_SOURCE": portfolio_source})
+                    st.success("Portfolio account saved.")
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Could not save portfolio account: {error}")
+
+            selected_snapshot = st.session_state.get(portfolio_source_key)
+            if portfolio_source != "paper":
+                if st.button("Fetch selected account balance", key="fetch_portfolio_account_balance"):
+                    try:
+                        selected_snapshot = integrations_module.get_portfolio_account_snapshot(portfolio_source)
+                        st.session_state[portfolio_source_key] = selected_snapshot
+                        st.rerun()
+                    except Exception as error:
+                        selected_snapshot = {
+                            "available": False,
+                            "source": portfolio_source,
+                            "message": str(error),
+                        }
+                        st.session_state[portfolio_source_key] = selected_snapshot
+
+                if selected_snapshot:
+                    if selected_snapshot.get("available"):
+                        balance = selected_snapshot.get("balance")
+                        cash_available = selected_snapshot.get("cash_available")
+                        currency = selected_snapshot.get("currency") or "USD"
+                        if balance is not None:
+                            st.caption(f"Selected balance: {currency} {float(balance):,.2f}")
+                        if cash_available is not None and cash_available != balance:
+                            st.caption(f"Available cash: {currency} {float(cash_available):,.2f}")
+                        if st.button(
+                            "Sync capital from selected account",
+                            key="sync_portfolio_capital",
+                            disabled=balance is None,
+                        ):
+                            try:
+                                set_starting_capital(float(balance))
+                                st.success("Starting capital updated from the selected account balance.")
+                                st.rerun()
+                            except ValueError as error:
+                                st.error(str(error))
+                    else:
+                        st.warning(selected_snapshot.get("message", "Selected account balance is unavailable."))
+
+            st.divider()
+            st.subheader("Trade Oversight")
+            if st.button("🔍 Audit all trades", key="run_overwatcher_audit"):
+                with st.spinner("Running trade configuration audit..."):
+                    overwatcher = OverwatcherAgent()
+                    audit_result = overwatcher.audit_all_trades()
+                st.success(f"✓ Audit complete: {audit_result['total_trades_audited']} trades checked")
+                st.caption(f"Log file: audit_logs/{audit_result['audit_log_file'].split('/')[-1]}")
+                st.rerun()
+
+    with st.sidebar.expander('Broker settings', expanded=False, key='lazy_main_3', on_change="rerun") as lazy_panel:
+        if lazy_panel.open:
+            with st.form("broker_settings"):
+                broker_provider = st.selectbox(
+                    "Broker provider",
+                    ["dummy", "etoro"],
+                    index=["dummy", "etoro"].index(os.getenv("FINBOT_BROKER_PROVIDER", "dummy").lower())
+                    if os.getenv("FINBOT_BROKER_PROVIDER", "dummy").lower() in {"dummy", "etoro"}
+                    else 0,
+                    help="dummy is local simulation; eToro is demo-only. Live order execution is blocked.",
+                )
+                st.caption("Changing the provider updates the live environment and persists to .env.config.")
+                st.markdown("**eToro**")
+                st.caption("eToro API access requires both the public API key and the user key; demo balance checks can also use an optional demo account ID.")
+                etoro_base_url = st.text_input(
+                    "eToro API base URL",
+                    value=os.getenv("ETORO_API_BASE_URL", "https://public-api.etoro.com"),
+                    help="Leave unchanged unless your account uses a different eToro API host.",
+                )
+                etoro_api_key = st.text_input(
+                    "eToro public API key",
+                    value=os.getenv("ETORO_API_KEY", ""),
+                    type="password",
+                )
+                etoro_user_key = st.text_input(
+                    "eToro user key",
+                    value=os.getenv("ETORO_USER_KEY", ""),
+                    type="password",
+                )
+                etoro_main_account_id = st.text_input(
+                    "eToro main account ID",
+                    value=os.getenv("ETORO_MAIN_ACCOUNT_ID", ""),
+                    help="Optional read-only account balance lookup. This does not enable live order execution.",
+                )
+                etoro_demo_account_id = st.text_input(
+                    "eToro demo account ID",
+                    value=os.getenv("ETORO_DEMO_ACCOUNT_ID", ""),
+                    help="Optional. Needed only if you want to test the demo balance endpoint as well.",
+                )
+                st.checkbox("eToro demo trading (live route disabled)", value=True, disabled=True)
+                etoro_api_debug_logging = st.checkbox(
+                    "Enable eToro API debug logs",
+                    value=get_etoro_api_debug_logging(),
+                    help="Store masked eToro request and response details on each trade event. Turn off to avoid extra log storage.",
+                )
+                st.markdown("**Interactive Brokers**")
+                st.caption("Legacy account fields only; this strategy does not submit IBKR orders.")
+                ibkr_host = st.text_input("IBKR host", value=os.getenv("IBKR_HOST", "127.0.0.1"))
+                ibkr_port = st.number_input("IBKR port", min_value=1, max_value=65535, value=int(os.getenv("IBKR_PORT", "7497")))
+                ibkr_client_id = st.number_input("IBKR client id", min_value=0, value=int(os.getenv("IBKR_CLIENT_ID", "1")))
+                ibkr_main_account_id = st.text_input(
+                    "IBKR main account ID",
+                    value=os.getenv("IBKR_MAIN_ACCOUNT_ID", os.getenv("IBKR_ACCOUNT_ID", "")),
+                )
+                ibkr_demo_account_id = st.text_input(
+                    "IBKR demo account ID",
+                    value=os.getenv("IBKR_DEMO_ACCOUNT_ID", ""),
+                )
+                ibkr_paper_trading = st.checkbox(
+                    "Use IBKR paper trading",
+                    value=os.getenv("IBKR_PAPER_TRADING", "true").lower() in {"1", "true", "yes", "on"},
+                )
+                if st.form_submit_button("Save broker settings"):
+                    try:
+                        save_env_config({
+                            "FINBOT_BROKER_PROVIDER": broker_provider,
+                            "ETORO_API_BASE_URL": etoro_base_url.strip(),
+                            "ETORO_API_KEY": etoro_api_key.strip(),
+                            "ETORO_USER_KEY": etoro_user_key.strip(),
+                            "ETORO_MAIN_ACCOUNT_ID": etoro_main_account_id.strip(),
+                            "ETORO_DEMO_ACCOUNT_ID": etoro_demo_account_id.strip(),
+                            "ETORO_DEMO_TRADING": "true",
+                            "IBKR_HOST": ibkr_host.strip(),
+                            "IBKR_PORT": str(int(ibkr_port)),
+                            "IBKR_CLIENT_ID": str(int(ibkr_client_id)),
+                            "IBKR_ACCOUNT_ID": ibkr_main_account_id.strip(),
+                            "IBKR_MAIN_ACCOUNT_ID": ibkr_main_account_id.strip(),
+                            "IBKR_DEMO_ACCOUNT_ID": ibkr_demo_account_id.strip(),
+                            "IBKR_PAPER_TRADING": "true" if ibkr_paper_trading else "false",
+                        })
+                        set_etoro_api_debug_logging(etoro_api_debug_logging)
+                        st.success("Broker settings saved.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Could not save broker settings: {error}")
+
+            validate_clicked = st.button(
+                "Validate eToro credentials",
+                key="validate_etoro_credentials",
+                help="Runs a read-only eToro market-data lookup using the configured public API key and user key.",
+            )
+            if validate_clicked:
+                with st.spinner("Checking eToro authentication and market-data access..."):
+                    try:
+                        validation = asyncio.run(integrations_module.validate_etoro_credentials())
+                        st.session_state["etoro_validation_result"] = validation
+                    except Exception as error:
+                        st.session_state["etoro_validation_result"] = {
+                            "available": False,
+                            "status": "error",
+                            "message": str(error),
+                            "source": "eToro Public API",
+                        }
+
+            validation_result = st.session_state.get("etoro_validation_result")
+            if validation_result:
+                if validation_result.get("available"):
+                    st.success(validation_result.get("message", "eToro credentials validated."))
+                else:
+                    st.warning(validation_result.get("message", "Some eToro read-only checks failed."))
+
+                checks = validation_result.get("checks", {})
+                market_check = checks.get("market_data", {})
+                portfolio_check = checks.get("demo_portfolio", {})
+                balance_check = checks.get("demo_balance", {})
+
+                st.markdown("**Validation results**")
+                st.write(
+                    f"Market data lookup: {'passed' if market_check.get('available') else 'failed'}"
+                )
+                if market_check.get("available"):
+                    market_bits = [f"Symbol {market_check.get('quote_symbol') or market_check.get('symbol')}"]
+                    if market_check.get("instrument_id") is not None:
+                        market_bits.append(f"Instrument ID {market_check['instrument_id']}")
+                    if market_check.get("quote_type"):
+                        market_bits.append(f"Quote type {market_check['quote_type']}")
+                    st.caption(" · ".join(market_bits))
+                else:
+                    st.caption(market_check.get("error", "No market-data details returned."))
+
+                st.write(f"Demo portfolio snapshot: {'passed' if portfolio_check.get('available') else 'failed'}")
+                if not portfolio_check.get("available"):
+                    st.caption(portfolio_check.get("error", "No portfolio details returned."))
+
+                if balance_check.get("skipped"):
+                    st.caption(balance_check.get("message", "Demo balance check skipped."))
+                else:
+                    st.write(f"Demo balance endpoint: {'passed' if balance_check.get('available') else 'failed'}")
+                    if not balance_check.get("available"):
+                        st.caption(balance_check.get("error", "No demo balance details returned."))
+
+    with st.sidebar.expander(
+        "Trade email notifications", expanded=False, key="lazy_trade_email_settings", on_change="rerun"
+    ) as lazy_panel:
+        if lazy_panel.open:
+            st.caption(
+                "Send an email after eToro acknowledges a demo order. The message includes every agent-stage decision "
+                "and an optional sanitized JSON evidence attachment. Fill and protection remain pending until reconciliation."
+            )
+            current_email = load_env_config()
+            security_options = ["starttls", "tls", "none"]
+            current_security = current_email.get(
+                "FINBOT_SMTP_SECURITY", os.getenv("FINBOT_SMTP_SECURITY", "starttls")
+            ).lower()
+            if current_security not in security_options:
+                current_security = "starttls"
+            with st.form("trade_email_settings"):
+                email_enabled = st.checkbox(
+                    "Email successful demo submissions",
+                    value=current_email.get(
+                        "FINBOT_TRADE_EMAIL_ENABLED", os.getenv("FINBOT_TRADE_EMAIL_ENABLED", "false")
+                    ).lower() in {"1", "true", "yes", "on"},
+                )
+                smtp_host = st.text_input(
+                    "SMTP host", value=current_email.get("FINBOT_SMTP_HOST", os.getenv("FINBOT_SMTP_HOST", ""))
+                )
+                smtp_port = st.number_input(
+                    "SMTP port", min_value=1, max_value=65535,
+                    value=int(current_email.get("FINBOT_SMTP_PORT", os.getenv("FINBOT_SMTP_PORT", "587"))),
+                    step=1,
+                )
+                smtp_security = st.selectbox(
+                    "Connection security",
+                    security_options,
+                    index=security_options.index(current_security),
+                    format_func=lambda value: {
+                        "starttls": "STARTTLS (usually port 587)",
+                        "tls": "Implicit TLS (usually port 465)",
+                        "none": "None",
+                    }[value],
+                )
+                smtp_username = st.text_input(
+                    "SMTP username",
+                    value=current_email.get("FINBOT_SMTP_USERNAME", os.getenv("FINBOT_SMTP_USERNAME", "")),
+                )
+                smtp_password = st.text_input(
+                    "SMTP password", type="password",
+                    help="Leave blank to preserve the currently configured password.",
+                )
+                smtp_from = st.text_input(
+                    "From address",
+                    value=current_email.get("FINBOT_SMTP_FROM", os.getenv("FINBOT_SMTP_FROM", "")),
+                )
+                email_to = st.text_area(
+                    "Recipient email addresses",
+                    value=current_email.get("FINBOT_TRADE_EMAIL_TO", os.getenv("FINBOT_TRADE_EMAIL_TO", "")).replace(",", "\n"),
+                    help="Enter one address per line, or separate addresses with commas or semicolons.",
+                )
+                attach_json = st.checkbox(
+                    "Attach sanitized lifecycle evidence as JSON",
+                    value=current_email.get(
+                        "FINBOT_TRADE_EMAIL_ATTACH_JSON", os.getenv("FINBOT_TRADE_EMAIL_ATTACH_JSON", "true")
+                    ).lower() in {"1", "true", "yes", "on"},
+                )
+                if st.form_submit_button("Save trade email settings"):
+                    try:
+                        recipients = list(parse_recipient_addresses(email_to))
+                        if email_enabled and (not smtp_host.strip() or not smtp_from.strip() or not recipients):
+                            raise ValueError("Enabled email requires an SMTP host, from address, and recipient address.")
+                        updates = {
+                            "FINBOT_TRADE_EMAIL_ENABLED": "true" if email_enabled else "false",
+                            "FINBOT_SMTP_HOST": smtp_host.strip(),
+                            "FINBOT_SMTP_PORT": str(int(smtp_port)),
+                            "FINBOT_SMTP_SECURITY": smtp_security,
+                            "FINBOT_SMTP_USERNAME": smtp_username.strip(),
+                            "FINBOT_SMTP_FROM": smtp_from.strip(),
+                            "FINBOT_TRADE_EMAIL_TO": ",".join(recipients),
+                            "FINBOT_TRADE_EMAIL_ATTACH_JSON": "true" if attach_json else "false",
+                        }
+                        if smtp_password:
+                            updates["FINBOT_SMTP_PASSWORD"] = smtp_password
+                        save_env_config(updates)
+                        st.success("Trade email settings saved. Automated cycles read these values without a restart.")
+                        st.rerun()
+                    except (ValueError, OverflowError) as error:
+                        st.error(str(error))
+            smtp_test_col, delivery_test_col = st.columns(2)
+            if smtp_test_col.button("Test SMTP connection", key="test_smtp_connection"):
+                try:
+                    with st.spinner("Checking SMTP encryption and authentication..."):
+                        result = test_smtp_connection()
+                    st.success(
+                        f"SMTP connected with {result['security'].upper()}; "
+                        f"authentication {'passed' if result['authenticated'] else 'was not configured'}. No email was sent."
+                    )
+                except Exception as error:
+                    st.error(f"SMTP connection test failed: {type(error).__name__}: {error}")
+            if delivery_test_col.button(
+                "Send sample trade email",
+                key="send_sample_trade_email",
+                help="Emails the latest broker-linked lifecycle as an SMTP TEST. It does not submit or modify a trade.",
+            ):
+                connection = backend_module.get_connection()
+                try:
+                    latest = connection.execute(
+                        "SELECT id FROM trades WHERE broker_order_id IS NOT NULL OR broker_position_id IS NOT NULL "
+                        "ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                finally:
+                    connection.close()
+                if not latest:
+                    st.warning("No broker-linked lifecycle is available for a sample email.")
+                else:
+                    try:
+                        with st.spinner("Sending the explicitly labeled SMTP test report..."):
+                            result = send_trade_execution_email(
+                                Path(backend_module.DB_PATH), int(latest["id"]), test_mode=True
+                            )
+                        st.success(
+                            f"SMTP test report for trade #{latest['id']} sent to "
+                            f"{result['recipient_count']} configured recipient(s)."
+                        )
+                    except Exception as error:
+                        st.error(f"SMTP delivery test failed: {type(error).__name__}: {error}")
+
+    with st.sidebar.expander('AI research settings', expanded=False, key='lazy_main_4', on_change="rerun") as lazy_panel:
+        if lazy_panel.open:
+            ai_enabled = get_ai_research_enabled()
+            with st.form("ai_research_settings"):
+                requested_ai_enabled = st.checkbox(
+                    "Use OpenAI to analyze research",
+                    value=ai_enabled,
+                    help="When enabled, the selected dummy signal and recent headlines are sent to the configured OpenAI-compatible endpoint.",
+                )
+                st.caption("Disabled uses the existing dummy research signal. Risk and execution gates remain deterministic.")
+                if st.form_submit_button("Save AI setting"):
+                    try:
+                        set_ai_research_enabled(requested_ai_enabled)
+                        st.rerun()
+                    except ValueError as error:
+                        st.error(str(error))
+            if st.button("Synchronize usage counter", icon=":material/sync:", key="ai_settings_sync_usage"):
+                sync_openai_token_allowance()
+                st.rerun()
+
+    with st.sidebar.expander('News research strategy and evaluation', expanded=False, key='lazy_main_5', on_change="rerun") as lazy_panel:
+        if lazy_panel.open:
+            st.caption("eToro research discovers candidates from current Yahoo headlines, adds Yahoo company data and price trends, then asks OpenAI for evidence-based analysis. Candidate names are not hard-coded.")
+            with st.form("daily_strategy_config"):
+                research_candidate_limit = st.number_input("Maximum news-discovered companies analyzed per cycle", min_value=1, max_value=20, value=int(os.getenv("FINBOT_RESEARCH_MAX_CANDIDATES", "8")), step=1)
+                risk_trade = st.text_input("Risk per trade (fraction of equity)", value=os.getenv("FINBOT_RISK_PER_TRADE_PCT", "0.005"))
+                risk_total = st.text_input("Maximum aggregate stop risk (fraction)", value=os.getenv("FINBOT_MAX_TOTAL_RISK_PCT", "0.02"))
+                max_positions = st.number_input(
+                    "Maximum open positions", min_value=1, max_value=100,
+                    value=max(1, min(100, int(os.getenv("FINBOT_MAX_OPEN_POSITIONS", "5")))),
+                    step=1,
+                )
+                max_gross = st.text_input("Maximum gross exposure (fraction of equity)", value=os.getenv("FINBOT_MAX_GROSS_EXPOSURE_PCT", "1.0"))
+                spread_cost = st.text_input("Backtest spread bps per side", value=os.getenv("FINBOT_BACKTEST_SPREAD_BPS_PER_SIDE", ""))
+                commission_cost = st.text_input("Backtest commission bps per side", value=os.getenv("FINBOT_BACKTEST_COMMISSION_BPS_PER_SIDE", ""))
+                financing_cost = st.text_input("Annual financing percent", value=os.getenv("FINBOT_BACKTEST_FINANCING_ANNUAL_PCT", ""))
+                fx_cost = st.text_input("Backtest FX bps per side", value=os.getenv("FINBOT_BACKTEST_FX_BPS_PER_SIDE", ""))
+                dd_limit = st.text_input("Maximum holdout drawdown percent", value=os.getenv("FINBOT_BACKTEST_MAX_DRAWDOWN_PCT", "20"))
+                if st.form_submit_button("Save strategy settings"):
+                    try:
+                        for name, value in (("risk per trade", risk_trade), ("aggregate risk", risk_total), ("gross exposure", max_gross), ("drawdown", dd_limit)):
+                            number = float(value)
+                            if not math.isfinite(number) or number <= 0:
+                                raise ValueError(f"{name} must be a positive number.")
+                        for name, value in (("spread", spread_cost), ("commission", commission_cost), ("financing", financing_cost), ("FX", fx_cost)):
+                            if value.strip() and (not math.isfinite(float(value)) or float(value) < 0):
+                                raise ValueError(f"{name} cost must be zero or positive.")
+                        if int(max_positions) < 1:
+                            raise ValueError("Maximum open positions must be at least 1.")
+                        save_env_config({
+                            "FINBOT_RESEARCH_MAX_CANDIDATES": str(int(research_candidate_limit)),
+                            "FINBOT_RISK_PER_TRADE_PCT": risk_trade,
+                            "FINBOT_MAX_TOTAL_RISK_PCT": risk_total,
+                            "FINBOT_MAX_OPEN_POSITIONS": str(int(max_positions)),
+                            "FINBOT_MAX_GROSS_EXPOSURE_PCT": max_gross,
+                            "FINBOT_BACKTEST_SPREAD_BPS_PER_SIDE": spread_cost,
+                            "FINBOT_BACKTEST_COMMISSION_BPS_PER_SIDE": commission_cost,
+                            "FINBOT_BACKTEST_FINANCING_ANNUAL_PCT": financing_cost,
+                            "FINBOT_BACKTEST_FX_BPS_PER_SIDE": fx_cost,
+                            "FINBOT_BACKTEST_MAX_DRAWDOWN_PCT": dd_limit,
+                        })
+                        st.success("Strategy settings saved to .env.config.")
+                        st.rerun()
+                    except (ValueError, OverflowError) as error:
+                        st.error(str(error))
+            if st.button("Check strategy evaluation", key="run_daily_strategy_eval"):
+                with st.spinner("Checking whether historical news inputs are available for a chronological evaluation..."):
+                    try:
+                        st.session_state["daily_strategy_evaluation"] = asyncio.run(run_strategy_evaluation())
+                    except Exception as error:
+                        st.session_state["daily_strategy_evaluation"] = {"status": "inconclusive", "reason": f"Evaluation failed: {type(error).__name__}: {error}"}
+            # Read the version-checked persisted result so an old cached SMA result
+            # cannot appear to authorize the current news-research strategy.
+            evaluation = get_strategy_evaluation()
+            st.write(f"Evaluation status: **{evaluation.get('status', 'not_run')}**")
+            if evaluation.get("reason"):
+                st.caption(evaluation["reason"])
+            metrics = {key: evaluation.get(key) for key in (
+                "holdout_start", "holdout_end", "net_return_pct", "benchmark_return_pct",
+                "max_drawdown_pct", "trade_count", "turnover", "costs", "cost_assumptions",
+            ) if evaluation.get(key) is not None}
+            if metrics:
+                st.json(metrics)
+            evaluation_current = get_strategy_evaluation()
+            broker_is_etoro_demo = (
+                os.getenv("FINBOT_BROKER_PROVIDER", "dummy").strip().lower() == "etoro"
+                and os.getenv("ETORO_DEMO_TRADING", "true").strip().lower() in {"1", "true", "yes", "on"}
+            )
+            can_enable_demo = broker_is_etoro_demo
+            requested_demo_orders = st.checkbox(
+                "Enable automated eToro demo orders",
+                value=get_demo_automated_trading_enabled(),
+                disabled=not can_enable_demo,
+                help="Enables automatic eToro demo orders for approved candidates. The preference stays enabled after a trade; known position warnings do not disable automation; uncertain submissions are resolved before new account risk is added.",
+            )
+            if requested_demo_orders != get_demo_automated_trading_enabled():
+                try:
+                    set_demo_automated_trading_enabled(requested_demo_orders)
+                    st.rerun()
+                except ValueError as error:
+                    st.error(str(error))
+            if not can_enable_demo:
+                st.caption("Select eToro demo mode to enable automated demo orders. This strategy never sends live orders.")
+            else:
+                st.caption("Automation remains enabled after successful trades and reconciliation warnings. Each new order still requires verified account equity, a complete broker position snapshot, and enough position-level stop, fill, and quantity data to calculate total risk.")
+            st.caption("Evaluation is shown for performance context only. Broker-side stop confirmation is still required after an order fills.")
+
+    broker_provider = os.getenv("FINBOT_BROKER_PROVIDER", "dummy").strip().lower()
+    if broker_provider == "etoro":
+        automated = "enabled" if get_demo_automated_trading_enabled() else "disabled"
+        st.caption(f"Order mode: eToro demo only · automated demo orders {automated}")
+    else:
+        st.caption("Order mode: local simulation · no broker orders are submitted")
 
     render_research_actions()
 
@@ -2251,9 +3389,13 @@ def main() -> None:
         start_at, end_at = render_time_range()
     with refresh_col:
         if st.button("🔄", help="Refresh page", key="page_refresh_button", use_container_width=True):
+            clear_dashboard_caches()
             st.rerun()
 
-    summary = get_dashboard_summary(start_at, end_at)
+    st.session_state["lifecycle_end_at"]=end_at
+    if st.session_state.get("manual_research_result"):
+        clear_dashboard_caches()
+    summary = get_ui_dashboard_summary(str(backend_module.DB_PATH),start_at,end_at)
 
     manual_result = st.session_state.pop("manual_research_result", None)
     manual_error = st.session_state.pop("manual_research_error", None)
@@ -2261,74 +3403,149 @@ def main() -> None:
         st.error(f"Agent analysis failed: {manual_error}")
     if manual_result:
         with st.expander("Latest manual research run", expanded=True):
-            news_result = manual_result["news"]
-            cycle_result = manual_result["cycle"]
+            news_result = manual_result.get("news")
+            cycle_result = manual_result.get("cycle")
             if news_result is not None:
                 st.write(
                     f"News fetch: {news_result['fetched']} headlines received, "
                     f"{news_result['inserted']} new and {news_result['updated']} existing articles refreshed."
                 )
             if cycle_result:
-                headlines = cycle_result["market_data"].get("recent_news", [])
-                relevance = cycle_result["market_data"].get("headline_relevance", {})
-                st.write(
-                    f"Analyzed {len(headlines)} headlines: {relevance.get('relevant', 0)} relevant, "
-                    f"{relevance.get('not_relevant', 0)} not relevant."
-                )
-                research_mode = "OpenAI research" if cycle_result["ai_research_enabled"] else "Dummy research"
-                st.write(f"Research mode: {research_mode}")
-                opened_count = sum(trade.get("status") == "OPEN" for trade in cycle_result["trades"])
-                deferred_count = sum(trade.get("status") == "DEFERRED_CAPACITY" for trade in cycle_result["trades"])
-                st.write(
-                    f"Candidate pool: {cycle_result['market_data'].get('candidate_pool_size', 0)} · "
-                    f"analyzed: {cycle_result.get('research_candidate_count', 0)} · "
-                    f"risk-approved: {cycle_result.get('risk_approved_candidate_count', 0)} · "
-                    f"opened: {opened_count} of {cycle_result.get('max_trades_per_cycle', 0)} allowed · "
-                    f"deferred by quota: {deferred_count}."
-                )
-                st.caption(
-                    "Selection score ranks research confidence and directional evidence corroboration; "
-                    "it is a heuristic, not a calibrated probability of profit."
-                )
-                st.dataframe(pd.DataFrame(cycle_result["trades"]), hide_index=True, width="stretch")
+                market_data = cycle_result.get("market_data")
+                if cycle_result.get("mode") in {"eToro demo", "demo"} or not isinstance(market_data, dict):
+                    cycle_label = "eToro demo" if cycle_result.get("mode") in {"eToro demo", "demo"} else "Trading"
+                    st.write(f"{cycle_label} cycle: {cycle_result.get('status', 'unknown')} · {cycle_result.get('reason', '')}")
+                    account = cycle_result.get("account")
+                    account = account if isinstance(account, dict) else {}
+                    st.write(f"Broker positions: {cycle_result.get('broker_position_count', 'unavailable')} · equity: {account.get('equity', 'unavailable')}")
+                    if cycle_result.get("signals"):
+                        st.dataframe(pd.DataFrame(cycle_result["signals"]).T, width="stretch")
+                    if cycle_result.get("research_candidates"):
+                        st.dataframe(pd.DataFrame([
+                            {
+                                "lifecycle_id": candidate.get("trade_id"),
+                                "ticker": candidate.get("ticker"),
+                                "company": candidate.get("company_name"),
+                                "signal": candidate.get("signal"),
+                                "confidence": candidate.get("confidence"),
+                                "analysis": candidate.get("analysis_status"),
+                                "analysis decision": candidate.get("analysis_decision"),
+                                "execution gate": candidate.get("execution_status"),
+                                "research_status": candidate.get("research_status"),
+                                "headlines": (candidate.get("research_input") or {}).get("article_count"),
+                                "quote_time": (candidate.get("research_input") or {}).get("quote_timestamp"),
+                                "SMA trend": ((candidate.get("research_input") or {}).get("daily_trend_context") or {}).get("trend_state"),
+                                "trend alignment": (((candidate.get("agent_workflow") or {}).get("strategist") or {}).get("decision_gate") or {}).get("daily_trend_alignment"),
+                                "researcher": ((candidate.get("agent_workflow") or {}).get("researcher") or {}).get("decision"),
+                                "strategist": ((candidate.get("agent_workflow") or {}).get("strategist") or {}).get("decision"),
+                                "risk_manager": ((candidate.get("agent_workflow") or {}).get("risk_manager") or {}).get("decision"),
+                                "execution": ((candidate.get("agent_workflow") or {}).get("execution") or {}).get("decision"),
+                                "analysis findings": "; ".join(candidate.get("analysis_reasons") or []),
+                                "execution gate reasons": "; ".join(candidate.get("execution_reasons") or []),
+                            }
+                            for candidate in cycle_result["research_candidates"]
+                        ]), hide_index=True, width="stretch")
+                        with st.expander("Agent decisions and evidence"):
+                            for candidate in cycle_result["research_candidates"]:
+                                st.markdown(f"**{candidate.get('ticker')} · {candidate.get('company_name')}**")
+                                st.json(candidate.get("agent_workflow") or {})
+                                st.caption("Research inputs and OpenAI findings")
+                                st.json({
+                                    "research_input": candidate.get("research_input"),
+                                    "research_summary": candidate.get("research_summary"),
+                                    "fundamental_analysis": candidate.get("fundamental_analysis"),
+                                    "analysis_status": candidate.get("analysis_status"),
+                                    "analysis_decision": candidate.get("analysis_decision"),
+                                    "analysis_reasons": candidate.get("analysis_reasons"),
+                                    "execution_status": candidate.get("execution_status"),
+                                    "execution_reasons": candidate.get("execution_reasons"),
+                                })
+                    if cycle_result.get("trades"):
+                        st.dataframe(pd.DataFrame(cycle_result["trades"]), hide_index=True, width="stretch")
+                else:
+                    headlines = market_data.get("recent_news", [])
+                    relevance = market_data.get("headline_relevance", {})
+                    st.write(
+                        f"Analyzed {len(headlines)} headlines: {relevance.get('relevant', 0)} relevant, "
+                        f"{relevance.get('not_relevant', 0)} not relevant."
+                    )
+                    research_mode = "OpenAI research" if cycle_result.get("ai_research_enabled") else "Dummy research"
+                    st.write(f"Research mode: {research_mode}")
+                    opened_count = sum(trade.get("status") == "OPEN" for trade in cycle_result["trades"])
+                    deferred_count = sum(trade.get("status") == "DEFERRED_CAPACITY" for trade in cycle_result["trades"])
+                    st.write(
+                        f"Candidate pool: {market_data.get('candidate_pool_size', 0)} · "
+                        f"analyzed: {cycle_result.get('research_candidate_count', 0)} · "
+                        f"risk-approved: {cycle_result.get('risk_approved_candidate_count', 0)} · "
+                        f"opened: {opened_count} of {cycle_result.get('max_trades_per_cycle', 0)} allowed · "
+                        f"deferred by quota: {deferred_count}."
+                    )
+                    st.caption("This local simulation ranks research heuristics; those scores are not used as probabilities of profit.")
+                    st.dataframe(pd.DataFrame(cycle_result["trades"]), hide_index=True, width="stretch")
 
     st.sidebar.subheader("Agent rule editor")
     for agent_name, default_rules in DEFAULT_AGENT_RULES.items():
         agent_rules = next((agent["rules"] for agent in summary.get("agents", []) if agent["agent_name"] == agent_name), default_rules)
-        with st.sidebar.expander(agent_name.title()):
-            with st.form(f"edit_rules_{agent_name}"):
-                updated = {}
-                for key, value in agent_rules.items():
-                    if key == "status":
-                        continue
-                    label = key.replace("_", " ").title()
-                    help_text = AGENT_RULE_HELP.get(key, "Rule applied by this agent.")
-                    if isinstance(value, bool):
-                        if agent_name == "risk_manager" and key == "enabled":
-                            st.checkbox("Enabled (required safety gate)", value=True, disabled=True, help=help_text)
-                            updated[key] = True
-                        elif agent_name == "execution" and key == "paper_trading_only":
-                            st.checkbox("Paper trading only (locked)", value=True, disabled=True, help=help_text)
-                            updated[key] = True
+        with st.sidebar.expander(agent_name.title(), key=f"agent_settings_{agent_name}", on_change="rerun") as lazy_panel:
+            if lazy_panel.open:
+                with st.form(f"edit_rules_{agent_name}"):
+                    updated = {}
+                    for key, value in agent_rules.items():
+                        inactive = {
+                            "researcher": {"allowed_sectors", "max_fetch_per_cycle", "default_leverage", "include_market_fundamentals"},
+                            "strategist": {"position_limit", "require_current_market_quote"},
+                            "risk_manager": {"max_drawdown", "max_volatility", "exit_on_risk_breach", "stop_loss_pct", "openai_trend_review_enabled", "trend_opposition_min_confidence"},
+                            "execution": {"max_trade_value", "paper_trading_only"},
+                        }
+                        if key == "status" or os.getenv("FINBOT_BROKER_PROVIDER", "dummy").lower() == "etoro" and key in inactive.get(agent_name, set()):
+                            continue
+                        label = key.replace("_", " ").title()
+                        help_text = AGENT_RULE_HELP.get(key, "Rule applied by this agent.")
+                        if key in {"default_leverage", "max_leverage"} and agent_name in {"researcher", "strategist"}:
+                            try:
+                                leverage_value = int(float(value))
+                            except (TypeError, ValueError):
+                                leverage_value = 2
+                            updated[key] = st.number_input(
+                                label, min_value=1, value=leverage_value, step=1, help=help_text
+                            )
+                        elif key == "conditional_mean_reversion_min_atr_multiple" and agent_name == "strategist":
+                            updated[key] = st.number_input(
+                                label, min_value=0.1, max_value=10.0, value=float(value), step=0.05,
+                                format="%.2f", help=help_text,
+                            )
+                        elif isinstance(value, bool):
+                            if agent_name == "risk_manager" and key == "enabled":
+                                st.checkbox("Enabled (required safety gate)", value=True, disabled=True, help=help_text)
+                                updated[key] = True
+                            elif agent_name == "execution" and key == "paper_trading_only":
+                                st.checkbox("Local simulator is paper-only (locked)", value=True, disabled=True, help=help_text)
+                                if os.getenv("FINBOT_BROKER_PROVIDER", "dummy").strip().lower() == "etoro":
+                                    st.caption("The selected eToro provider handles approved orders; this local simulator rule does not override it.")
+                                updated[key] = True
+                            else:
+                                updated[key] = st.checkbox(label, value=value, help=help_text)
+                        elif isinstance(value, list):
+                            defaults = {
+                                "allowed_sectors": ["Technology", "Energy"],
+                                "allowed_side": ["LONG", "SHORT"],
+                            }.get(key, value)
+                            options = list(dict.fromkeys([*defaults, *value]))
+                            updated[key] = st.multiselect(label, options=options, default=value, help=help_text)
+                        elif isinstance(value, int):
+                            updated[key] = st.number_input(label, min_value=1, value=int(value), step=1, help=help_text)
+                        elif isinstance(value, float):
+                            updated[key] = st.number_input(label, value=float(value), step=0.01, help=help_text)
                         else:
-                            updated[key] = st.checkbox(label, value=value, help=help_text)
-                    elif isinstance(value, list):
-                        defaults = {
-                            "allowed_sectors": ["Technology", "Energy"],
-                            "allowed_side": ["LONG", "SHORT"],
-                        }.get(key, value)
-                        options = list(dict.fromkeys([*defaults, *value]))
-                        updated[key] = st.multiselect(label, options=options, default=value, help=help_text)
-                    elif isinstance(value, int):
-                        updated[key] = st.number_input(label, value=int(value), step=1, help=help_text)
-                    elif isinstance(value, float):
-                        updated[key] = st.number_input(label, value=float(value), step=0.01, help=help_text)
-                    else:
-                        updated[key] = st.text_input(label, value=str(value), help=help_text)
-                if st.form_submit_button(f"Save {agent_name} rules"):
-                    update_agent_rules(agent_name, updated)
-                    st.sidebar.success(f"{agent_name.title()} rules updated.")
-                    st.rerun()
+                            updated[key] = st.text_input(label, value=str(value), help=help_text)
+                    if st.form_submit_button(f"Save {agent_name} rules"):
+                        try:
+                            update_agent_rules(agent_name, updated)
+                            clear_dashboard_caches()
+                            st.sidebar.success(f"{agent_name.title()} rules updated.")
+                            st.rerun()
+                        except ValueError as error:
+                            st.sidebar.error(str(error))
 
     if selected_view == "Dashboard":
         render_summary(summary)

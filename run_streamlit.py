@@ -2,6 +2,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -76,9 +77,12 @@ def main() -> None:
     except OSError:
         port = get_free_port(preferred_port)
 
+    backup_process = None
+
     # Start the scheduler daemon in the background
     print("Starting research scheduler daemon...")
-    scheduler_log = (project_dir / "scheduler.log").open("a", buffering=1)
+    log_scheduler_to_stdout = os.getenv("FINBOT_LOG_TO_STDOUT", "false").lower() in {"1", "true", "yes", "on"}
+    scheduler_log = None if log_scheduler_to_stdout else (project_dir / "scheduler.log").open("a", buffering=1)
     try:
         scheduler_process = subprocess.Popen(
             [python_executable, "makemoney.py"],
@@ -88,9 +92,28 @@ def main() -> None:
             text=True,
         )
     except Exception:
-        scheduler_log.close()
+        if scheduler_log is not None:
+            scheduler_log.close()
         raise
-    print(f"Scheduler daemon started (PID: {scheduler_process.pid}); logging to scheduler.log")
+    log_destination = "container stdout" if log_scheduler_to_stdout else "scheduler.log"
+    print(f"Scheduler daemon started (PID: {scheduler_process.pid}); logging to {log_destination}")
+
+    if os.getenv("FINBOT_S3_BACKUP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}:
+        try:
+            backup_process = subprocess.Popen(
+                [python_executable, "s3_backup.py", "daemon"],
+                cwd=project_dir,
+                stdout=scheduler_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except Exception:
+            scheduler_process.terminate()
+            scheduler_process.wait(timeout=5)
+            if scheduler_log is not None:
+                scheduler_log.close()
+            raise
+        print(f"S3 backup daemon started (PID: {backup_process.pid}); logging to {log_destination}")
 
     try:
         cmd = [
@@ -110,7 +133,24 @@ def main() -> None:
             cmd.extend(["--server.sslCertFile", cert_path, "--server.sslKeyFile", key_path])
 
         print(f"Starting Streamlit on port {port}...")
-        subprocess.run(cmd, check=True)
+        frontend = subprocess.Popen(cmd)
+        try:
+            while frontend.poll() is None:
+                if scheduler_process.poll() is not None:
+                    raise RuntimeError("Scheduler exited; restarting the workload is required.")
+                if backup_process is not None and backup_process.poll() is not None:
+                    raise RuntimeError("S3 backup daemon exited; restarting the workload is required.")
+                time.sleep(2)
+            if frontend.returncode:
+                raise RuntimeError(f"Streamlit exited with status {frontend.returncode}")
+        finally:
+            if frontend.poll() is None:
+                frontend.terminate()
+                try:
+                    frontend.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    frontend.kill()
+                    frontend.wait()
     finally:
         # Cleanup scheduler when Streamlit exits
         if scheduler_process.poll() is None:
@@ -121,7 +161,18 @@ def main() -> None:
             except subprocess.TimeoutExpired:
                 scheduler_process.kill()
                 scheduler_process.wait()
-        scheduler_log.close()
+        # The backup daemon receives SIGTERM after the writer stops and creates
+        # one final consistent snapshot before the container exits.
+        if backup_process is not None and backup_process.poll() is None:
+            print("Stopping S3 backup daemon and creating a final snapshot...")
+            backup_process.terminate()
+            try:
+                backup_process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                backup_process.kill()
+                backup_process.wait()
+        if scheduler_log is not None:
+            scheduler_log.close()
 
 
 if __name__ == "__main__":

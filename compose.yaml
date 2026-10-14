@@ -4,13 +4,24 @@ services:
     restart: unless-stopped
     init: true
     env_file:
-      - .env.config
+      - path: .env.config
+        required: false
     environment:
       FINBOT_DB_PATH: /data/finbot.db
       FINBOT_SKIP_INSTALL: "true"
       STREAMLIT_PORT: "8501"
       ENABLE_HTTPS: "false"
+      FINBOT_LOG_TO_STDOUT: "true"
+      # Keep one writable replica. Optional S3 settings come from env_file or
+      # the hosting provider's injected environment and never mount S3 at /data.
     ports:
       - "${FINBOT_HOST_PORT:-8501}:8501"
     volumes:
       - ./data:/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "/app/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3

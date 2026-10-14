@@ -1,59 +1,98 @@
-# Local MVP: Paper Portfolio and Integrations
+# Finbot operating contract
 
-## Run locally
+The objective is positive net returns with explicit loss and exposure limits. This implementation is a versioned **demo experiment**, not evidence of profitability. The active strategy version is `news_reaction_v2`.
 
-1. Copy `.env.example` to `.env.config` and set local credentials there. `.env.config` is git-ignored.
-2. Run `./start.sh`.
-3. Open the local URL printed by Streamlit. HTTPS stays disabled unless `ENABLE_HTTPS=true` is set in `.env`.
+## Candidate and research workflow
 
-The app stores users, sessions, research, trade lifecycles, and portfolio allocations in `finbot.db`. Login uses a signed 30-day browser cookie backed by a revocable SQLite session. Logout revokes the session. Existing SHA-256 password records are upgraded to salted scrypt after a successful login.
+Yahoo Finance news and `yfscreen` discover candidates dynamically. `FINBOT_NEWS_SYMBOL_LIMIT` defaults to 40 screened companies and `FINBOT_RESEARCH_MAX_CANDIDATES` to 8 full analyses per cycle. `FINBOT_NEWS_TICKERS` is an optional explicit discovery fallback. `research_feed.json` is limited to local simulation and clearly marked sample replay tests.
 
-## Profile and users
+Article/company associations are stored separately so a multi-company URL does not lose earlier ticker associations. Related tickers each receive candidate analysis. Provider association alone is not proof of relevance: OpenAI records direct, indirect, irrelevant, or uncertain company relevance. Irrelevant or non-directional research is rejected before subsequent gates.
 
-The Profile page lets each signed-in user choose an avatar and change their password. Administrators can create accounts, grant or revoke admin access, and delete other users. Password changes require the current password and at least 12 characters. User removal revokes that user's sessions, and the last administrator cannot be removed or demoted. Existing databases gain avatar/admin columns in place; if a database has no administrator, its earliest account is promoted.
+Research receives supplied headlines, company financial data, recent price context, and measured post-news OHLC where available. Its output includes direction, confidence, temporary/structural/uncertain reaction assessment, rationale, and forecast horizon. Confidence is an uncalibrated model assessment. Company statement currency and quote currency are distinct; reporting-period dates and retrieval time are recorded. Original statement availability dates and ADR conversions remain unverified rather than being invented.
 
-## Docker
+Completed Yahoo adjusted daily bars supply SMA50, SMA200 and ATR14. Yahoo session-close metadata determines whether today's bar is complete; if metadata is unavailable, today's bar is conservatively excluded. These indicators inform the strategy and risk review. They do not replace the news thesis.
 
-1. Ensure `.env.config` exists and contains the credentials/settings you want to pass to the container. Compose injects this ignored file at runtime; it is excluded from the image build context.
-2. Build and start with `docker compose up --build -d`.
-3. Open `http://localhost:8501`. To publish on another host port, run `FINBOT_HOST_PORT=8502 docker compose up --build -d` and open port 8502.
+## Two-direction strategies
 
-Compose bind-mounts `./data` to `/data` and stores SQLite at `./data/finbot.db`, so database updates survive container rebuilds and restarts. To use an existing local database, stop the local app and copy it before the first container start: `mkdir -p data && cp finbot.db data/finbot.db`. Back up `data/finbot.db` with the container stopped so SQLite writes are complete. `docker compose down` stops the service but leaves the bind-mounted database in place.
+**Directional news:** bullish research proposes LONG, bearish research proposes SHORT. Structural or uncertain news is not automatically reversed just because the daily trend disagrees. Existing confidence and company-evidence gates apply. Opposing daily trends require the configured countertrend confidence and receive half the normal risk budget; mixed/unavailable trends receive half risk. Missing optional data does not masquerade as a research rejection.
 
-The image installs Python dependencies at build time. It runs the existing background worker and Streamlit app together; `FINBOT_SKIP_INSTALL=true` prevents package installation at container startup. This is a local paper-trading deployment, not a live broker integration.
+Directional entries use a stop 2×ATR14 from entry and a target 1.5 times that stop distance by default. LONG stop/target are below/above entry; SHORT stop/target are above/below entry. After the actual fill is reported, these offsets are applied to the fill and broker protection is updated when necessary. A PATCH acknowledgment is not confirmation that the levels changed.
 
-## Portfolio semantics
+**Conditional mean reversion:** only research explicitly identifying a temporary reaction can propose the opposite-news track:
 
-- Starting capital is the configured account balance for the local paper account.
-- Available cash is starting capital less open-position allocations plus realized P&L.
-- Invested capital is cash allocated as margin to open paper positions.
-- Gross exposure is invested capital multiplied by position leverage.
-- The sidebar now includes a portfolio-account selector so you can sync the paper capital setting from an external account balance.
-- eToro demo balance syncing is currently wired; the eToro main and IBKR account slots are present in the UI/config so they can be filled in when those balances are available.
-- The dashboard's Decisions over time chart has an independent quick range: 24 hours, 3 days, 7 days, 1 month, or 3 months.
-- Trade lifecycles lets you choose an inclusive 1–18 day opportunity-age range for batch historical validation; it reports progress per opportunity, and the price-path validation window remains capped at 14 days.
-- The planned-vs-historical-result chart is available on both Dashboard and Trade lifecycles. Lifecycle entries are paged for responsiveness, with an option to show all entries.
-- Each research candidate has its own trade ID and ordered Research, Strategy, Risk, Execution, and optional Exit events.
-- Every trade uses a 2% base stop and 5% base take-profit distance at 1x. Both price distances are divided by leverage, so at 2x the stop is 1% from entry and the target is 2.5% from entry, preserving the same account-level risk/reward thresholds.
-- Trade lifecycles and Companies → Related Trades show projected P&L at the take-profit price using the recorded quantity (and therefore leverage); this estimate is before fees and slippage. Realized P&L is separate and is recorded when a paper position closes.
-- Positions remain open across app restarts until manually closed in the trade panel.
+- Bullish daily trend + temporary bearish news: LONG after a measured dip and recovery.
+- Bearish daily trend + temporary bullish news: SHORT after a measured burst and reversal.
 
-The current simulator uses feed confidence and simple deterministic checks. Stop and target prices are recorded but are not automatically triggered because the dummy provider supplies no live price updates. It does not calculate real market P&L or send brokerage orders. The displayed estimates are operational scaffolding, not a trading recommendation or estimate of real returns.
+The reference is the completed five-minute close immediately before the news timestamp. At least two completed post-news bars are required. The excursion from that anchor must exceed 1.25×ATR14 by default; recovery from the extreme must reach 0.2×ATR14, and the latest completed close must turn in the intended direction. Research confidence must reach 70%. The target is the pre-news anchor; the stop is 0.25×ATR14 beyond the reaction extreme. The actual entry must retain a favorable stop/target and pass the normal cost/reward and risk gates. Failed conditions reject this setup. This replaces the earlier SMA-distance-only interpretation; old decisions retain their stored evidence.
 
-## Provider scaffolding
+Notes carry `STRATEGY: CONDITIONAL_MEAN_REVERSION; ENTRY_ZONE: ... to ...; SOURCE_ATR: ...` for downstream agents. All thresholds are agent settings.
 
-The backend uses `yfscreen` to screen U.S. equities and `yfinance` to fetch ticker headlines immediately at startup and once per hour. Repeat fetches refresh article timestamps and metadata. During an agent analysis cycle, the Researcher marks each stored headline relevant/not relevant using candidate ticker, company, and sector-topic matches, and persists the reason. Only relevant items are passed into matching trade lifecycle evidence. The dashboard shows the classification and reason; use Manual research actions to fetch only, analyze stored items, or do both in one action. Screening/news retrieval does not itself open or close trades. Yahoo can rate-limit or return no articles; on those runs the configured ticker list is tried, errors are logged, and the existing `research_feed.json` trading simulation remains available.
+## Order eligibility and sizing
 
-OpenAI research is disabled by default and can be enabled in the sidebar. When enabled, each candidate and up to eight related headlines are sent to the configured OpenAI-compatible Chat Completions endpoint. The adapter requires structured JSON for signal, confidence, catalyst, and summary; these results are saved with the research event and feed the Strategist. API/configuration errors are surfaced rather than silently falling back to dummy decisions.
+eToro must confirm a tradeable USD stock/ETF, the proposed direction, account equity/cash, complete positions, and a fresh eToro bid/ask quote. LONG uses ask; SHORT uses bid. Yahoo never silently substitutes for an execution quote. Unavailable execution inputs block that order while research can continue.
 
-The **OpenAI API spend** panel uses the organization Costs endpoint and requires an organization admin key (`OPENAI_ADMIN_KEY`) plus organization ID (`OPENAI_ORGANIZATION_ID`) in `.env.config`. It reports month-to-date usage cost, not remaining prepaid credit; the project API key alone cannot retrieve billing costs.
+The Risk Manager calculates units as the smallest capacity permitted by:
 
-The Strategist still applies deterministic confidence and direction rules, the Risk Manager remains the deterministic final threshold gate, and execution remains paper-only unless you explicitly switch the broker provider to eToro. OpenAI does not place orders. When `FINBOT_BROKER_PROVIDER=etoro`, the app can resolve instrument IDs, query eToro market data, submit demo orders with the configured eToro API keys in `.env.config`, and read the demo trading balance used by the dashboard portfolio selector. Interactive Brokers remains a separate execution/account integration and is not used as a news source. IBKR news/data availability depends on supported services, subscriptions, and account permissions. Keep provider credentials in `.env.config`; no key is required for the Yahoo screener/news packages.
+1. Per-trade risk budget divided by entry-to-stop distance.
+2. Remaining aggregate marked stop-risk capacity.
+3. `max_order_units` (default **5 units**).
+4. `max_order_spend_usd` (default **$200 capital/margin**, with a cost reserve).
+5. Available cash/margin and remaining total gross exposure.
+6. Single-position gross exposure and portfolio stop-plus-gap stress capacity.
+7. Sector concentration when explicitly enabled and all sector labels are available.
 
-Before using broker credentials, use a dedicated paper account, restrict permissions, never enable withdrawals, and keep `.env.config` out of source control.
+Risk defaults: 0.5% equity per trade, 2% aggregate nominal stop risk, 100% total gross exposure, 10% single-position exposure, 30 open positions (or `FINBOT_MAX_OPEN_POSITIONS`), and leverage 2. The extra stress scenario assumes a 5% adverse gap and permits at most 10% equity stressed loss. These are configurable scenarios, not guarantees against larger losses. Sector checking is off until complete sector labels are supplied; enabling it makes missing labels an explicit execution dependency.
 
-## Automatic research and oversight
+Costs reserve the observed spread, configured round-trip cost (10 bps), and financing estimate (8% annualized) for the holding horizon. The eToro what-if cost endpoint is used when available; explicit USD opening fees are reserved additionally. If unavailable, the configured estimate is labeled as an estimate. Estimated target payoff must cover costs and minimum reward/risk. Market slippage can exceed an intended cap: confirmed fills over either cap trigger a broker close request. Existing historical positions are not resized retroactively.
 
-Use **Research Actions** in the sidebar to choose automatic mode, set its interval, and see the next scheduled run. The panel also shows the latest completed analysis outcome, rejection reasons, and available paper cash. A cycle can run successfully without opening a trade: strategist/risk rules may reject every candidate, or execution may reject new positions when available cash is insufficient. Existing positions remain open until manually closed, so allocated cash may stay unavailable.
+Each lifecycle shows the formula, per-constraint maximum units, selected quantity, limiting constraint, margin, notional, stop risk and estimated costs. Each submission snapshots rules, strategy/prompt version, model, confidence, holding policy, quote source/time, and a durable request reference.
 
-The **Oversight** tab displays saved Overwatcher audit reports, including per-trade leverage and stop-loss checks, issues, and audit timestamps. Select an older log to review it, or choose **Run audit now** to create another report. JSONL files are stored in `audit_logs/`. The scheduler daemon writes operational output to `scheduler.log` when started with `run_streamlit.py`.
+## Submission and position management
+
+Demo automation defaults enabled for a new database; existing user preferences are preserved. The checkbox remains on after submission. Two orders per research cycle is the default Execution limit. Every candidate is freshly reviewed at submission, including a strict `execution_ready=True` requirement and an empty execution-error list. An earlier accepted thesis cannot bypass a fresh risk failure.
+
+Account operations share a renewable database lease. A lifecycle is atomically marked SUBMITTING with its stable request reference before sending. Acknowledgments remain SUBMITTED_PENDING_RECONCILIATION. Network/server/timeout ambiguity retains the intent for broker order lookup; it is not automatically retried. Known protection mismatches do not freeze unrelated orders. Unknown order existence and unverifiable aggregate risk remain real dependencies on new account risk.
+
+Independent maintenance runs every minute even when no new news arrives. It reads broker positions and closed-trade history, resolves uncertain orders, updates fill-based protection, and submits exits for confirmed new-version positions when:
+
+- The side-appropriate stop/target is observed in a current eToro quote.
+- Maximum holding time expires (48h directional / 24h mean reversion by default, shortened by a supplied research forecast horizon).
+- Later high-confidence structural research invalidates the position thesis.
+- Confirmed fill units or capital exceed entry-time caps.
+
+Broker-installed stops/targets remain important protection between polls. A close acknowledgment stays EXIT_PENDING; local updates alone never claim closure. Broker absence after a submitted close confirms absence with P&L still unavailable; closed-trade history supplies actual close rate, reported net profit, and fees when present. A stop hit is not claimed solely from a price crossing. Protection corrections for legacy positions preserve their recorded requested levels.
+
+## Evaluation and accounting
+
+Historical news-strategy evaluation remains inconclusive until point-in-time news, fundamentals, model outputs, and execution/cost evidence can be replayed without look-ahead. The retained SMA-only backtest does not validate this strategy. **No historical evaluation result gates demo automation.**
+
+The dashboard uses recorded verified broker equity/cash snapshots when available and labels local fallback metrics. It records SPY adjusted daily benchmark snapshots, observed equity change/drawdown, and broker-reported closed net profit/fees. Closed outcomes are grouped by strategy version/framework, with saved fixture tests separate. Account equity includes manual/test activity; cash-flow-adjusted strategy returns, calibrated confidence, and statistical superiority remain unestablished. Unknown fees remain explicitly incomplete.
+
+## Lifecycle retention
+
+Maintenance archives never-submitted analysis hourly after **3 days** by default (`Execution → analysis_retention_days`). It includes old rejected and capacity-deferred zero-allocation analysis. It preserves broker-linked orders, persisted order references, uncertain submissions, fills, and positions. The archive stores compressed lifecycle and event records in the mounted SQLite database. It cleans active dashboard history, not the entire physical database. Administrators can archive now or restore an ID; restored entries receive a fresh retention grace period. Archives are not permanently purged automatically.
+
+## Operation and test workflow
+
+Compose uses `./data/finbot.db` mounted at `/data/finbot.db`, plus `./logs`. Local Python defaults to a different `./finbot.db`. Stop services before copying SQLite files. Schema changes are additive; archival is reversible. Audit reports live beside the configured DB in `audit_logs/`.
+
+Hosted single-replica deployments can enable consistent S3 snapshots and
+startup restoration. The live SQLite file stays on local or persistent block
+storage; S3 is never used as SQLite's active filesystem. See `HOSTING.md`.
+
+Optional trade email notifications are sent only after eToro acknowledges a
+demo submission. They summarize Researcher, Strategist, Risk Manager and
+Execution decisions and may attach the complete sanitized lifecycle evidence.
+SMTP supports STARTTLS, implicit TLS, authentication, and multiple recipients.
+
+One supervised scheduler runs alongside Streamlit. A heartbeat and HTTP healthcheck expose a stalled worker; required task failures stop the supervisor so Docker's restart policy can recover. Container health status alone does not restart a container.
+
+Initial account creation requires `FINBOT_PASSWORD`; there is no built-in password fallback. Administrators control order actions/settings; non-admin dashboard access is read-only.
+
+**Research Actions → Test purchase workflow** replays a saved bullish research fixture with a $1–$25 stake. It creates a normal lifecycle and uses the shared fresh Strategist/Risk/Execution submission boundary, position caps, durable references, reconciliation and management. It does not bypass safety gates or invent a trade when the fixture is ineligible. Test orders are marked separately for strategy attribution.
+
+All adapter requests use the configured `ETORO_USER_AGENT`. API debug logging remains toggleable and masks credentials; lifecycle evidence contains relevant request/response logs. Live eToro orders are blocked and credentials are unchanged by this implementation.
+
+## Dashboard loading
+
+Lifecycle lists use compact metadata, SQL pagination and on-demand evidence. Tabs and collapsed panels skip hidden content. Dashboard reads may be cached for five seconds; broker values carry the worker snapshot timestamp. Use **Refresh eToro positions** for an explicit current broker read. UI caches never authorize orders. See [DASHBOARD_PERFORMANCE.md](DASHBOARD_PERFORMANCE.md) for measurements and deployment details.

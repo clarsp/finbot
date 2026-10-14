@@ -23,22 +23,20 @@ if [ "${FINBOT_SKIP_INSTALL:-false}" != "true" ]; then
 fi
 
 export FINBOT_USERNAME="${FINBOT_USERNAME:-admin}"
-export FINBOT_PASSWORD="${FINBOT_PASSWORD:-admin123}"
+export FINBOT_PASSWORD="${FINBOT_PASSWORD:?Set FINBOT_PASSWORD before starting Finbot}"
 export STREAMLIT_PORT="${STREAMLIT_PORT:-8501}"
 export ENABLE_HTTPS="${ENABLE_HTTPS:-false}"
 
 LOG_DIR="logs"
 mkdir -p "$LOG_DIR"
 
-python makemoney.py > "$LOG_DIR/backend.log" 2>&1 &
-BACKEND_PID=$!
+echo "Checking configured database restore policy before Finbot starts..."
+python s3_backup.py restore
 
 if [ "${ENABLE_HTTPS:-false}" = "true" ]; then
   echo "Starting Streamlit with HTTPS enabled..."
-  python run_streamlit.py
+  exec python run_streamlit.py
 else
   echo "Starting Streamlit in local HTTP mode..."
-  python run_streamlit.py
+  exec python run_streamlit.py
 fi
-
-wait "$BACKEND_PID"

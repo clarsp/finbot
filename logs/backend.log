@@ -14,3 +14,44 @@ INFO:__main__:Analyzing market data and forming strategy...
 WARNING:integrations:eToro quote unavailable for AAPL: ValueError
 INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
 INFO:__main__:Analyzing market data and forming strategy...
+INFO:__main__:Headline classification after fetch: 128 relevant, 72 not relevant
+INFO:__main__:Hourly Yahoo news fetch completed: 30 fetched, 0 new, 30 refreshed
+INFO:__main__:Scheduled research cycle starting
+WARNING:integrations:eToro quote unavailable for AMD: ValueError
+INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+INFO:__main__:Analyzing market data and forming strategy...
+ERROR:yfinance:HTTP Error 404: {"quoteSummary":{"result":null,"error":{"code":"Not Found","description":"Quote not found for symbol: USOIL"}}}
+WARNING:integrations:eToro quote unavailable for USOIL: ValueError
+INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+WARNING:integrations:eToro quote unavailable for META: ValueError
+INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+INFO:__main__:Analyzing market data and forming strategy...
+WARNING:integrations:eToro quote unavailable for CL: ValueError
+INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+INFO:__main__:Analyzing market data and forming strategy...
+INFO:__main__:Scheduled research cycle starting
+WARNING:integrations:eToro quote unavailable for XOM: ValueError
+INFO:openai._base_client:Retrying request in 0.423736 seconds (retry 1 of 1)
+INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+INFO:__main__:Analyzing market data and forming strategy...
+WARNING:integrations:eToro quote unavailable for AMD: ValueError
+INFO:openai._base_client:Retrying request in 0.431931 seconds (retry 1 of 1)
+INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+INFO:__main__:Analyzing market data and forming strategy...
+ERROR:yfinance:HTTP Error 404: {"quoteSummary":{"result":null,"error":{"code":"Not Found","description":"Quote not found for symbol: USOIL"}}}
+WARNING:integrations:eToro quote unavailable for USOIL: ValueError
+INFO:openai._base_client:Retrying request in 0.427422 seconds (retry 1 of 1)
+INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+WARNING:integrations:eToro quote unavailable for META: ValueError
+INFO:httpx2:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+INFO:__main__:Analyzing market data and forming strategy...
+INFO:__main__:Headline classification after fetch: 129 relevant, 71 not relevant
+INFO:__main__:Hourly Yahoo news fetch completed: 30 fetched, 0 new, 30 refreshed
+INFO:__main__:Headline classification after fetch: 129 relevant, 71 not relevant
+INFO:__main__:Hourly Yahoo news fetch completed: 30 fetched, 0 new, 30 refreshed
+INFO:__main__:Headline classification after fetch: 129 relevant, 71 not relevant
+INFO:__main__:Hourly Yahoo news fetch completed: 30 fetched, 0 new, 30 refreshed
+INFO:__main__:Headline classification after fetch: 129 relevant, 71 not relevant
+INFO:__main__:Hourly Yahoo news fetch completed: 30 fetched, 0 new, 30 refreshed
+INFO:__main__:Headline classification after fetch: 129 relevant, 71 not relevant
+INFO:__main__:Hourly Yahoo news fetch completed: 30 fetched, 0 new, 30 refreshed

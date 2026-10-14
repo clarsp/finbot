@@ -1,86 +1,61 @@
-x1. The API Choice & Infrastructure
-To cascade 30 parallel rebalancing threads alongside edge signals, you need an API with low latency, WebSocket orderbook feeds, and multi-threaded or sub-account execution:
-For Crypto (Global): CCXT Engine + Binance / Bybit API
-Why: CCXT is a unified Python library that handles WebSocket streams and async multi-threaded order placement across 100+ exchanges. It easily handles placing 30 async orders simultaneously in milliseconds without rate-limit bans.
-For Stocks / Options / Crypto (US): Alpaca Trading API
-Why: Alpaca provides a developer-first REST/WebSocket API with native paper trading, sub-accounting, zero commission, and up to 4x intraday margin.
-2. The Graphical Interface (Visualizing the Matrix)
-To track the 30 parallel bets, edge triggers, and Shannon rebalancing in real time, build a lightweight, open-source stack:
-Frontend: Streamlit + Plotly or Hummingbot Dashboard.
-Visualization Features:
-30-Thread Heatmap: Real-time grid showing the win/loss status of each $1 allocation.
-Volatility Harvesting Curve: Tracking net cash extracted during daily rebalancing cycles.
-Edge Overlay: Indicators marking high-liquidity session opens (London/NY overlap) and news volatility spikes.
-Backend Pipeline: A local Python runner storing execution logs in an SQLite/InfluxDB database, streamed to your dashboard via WebSocket.
-3. The Implementation System Prompt
-Copy and paste this prompt directly into your AI code generator (or Claude/GPT developer) to build the complete bot:
-You are an expert Quantitative Algorithmic Trading Developer. Build an automated trading engine in Python using CCXT and Asyncio implementing Shannon's Demon combined with Structural Edge Filters.
+# Finbot
 
-### Core Strategy Requirements:
-1. SHANNON'S DEMON REBALANCING:
-   - Divide total capital into 30 equal parallel allocations ($1 per thread or percentage equivalents).
-   - Execute a daily (or interval-based) rebalancing cycle: take profits from winning trades (+100% target or trailing stop) and reinvest into losing/halved trades to bring all 30 threads back to equal weighting.
+Finbot pursues positive **net returns** through news research, explicit strategy rules, and portfolio risk controls. It is a demo research and execution application. Positive net expectancy has **not** been established.
 
-2. EDGE & COUNTER-EDGE FILTERS:
-   - Temporal Filter: Only execute or rebalance during high-volume liquidity windows (e.g., London/NY overlap, 08:00–11:00 EST).
-   - Order Flow / Volatility Filter: Check ATR (Average True Range) and Order Book spread. Skip trade execution if bid-ask spread exceeds 0.05% (avoiding counter-edge/slippage).
-   - News Pause: Suspend new entries 15 minutes before and after major macroeconomic data releases.
+The active eToro workflow discovers companies from Yahoo news/screens, enriches them with company fundamentals, asks OpenAI for evidence-based research, and runs the Strategist, Risk Manager, and Execution gates. It supports positive-news LONG trades, negative-news SHORT trades, and a separate measured conditional mean reversion track. An actual rejection stops that candidate; unavailable optional data is recorded separately from execution eligibility.
 
-3. LEVERAGE & RISK MANAGEMENT:
-   - Apply conservative leverage (2x to 3x maximum).
-   - Enforce hard stop-losses per thread at -40% to prevent full exchange liquidation before the rebalancer runs.
+- **Local simulation:** `FINBOT_BROKER_PROVIDER=dummy`; local simulated records, no broker orders.
+- **eToro demo:** `FINBOT_BROKER_PROVIDER=etoro`, `ETORO_DEMO_TRADING=true`; automatic demo submission when enabled and all execution gates pass.
+- **Live orders:** blocked in the eToro adapter.
 
-4. SYSTEM & DASHBOARD INTEGRATIONS:
-   - Output real-time execution telemetry to a SQLite database.
-   - Build a Streamlit dashboard showing: (a) 30-thread allocation status grid, (b) Daily compounding ROI vs Buy-and-Hold, (c) Active edge signal states.
+## Run
 
-Provide the complete modular Python code (API connection, Async Execution Engine, Risk Manager, and Streamlit Dashboard script).
-With this setup, you turn statistical theoretical math into an automated, edge-filtered profit engine.
-Anything else?
+Set credentials and an initial administrator password in the ignored `.env.config`, then:
 
-Almost, but do not just "leave it running" on your laptop or a basic script without a proper production wrapper.
-If your laptop goes to sleep, Wi-Fi drops for 10 seconds, or the exchange throws a temporary 502 Bad Gateway error, a bare Python script will crash and leave your 30 allocations unmanaged.
-To run this safely 24/7, here is the exact deployment pipeline to follow:
-1. Golden Rule: API Key Hardening
-Before putting a single dollar into the account, set up your exchange API keys correctly:
-Enable Trading Permissions ONLY (Spot/Futures Trading).
-DISABLE Withdrawal Permissions. Even if your server gets hacked, nobody can steal your funds—they can only trade.
-IP Whitelisting: Restrict the API key so it only accepts commands coming from your server’s static IP address.
-2. Server Infrastructure ($10–$20/mo VPS)
-Rent a cloud Linux server (Virtual Private Server like Hetzner, DigitalOcean, or AWS EC2).
-Specs: 2 vCPU cores, 2–4 GB RAM, Ubuntu 24.04 LTS.
-Location: Pick a server datacenter physically close to your exchange's servers (e.g., Tokyo for Bybit, Frankfurt/London for Binance) to cut latency down to under 5ms.
-3. The Production Execution Architecture
-To ensure your 30-thread engine handles crashes, network blips, and reboots automatically, run it inside Docker or a Linux systemd daemon:
-┌─────────────────────────────────────────────────────────────┐
-│                    Cloud VPS (Ubuntu 24.04)                 │
-│                                                             │
-│  ┌───────────────────────┐       ┌───────────────────────┐  │
-│  │     Trading Engine    │───────│  Streamlit Dashboard  │  │
-│  │ (Async Python/CCXT)   │       │   (Password Protected)│  │
-│  └───────────┬───────────┘       └───────────────────────┘  │
-│              │ (Logs & Trades)                              │
-│              ▼                                              │
-│  ┌───────────────────────┐                                  │
-│  │  Local SQLite / DB    │                                  │
-│  └───────────────────────┘                                  │
-└──────────────────────────────┬──────────────────────────────┘
-                               │ Secure WebSocket / REST
-                               ▼
-                   ┌───────────────────────┐
-                   │ Exchange (Binance/etc)│
-                   └───────────────────────┘
-4. Operational Lifecycle: How It Actually Runs
-Environment Variables: API keys live in an encrypted .env file on the server—never in your Python code.
-Auto-Restart (Supervisor/Systemd): If the server reboots or Python encounters an uncaught exception, systemd or Docker automatically revives the process within 5 seconds.
-Heartbeat & Telemetry:
-The Python script writes state updates (the status of your 30 bets) to SQLite every second.
-The Streamlit UI reads that SQLite file and displays your heatmap and P&L.
-Telegram Alerts: Program your bot to send a message to your phone if an API error occurs, a daily rebalance finishes, or net drawdowns hit a safety threshold.
-The Recommended Launch Sequence
-Phase 1: Paper Trading (1 Week) — Connect to the exchange Testnet (fake money). Let it run 30 parallel bets for 7 days to prove your rebalancing logic works without software bugs.
-Phase 2: Micro-Capital (1 Week) — Deploy $30 real dollars ($1 per bet). Observe execution slippage and spread fees.
-Phase 3: Full Automation — Once stable, lock the server, close all SSH ports except key-based authentication, and let it harvest volatility 24/7.
+```sh
+docker compose up -d --build --force-recreate
+docker compose logs -f finbot
+```
 
+Open http://localhost:8501. Compose persists the database in `./data/finbot.db` and operational logs in `./logs`. Rebuilding does not erase the mounted database. The local Python default database is a separate `./finbot.db`; set `FINBOT_DB_PATH` explicitly when sharing data between launch methods. Stop the workload before copying or backing up SQLite files.
 
+## Hosted database backups
 
+For hosting, keep SQLite on local SSD or a persistent block volume and run one
+writable container. Optional S3 support restores a validated snapshot before
+startup, uploads consistent versioned snapshots periodically, and makes a final
+backup during a normal shutdown. Do not mount an S3 bucket as the live SQLite
+filesystem. See [HOSTING.md](HOSTING.md) for configuration, IAM permissions,
+restore modes, and the point at which PostgreSQL becomes necessary.
+
+## Main controls
+
+Under the sidebar agent configuration:
+
+- **Execution:** `max_order_units=5`, `max_order_spend_usd=200`, and `analysis_retention_days=3` by default. Both sizing caps apply. Spend is account margin/capital with estimated costs reserved; leverage 2 can produce nearly $400 gross exposure from $200 capital. Actual market fills can differ; an excessive confirmed fill triggers a close request.
+- **Risk Manager:** position count, aggregate stop risk, gross exposure, single-position exposure, gap-stress scenario, ATR stop/target, estimated costs, and maximum holding time.
+- **Strategist:** confidence/fundamental gates, integer leverage, and conditional mean reversion thresholds.
+
+In **Research Actions**, enable automated eToro demo orders and configure the research interval. Maintenance runs independently every minute; historical evaluation does not gate demo automation. Administrators control trading and settings; other users have read-only dashboard access.
+
+The main dashboard's Trade Lifecycles distinguish executed/submitted orders from analysis. Each new sized lifecycle explains its unit calculation. **Analysis cleanup and restore** provides manual archival and restoration alongside hourly scheduled archival.
+
+Successful eToro demo submissions can be emailed through configurable SMTP.
+Open **Trade email notifications** in the sidebar to configure the recipient,
+server, authentication, STARTTLS or implicit TLS, and the sanitized lifecycle
+evidence attachment. Notification failure is recorded on the lifecycle but
+never changes a broker-acknowledged order into a failed trade.
+
+Every expanded trade lifecycle also provides **Download JSON report** and
+**Download HTML report** controls. Both formats include the stored agent stages
+and supporting data after credential redaction. SMTP settings provide a
+connection/authentication test that sends no message and an explicitly labeled
+sample-report delivery button.
+
+## Tests and limitations
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Tests use temporary databases and mocked external providers; they submit no actual orders. They verify application behavior, not broker account permissions or profitable predictions. See [LOCAL_MVP.md](LOCAL_MVP.md) for exact strategy rules, [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md) for changes and remaining gaps, and [APPLICATION_AUDIT.md](APPLICATION_AUDIT.md) for the original audit.

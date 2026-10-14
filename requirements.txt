@@ -1,6 +1,8 @@
-streamlit>=1.36.0
-extra-streamlit-components>=0.1.81
-yfscreen>=0.1.2
-yfinance>=0.2.54
-openai>=1.30.0
-plotly>=5.18.0
+streamlit==1.65.0
+extra-streamlit-components==0.1.81
+yfscreen==0.1.2
+yfinance==1.7.0
+openai==3.24.0
+plotly==7.1.0
+pandas==3.0.6
+boto3==1.40.76
