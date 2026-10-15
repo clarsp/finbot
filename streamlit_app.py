@@ -1377,6 +1377,52 @@ def render_trade_processing_chart(trades: list[Dict[str, Any]]) -> None:
 
 def render_trade_agent_flow(trades: list[Dict[str, Any]]) -> None:
     st.subheader("Trade processing by agent")
+    ordered_trades = sorted(trades, key=lambda item: (item["created_at"], item["id"]))
+    total_trades = len(ordered_trades)
+    if not total_trades:
+        st.info("No decisions to plot for this range.")
+        return
+
+    window_col, page_col, all_col = st.columns([2, 2, 1], vertical_alignment="bottom")
+    available_windows = [size for size in (10, 20, 30, 40) if size <= total_trades]
+    if not available_windows or available_windows[-1] < min(10, total_trades):
+        available_windows.append(total_trades)
+    default_window = min(20, total_trades)
+    default_window = min(available_windows, key=lambda size: abs(size - default_window))
+    with window_col:
+        window_size = st.selectbox(
+            "Trades per chart",
+            available_windows,
+            index=available_windows.index(default_window),
+            key="trade_agent_flow_window_size",
+            help="Smaller windows preserve readable stage boxes and ticker labels.",
+        )
+    with all_col:
+        show_all = st.checkbox(
+            "Show all",
+            value=False,
+            key="trade_agent_flow_show_all",
+            help="Useful for exporting an overview; labels may be crowded.",
+        )
+    page_count = max(1, math.ceil(total_trades / int(window_size)))
+    with page_col:
+        page = st.selectbox(
+            "Trade window",
+            list(range(1, page_count + 1)),
+            format_func=lambda value: "Newest" if value == 1 else f"{value} · older",
+            disabled=show_all or page_count == 1,
+            key="trade_agent_flow_page",
+        )
+    if show_all:
+        chart_trades = ordered_trades
+    else:
+        end = total_trades - (int(page) - 1) * int(window_size)
+        start = max(0, end - int(window_size))
+        chart_trades = ordered_trades[start:end]
+    st.caption(
+        f"Showing {len(chart_trades)} of {total_trades} lifecycles. Hover a stage for the complete timestamp, company, decision and evidence."
+    )
+
     agent_rows = {
         "researcher": "Researcher",
         "strategist": "Strategist",
@@ -1386,11 +1432,9 @@ def render_trade_agent_flow(trades: list[Dict[str, Any]]) -> None:
     plotted = []
     trade_labels = []
 
-    for trade in sorted(trades, key=lambda item: (item["created_at"], item["id"])):
+    for trade in chart_trades:
         latest_by_agent, latest_reconciliation = _trade_chart_events(trade)
-        execution_event = latest_by_agent.get("execution")
-        time_value = execution_event["created_at"] if execution_event else trade["created_at"]
-        label = f"#{trade['id']} · {pd.to_datetime(time_value).strftime('%b %d %H:%M')} · {trade['symbol']}"
+        label = f"#{trade['id']} · {trade['symbol']}"
         trade_labels.append(label)
 
         ordered_events = [
@@ -1456,21 +1500,28 @@ def render_trade_agent_flow(trades: list[Dict[str, Any]]) -> None:
                 x=[item["trade_label"] for item in points],
                 y=[item["agent"] for item in points],
                 mode="markers+text",
-                name=marker_text,
+                name=marker_text.split(" · ", 1)[-1],
                 text=[item["mark"] for item in points],
                 textposition="middle center",
                 textfont={"color": "white", "size": 12},
                 customdata=[item["hover"] for item in points],
-                marker={"symbol": "square", "size": 34, "color": color, "line": {"color": "#0f172a", "width": 1}},
+                marker={"symbol": "square", "size": 32, "color": color, "line": {"color": "#0f172a", "width": 1}},
                 hovertemplate="%{customdata}<extra></extra>",
             ))
 
     figure.update_layout(
-        height=max(390, min(760, 330 + 24 * len(trade_labels))),
-        margin={"l": 30, "r": 20, "t": 20, "b": 110},
+        height=560,
+        margin={"l": 30, "r": 20, "t": 78, "b": 80},
         hovermode="closest",
-        legend={"orientation": "h", "y": 1.08, "x": 1, "xanchor": "right"},
-        xaxis={"title": "Trade number · execution time · ticker", "type": "category", "categoryorder": "array", "categoryarray": trade_labels, "tickangle": -35},
+        legend={"orientation": "h", "y": 1.16, "x": 0, "xanchor": "left", "yanchor": "top", "font": {"size": 12}},
+        xaxis={
+            "title": "Trade lifecycle · ticker",
+            "type": "category",
+            "categoryorder": "array",
+            "categoryarray": trade_labels,
+            "tickangle": -25 if len(trade_labels) > 12 else 0,
+            "automargin": True,
+        },
         yaxis={"title": "Agent", "type": "category", "categoryorder": "array", "categoryarray": ["Execution", "Risk Manager", "Strategist", "Researcher"]},
     )
     render_expandable_plotly_chart(figure, "Trade agent flow", "trade_agent_flow_chart")

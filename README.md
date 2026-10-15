@@ -62,3 +62,30 @@ sample-report delivery button.
 ```
 
 Tests use temporary databases and mocked external providers; they submit no actual orders. They verify application behavior, not broker account permissions or profitable predictions. See [LOCAL_MVP.md](LOCAL_MVP.md) for exact strategy rules, [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md) for changes and remaining gaps, and [APPLICATION_AUDIT.md](APPLICATION_AUDIT.md) for the original audit.
+
+
+Is the core application sufficiently complete?
+I broadly agree with you. It is now sufficiently complete to run as a monitored eToro demo experiment while you gather evidence and make smaller adjustments.
+The core capabilities are present:
+- Dynamic news discovery
+- Company-specific OpenAI research
+- LONG and SHORT news reactions
+- Conditional mean reversion
+- SMA and ATR evidence
+- Exchange-local session context
+- Portfolio-level risk and sizing
+- Automatic demo submission
+- Fill and protection reconciliation
+- Lifecycle evidence
+- Notifications and reports
+- Data retention and backups
+The next phase should emphasize observation:
+- Actual win/loss and net return
+- Time to target or stop
+- Cost and financing impact
+- Results by strategy framework
+- Results by market session and weekday
+- Confidence calibration
+- Reconciliation reliability
+- OpenAI and infrastructure costs
+It is not yet evidence that the system makes money, and I would not call it ready for live capital. Those are evaluation conclusions rather than missing core features.
