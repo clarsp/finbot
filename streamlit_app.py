@@ -109,6 +109,10 @@ st.set_page_config(page_title="Finbot Local MVP", layout="wide")
 ENABLE_HTTPS = os.getenv("ENABLE_HTTPS", "false").lower() in {"1", "true", "yes", "on"}
 
 AGENT_RULE_HELP = {
+    "risk_per_trade_pct": "Maximum planned entry-to-stop risk for one new position as a fraction of verified account equity.",
+    "max_total_risk_pct": "Maximum aggregate planned stop risk across verified open positions and the proposed order.",
+    "max_gross_exposure_pct": "Maximum total gross notional exposure as a fraction of verified account equity.",
+    "max_open_positions": "Maximum number of verified broker positions allowed before another order is deferred.",
     "max_single_position_exposure_pct": "Maximum gross notional for one position as a fraction of account equity.",
     "stress_gap_pct": "Additional adverse gap assumption, as a fraction of price, added to nominal stop risk. This is a scenario, not a loss guarantee.",
     "max_stressed_loss_pct": "Maximum portfolio loss under the configured stop-plus-gap stress scenario, as a fraction of equity.",
@@ -125,6 +129,8 @@ AGENT_RULE_HELP = {
     "max_research_age_hours": "A manual candidate older than this needs fresh research before submission.",
     "news_max_hold_hours": "Automatically request a broker close when a new directional news trade exceeds this holding time.",
     "mean_reversion_max_hold_hours": "Maximum holding time for a new conditional mean reversion trade.",
+    "estimated_roundtrip_cost_bps": "Fallback round-trip trading cost estimate in basis points when broker cost evidence is unavailable.",
+    "estimated_financing_annual_pct": "Fallback annual financing-rate estimate used over the planned holding period.",
     "enabled": "Whether this agent participates in analysis cycles.",
     "min_confidence": "Minimum confidence, from 0.0 to 1.0, needed to pass this decision gate.",
     "allowed_sectors": "Research candidates outside these sectors are rejected.",
@@ -155,8 +161,8 @@ AGENT_RULE_HELP = {
     "trend_opposition_min_confidence": "Reject a proposed position when the OpenAI trend review strongly opposes it at or above this confidence.",
     "paper_trading_only": "Controls the local simulator. When eToro is the selected broker, approved trades are sent to the configured eToro demo or live endpoint.",
     "max_trade_value": "Maximum paper capital allocation for one trade.",
-    "max_trades_per_cycle": "Maximum number of risk-approved candidates the paper execution stage may open in one cycle; highest direction-neutral evidence scores are selected first.",
-    "allowed_side": "Trade directions permitted by paper execution.",
+    "max_trades_per_cycle": "Maximum number of eligible eToro demo orders submitted during one research cycle.",
+    "allowed_side": "LONG and/or SHORT directions permitted at the execution boundary.",
 }
 
 ENV_CONFIG_PATH = Path(__file__).resolve().parent / ".env.config"
@@ -1828,6 +1834,20 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                     st.caption(f"Selected {sizing['units']:.6f} units; binding limit: {sizing['binding_limit']}. Spend means account margin/capital, with estimated costs reserved.")
                     st.json({key: risk_event["details"].get(key) for key in ("required_margin", "notional", "planned_stop_risk", "estimated_costs", "estimated_total_spend", "estimated_net_target_profit")})
             policy = json.loads(trade.get("policy_json") or "{}")
+            research_session = next(
+                ((event.get("details") or {}).get("market_session_context") for event in reversed(trade.get("events", []))
+                 if event.get("stage") == "research" and (event.get("details") or {}).get("market_session_context")),
+                {},
+            )
+            session_context = policy.get("market_session_context") or risk_details.get("market_session_context") or research_session
+            if session_context:
+                session_local = session_context.get("local_timestamp") or session_context.get("observed_at")
+                st.caption(
+                    f"Market context: {session_context.get('primary_exchange') or 'exchange unresolved'} · "
+                    f"{session_context.get('market_session') or 'session unknown'} · "
+                    f"{session_local or 'time unavailable'} · "
+                    f"eToro {session_context.get('etoro_execution_state') or 'state unknown'}"
+                )
             protection = risk_details.get("protection") or {}
             atr14 = protection.get("atr14") or risk_details.get("atr14") or policy.get("atr14")
             protection_entry = protection.get("entry_price") or trade.get("entry_price")
@@ -2333,61 +2353,113 @@ def render_companies_dashboard() -> None:
 
 def render_how_it_works() -> None:
     st.subheader("How it works")
-    st.caption("Finbot has two execution modes: local simulation and eToro demo. Live execution is blocked.")
-    st.info("Historical evaluation reports strategy performance; it never blocks news analysis or eToro demo orders. Demo automation uses fresh per-order account, quote, sizing, and stop checks.")
-
-    agent_columns = st.columns(4)
-    agent_content = (
-        (
-            "Researcher",
-            "In eToro mode, analyzes Yahoo headlines for dynamically screened companies with Yahoo fundamentals and available price context, then records OpenAI research. A missing publication timestamp or market quote does not stop the research pass.",
-        ),
-        (
-            "Strategist",
-            "Compares research direction with company financials and available price context. A missing live quote is recorded for execution and does not reject the research thesis.",
-        ),
-        (
-            "Risk Manager",
-            "Uses the SMA trend as one supporting factor. For execution it verifies demo equity, positions, a fresh eToro quote, ATR stop sizing, and portfolio risk; missing data pauses order submission but does not block candidate analysis.",
-        ),
-        (
-            "Execution",
-            "When eToro demo automation is enabled, submits Strategist and Risk Manager approved long or short candidates after fresh per-order broker checks. Historical evaluation is informational and does not authorize or block orders.",
-        ),
-    )
-    for column, (agent, description) in zip(agent_columns, agent_content):
-        with column:
-            st.markdown(f"**{agent}**")
-            st.write(description)
-
-    st.divider()
-    st.subheader("Evaluation and execution")
-    st.write("Historical news-strategy evaluation is currently inconclusive because point-in-time research inputs are not archived. That limits performance measurement only; it does not gate demo automation. Orders remain off until eToro demo automation is enabled, then each order must pass fresh broker, quote, risk, and stop checks.")
-    st.write("eToro mode requires FINBOT_BROKER_PROVIDER=etoro and ETORO_DEMO_TRADING=true. The app never routes this strategy to live trading. A broker-reported position disappearance after a close request is recorded separately from realized P&L when close fills are unavailable.")
-
-    st.subheader("What runs")
-    run_columns = st.columns(3)
-    run_columns[0].markdown("**Research inputs**")
-    run_columns[0].write(
-        "Yahoo headlines are fetched hourly by the background worker. Manual actions can fetch news, run analysis, or do both. Automatic research cycles use the interval and suspension settings in Research Actions."
-    )
-    run_columns[1].markdown("**OpenAI calls**")
-    run_columns[1].write(
-        "Company research is optional. The independent risk trend review is controlled by the Risk Manager rule and may make an additional OpenAI request for each strategy-approved candidate. Both calls contribute to tracked token usage."
-    )
-    run_columns[2].markdown("**Trade evidence**")
-    run_columns[2].write(
-        "Each candidate has a trade ID with ordered researcher, strategy, risk, execution, and optional exit events. Inputs, headlines, model output, quote snapshots, and rejection reasons are stored in SQLite for lifecycle review."
+    st.caption("News-reaction trading with local simulation and eToro demo execution. Live broker routing is blocked.")
+    st.info(
+        "The objective is positive net return within explicit loss and exposure limits. "
+        "Historical evaluation is informational; every demo order still requires fresh broker, quote, sizing and protection checks."
     )
 
-    st.divider()
-    st.subheader("Current limits")
-    st.markdown(
-        "- eToro stop changes after fill and definitive stop-hit reporting are not yet confirmed by this adapter; demo automation is therefore disabled.\n"
-        "- eToro closed-trade fill/fee history is not yet reconciled, so a position can be confirmed absent while realized P&L remains unavailable.\n"
-        "- Yahoo daily data may be delayed, corrected, or unavailable; only completed bars enter the signal.\n"
-        "- A backtest does not establish future profitability; gaps, model assumptions, universe selection, and changing market regimes remain risks."
+    workflow_tab, strategy_tab, operations_tab, config_tab, limits_tab = st.tabs(
+        ["Workflow", "Strategies", "Operations", "Configuration map", "Known limits"]
     )
+    with workflow_tab:
+        agent_content = (
+            ("1 · Researcher", "Discovers companies from current Yahoo headlines, attaches company financials, completed price context, post-news movement and exchange-local session evidence, then asks OpenAI for a dated directional assessment."),
+            ("2 · Strategist", "Combines company-specific news, OpenAI findings, fundamentals, SMA trend, ATR and measured post-news movement. It selects directional news, conditional mean reversion, or rejection. Missing optional data is recorded rather than disguised as rejection."),
+            ("3 · Risk Manager", "Verifies account equity, all broker positions, aggregate stop and stressed-gap risk, exposure, fresh eToro bid/ask, ATR protection, costs, quantity and the configured unit/spend limits."),
+            ("4 · Execution", "Rechecks the candidate immediately before submission, writes a durable request reference, submits only to eToro demo, and leaves the lifecycle pending until broker reconciliation confirms the position."),
+        )
+        columns = st.columns(4)
+        for column, (agent, description) in zip(columns, agent_content):
+            with column:
+                st.markdown(f"**{agent}**")
+                st.write(description)
+        st.markdown("**Lifecycle after submission**")
+        st.write(
+            "Maintenance reconciles order/fill/position IDs, quantity, actual fill, stop loss, take profit, fees and closure history. "
+            "It can request configured time/thesis/protection exits, but never marks a broker position closed from a local database update alone."
+        )
+        st.caption(
+            "Research → Strategy → Risk → Execution is the decision path. Later Strategy/Risk/Execution events are fresh pre-submit rechecks, "
+            "and reconciliation/notification events report broker and delivery outcomes rather than a second trade decision."
+        )
+
+    with strategy_tab:
+        st.markdown("**Directional news reaction**")
+        st.write(
+            "Bullish company research proposes LONG and bearish research proposes SHORT. Fundamentals, completed SMA context, exchange-local session, "
+            "post-news price behavior and costs provide supporting or conflicting evidence. By default, protection uses a 2×ATR14 stop and a target "
+            "1.5 times the stop distance (3×ATR14)."
+        )
+        st.markdown("**Conditional mean reversion**")
+        st.write(
+            "A temporary bearish reaction inside a bullish trend may propose LONG; a temporary bullish reaction inside a bearish trend may propose SHORT. "
+            "The setup requires the configured ATR excursion, completed-bar reversal confirmation, confidence and a valid entry/stop/target relationship."
+        )
+        st.markdown("**Exchange-aware timing**")
+        st.write(
+            "Each candidate records its primary exchange, IANA timezone, local weekday, opening/morning/midday/afternoon/closing state, lunch break where applicable, "
+            "and eToro quote state. These variables are evidence only until measured results justify a session-specific rule."
+        )
+        st.warning("OpenAI confidence is an analysis score, not a calibrated probability of profit. No current evaluation establishes profitability.")
+
+    with operations_tab:
+        st.markdown("**Automation and scheduling**")
+        st.write(
+            "Research Actions controls the automatic cycle interval and suspension. Automated eToro demo orders stay enabled after successful trades; "
+            "each candidate still passes current account and portfolio gates. The per-cycle order limit and duplicate-position protection remain active."
+        )
+        st.markdown("**Storage and retention**")
+        st.write(
+            "SQLite is the active database on persistent local/block storage. Never-submitted analysis is archived after the configured retention period. "
+            "Broker-linked lifecycles are preserved. Optional S3 support creates consistent snapshots and restores them at startup; S3 is not the live database filesystem."
+        )
+        st.markdown("**Reports and notifications**")
+        st.write(
+            "Trade lifecycles can be downloaded as sanitized JSON or a dark HTML report. SMTP can notify multiple recipients after an acknowledged demo submission. "
+            "API debug evidence masks credentials and is controlled separately."
+        )
+
+    with config_tab:
+        st.write(
+            "Environment values configure providers, credentials and hosting. Persisted application settings configure scheduling and automation. "
+            "Agent rules configure decisions and sizing. Current agent values are shown below."
+        )
+        current_rules = backend_module.get_agent_rules()
+        rows = []
+        for agent_name, defaults in DEFAULT_AGENT_RULES.items():
+            values = current_rules.get(agent_name, defaults)
+            for name, default in defaults.items():
+                if name == "status":
+                    continue
+                rows.append({
+                    "Agent": agent_name.replace("_", " ").title(),
+                    "Setting": name,
+                    "Current": json.dumps(values.get(name), default=str) if isinstance(values.get(name), (dict, list)) else str(values.get(name)),
+                    "Default": json.dumps(default, default=str) if isinstance(default, (dict, list)) else str(default),
+                    "Purpose": AGENT_RULE_HELP.get(name, "Persisted agent behavior setting."),
+                })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=520)
+        manual_path = Path(__file__).resolve().parent / "CONFIGURATION.md"
+        if manual_path.is_file():
+            st.download_button(
+                "Download configuration manual",
+                data=manual_path.read_bytes(),
+                file_name="FINBOT_CONFIGURATION.md",
+                mime="text/markdown",
+                key="download_configuration_manual",
+            )
+        st.caption("Credentials are intentionally excluded from this table. Configure them in Broker settings or the hosting provider's secret store.")
+
+    with limits_tab:
+        st.markdown(
+            "- The active historical evaluation is inconclusive until point-in-time news, fundamentals, model decisions and execution costs can be replayed without look-ahead.\n"
+            "- Yahoo and eToro data can be delayed, corrected, unavailable or disagree. Execution always uses a fresh eToro quote.\n"
+            "- eToro acknowledgments do not prove fills or protection updates; reconciliation records the broker's later state and exposes mismatches.\n"
+            "- Broker closed-history fields and fees may be incomplete for some positions, so realized attribution can remain unavailable.\n"
+            "- SQLite supports the current single-replica design. Multiple application replicas require a transactional server database and distributed locking.\n"
+            "- Market gaps, liquidity, financing, model error and regime changes can produce losses beyond modeled stops and costs."
+        )
 
     st.divider()
     st.subheader("Path to trading APIs")
@@ -3289,7 +3361,7 @@ def main() -> None:
                 risk_total = st.text_input("Maximum aggregate stop risk (fraction)", value=os.getenv("FINBOT_MAX_TOTAL_RISK_PCT", "0.02"))
                 max_positions = st.number_input(
                     "Maximum open positions", min_value=1, max_value=100,
-                    value=max(1, min(100, int(os.getenv("FINBOT_MAX_OPEN_POSITIONS", "5")))),
+                    value=max(1, min(100, int(os.getenv("FINBOT_MAX_OPEN_POSITIONS", "30")))),
                     step=1,
                 )
                 max_gross = st.text_input("Maximum gross exposure (fraction of equity)", value=os.getenv("FINBOT_MAX_GROSS_EXPOSURE_PCT", "1.0"))
@@ -3435,6 +3507,10 @@ def main() -> None:
                                 "headlines": (candidate.get("research_input") or {}).get("article_count"),
                                 "quote_time": (candidate.get("research_input") or {}).get("quote_timestamp"),
                                 "SMA trend": ((candidate.get("research_input") or {}).get("daily_trend_context") or {}).get("trend_state"),
+                                "exchange": (candidate.get("research_input") or {}).get("primary_exchange"),
+                                "exchange session": (candidate.get("research_input") or {}).get("market_session"),
+                                "exchange local time": ((candidate.get("research_input") or {}).get("market_session_context") or {}).get("local_timestamp"),
+                                "eToro quote state": (candidate.get("research_input") or {}).get("etoro_execution_state"),
                                 "trend alignment": (((candidate.get("agent_workflow") or {}).get("strategist") or {}).get("decision_gate") or {}).get("daily_trend_alignment"),
                                 "researcher": ((candidate.get("agent_workflow") or {}).get("researcher") or {}).get("decision"),
                                 "strategist": ((candidate.get("agent_workflow") or {}).get("strategist") or {}).get("decision"),

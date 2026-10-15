@@ -40,7 +40,12 @@ def load_daily_bars(symbol: str, period: str = "5y", now=None) -> pd.DataFrame:
     current_session_complete = False
     try:
         regular = ticker.get_history_metadata()["currentTradingPeriod"]["regular"]
-        session_end = pd.Timestamp(regular["end"], unit="s", tz="UTC")
+        raw_session_end = regular["end"]
+        if isinstance(raw_session_end, (int, float)):
+            session_end = pd.Timestamp(raw_session_end, unit="s", tz="UTC")
+        else:
+            session_end = pd.Timestamp(raw_session_end)
+            session_end = session_end.tz_localize("UTC") if session_end.tzinfo is None else session_end.tz_convert("UTC")
         session_date = session_end.tz_convert(index.tz or "UTC").date()
         current_session_complete = session_date == today and checked_at >= session_end
     except (KeyError, TypeError, AttributeError, ValueError):
@@ -61,26 +66,41 @@ def load_daily_bars(symbol: str, period: str = "5y", now=None) -> pd.DataFrame:
     frame["sma50"] = frame["Close"].rolling(50, min_periods=50).mean()
     frame["sma200"] = frame["Close"].rolling(200, min_periods=200).mean()
     frame["atr14"] = true_range.rolling(14, min_periods=14).mean()
-    return frame.dropna(subset=["sma50", "sma200", "atr14"])
+    # ATR is an execution-risk input and becomes available before the slower
+    # trend averages for newly listed instruments. Preserve those rows so a
+    # missing SMA200 does not erase an otherwise valid ATR14.
+    return frame.dropna(subset=["atr14"])
 
 
 def evaluate_latest_signal(symbol: str, bars: pd.DataFrame) -> Dict[str, Any]:
     if bars is None or bars.empty:
         return {"available": False, "symbol": symbol, "reason": "No complete daily bars."}
     row = bars.iloc[-1]
-    close, sma50, sma200, atr14 = (float(row[key]) for key in ("Close", "sma50", "sma200", "atr14"))
-    if not all(math.isfinite(value) and value > 0 for value in (close, sma50, sma200, atr14)):
-        return {"available": False, "symbol": symbol, "reason": "Daily indicator data is invalid."}
-    return {
-        "available": True,
+    close, atr14 = (float(row[key]) for key in ("Close", "atr14"))
+    sma50, sma200 = (float(row[key]) for key in ("sma50", "sma200"))
+    timestamp = pd.Timestamp(bars.index[-1]).isoformat()
+    base = {
         "symbol": symbol,
         "strategy": DAILY_TREND_VERSION,
-        "signal_timestamp": pd.Timestamp(bars.index[-1]).isoformat(),
+        "signal_timestamp": timestamp,
         "signal_provider": "Yahoo Finance adjusted daily OHLC",
-        "close": close,
-        "sma50": sma50,
-        "sma200": sma200,
-        "atr14": atr14,
+        "close": close if math.isfinite(close) and close > 0 else None,
+        "sma50": sma50 if math.isfinite(sma50) and sma50 > 0 else None,
+        "sma200": sma200 if math.isfinite(sma200) and sma200 > 0 else None,
+        "atr14": atr14 if math.isfinite(atr14) and atr14 > 0 else None,
+    }
+    if base["close"] is None or base["atr14"] is None:
+        return {**base, "available": False, "trend_state": "unknown", "reason": "Daily close or ATR14 data is invalid."}
+    if base["sma50"] is None or base["sma200"] is None:
+        return {
+            **base,
+            "available": False,
+            "trend_state": "unknown",
+            "reason": "SMA trend is unavailable because fewer than 200 completed daily sessions exist.",
+        }
+    return {
+        **base,
+        "available": True,
         "enter_long": close > sma50 > sma200,
         "exit_long": close < sma50,
         "trend_state": (
@@ -133,7 +153,13 @@ def run_portfolio_backtest(
     """Chronological equal-universe portfolio test with a fixed final 20% holdout."""
     if costs is None:
         return {"status": "inconclusive", "reason": "Backtest cost inputs are incomplete."}
-    usable = {symbol: bars for symbol, bars in symbol_bars.items() if bars is not None and len(bars) >= 220}
+    usable = {
+        symbol: complete
+        for symbol, bars in symbol_bars.items()
+        if bars is not None
+        for complete in [bars.dropna(subset=["sma50", "sma200", "atr14"])]
+        if len(complete) >= 220
+    }
     if not usable:
         return {"status": "inconclusive", "reason": "No symbol has at least 220 usable completed daily bars."}
     dates = sorted(set().union(*(set(bars.index) for bars in usable.values())))

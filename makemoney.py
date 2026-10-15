@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional
 from trading_workflow import VERSION as WORKFLOW_VERSION, size_order, mean_reversion_setup, reaction_from_bars, exit_reason
 import workflow_store
 from email_notifications import send_trade_execution_email
+from market_sessions import build_market_session_context
 
 # Load environment variables from .env.config if it exists
 env_config_path = Path(__file__).resolve().parent / ".env.config"
@@ -2590,6 +2591,7 @@ class StrategistAgent:
             "fundamentals": tech_data.get("fundamentals", {}),
             "daily_trend_context": tech_data.get("daily_trend_context", {}),
             "market_quote": tech_data.get("market_quote", {}),
+            "market_session_context": tech_data.get("market_session_context", {}),
             "decision_gate": decision_gate,
             "notes": decision_gate.get("notes") or (
                 f"Received {len(recent_news)} headlines; decision applied confidence, company evidence, and available trend context."
@@ -2647,6 +2649,7 @@ class RiskManagerAgent:
             execution_reasons.append("The proposed direction is disabled in Execution settings.")
 
         daily_trend = candidate.get("daily_trend_context") or {}
+        market_session = candidate.get("market_session_context") or {}
         trend_state = str(daily_trend.get("trend_state") or "unknown").lower()
         if not daily_trend.get("available") or trend_state not in {"bullish", "bearish", "mixed"}:
             trend_alignment = "unavailable"
@@ -2725,6 +2728,7 @@ class RiskManagerAgent:
             "execution_ready": not reasons and not execution_reasons and bool(sized.get("proposed_units")),
             "verified_equity": equity, "open_position_count": len(positions), "max_open_positions": max_positions,
             "atr14": atr14, "daily_trend_context": daily_trend, "daily_trend_alignment": trend_alignment,
+            "market_session_context": market_session,
             "strategy_notes": strategy.get("notes"), "strategy_framework": strategy.get("decision_gate", {}).get("strategy_framework"),
             "risk_budget_multiplier": risk_budget_multiplier, "leverage": int(approved_leverage) if str(approved_leverage).replace(".", "", 1).isdigit() else None,
             "broker_order_submitted": False,
@@ -2864,6 +2868,7 @@ class ExecutionAgent:
             "proposed_side": strategy.get("position"),
             "strategy_notes": strategy.get("notes"),
             "strategy_framework": strategy.get("decision_gate", {}).get("strategy_framework"),
+            "market_session_context": candidate.get("market_session_context", {}),
             "broker_order_submitted": False,
             "evaluation_status_informational_only": evaluation.get("status", "not_run"),
         }
@@ -3668,12 +3673,18 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
         except Exception as error:
             instrument_error = f"{type(error).__name__}: {error}"
 
+        market_session_context = build_market_session_context(
+            instrument=instrument,
+            fundamentals=fundamentals,
+            quote=quote,
+        )
+
         # Compare with the time the quote was checked, not the start of the
         # whole research cycle; network and AI work can take longer than 60s.
         quote_fresh = is_fresh_etoro_quote(quote)
 
         reaction = await asyncio.to_thread(load_news_reaction, ticker, headlines)
-        trends = {**trends, "news_reaction": reaction}
+        trends = {**trends, "news_reaction": reaction, "market_session_context": market_session_context}
         ai_result = await researcher_agent.analyze_news_candidate(
             ticker=ticker,
             company_name=company_name,
@@ -3737,6 +3748,7 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
             "price": quote_price or (float(bars.iloc[-1]["Close"]) if bars is not None and not bars.empty else None),
             "market_quote": {**quote, "available": bool(quote.get("available") and quote_fresh)},
             "daily_trend_context": daily_trend_context,
+            "market_session_context": market_session_context,
             "fundamentals": fundamentals,
             "ai_analysis": ai_result,
             "related_news": related_news,
@@ -3756,6 +3768,7 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
             "headline_count": len(headlines),
             "openai": ai_result,
             "evidence": {"headlines": headlines[:8], "fundamentals": fundamentals, "market_context": trends},
+            "market_session_context": market_session_context,
         }
         record_agent_event(
             "researcher", researcher_result["status"], "dynamic_news_research",
@@ -3858,6 +3871,12 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
                 "quote_provider": quote.get("provider"),
                 "quote_timestamp": quote.get("fetched_at"),
                 "instrument_id": instrument.get("instrument_id"),
+                "primary_exchange": market_session_context.get("primary_exchange"),
+                "exchange_timezone": market_session_context.get("exchange_timezone"),
+                "market_session": market_session_context.get("market_session"),
+                "underlying_session_state": market_session_context.get("underlying_session_state"),
+                "etoro_execution_state": market_session_context.get("etoro_execution_state"),
+                "market_session_context": market_session_context,
             },
             "fundamentals": fundamentals,
             "market_trends": trends,
@@ -4113,8 +4132,12 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
     elif (candidate.get("ai_analysis") or {}).get("reaction_assessment") == "temporary" and trend == "bearish" and signal == "bullish":
         side = "SHORT"
     entry = quote["ask" if side == "LONG" else "bid"]
+    market_session_context = build_market_session_context(
+        instrument=instrument, fundamentals=fundamentals, quote=quote,
+    )
     candidate = {**candidate, "market_quote": quote, "price": entry,
-                 "fundamentals": fundamentals, "news_reaction": reaction, "daily_trend_context": daily}
+                 "fundamentals": fundamentals, "news_reaction": reaction, "daily_trend_context": daily,
+                 "market_session_context": market_session_context}
     strategy = StrategistAgent().analyze_and_decide({
         "tech_data": candidate, "energy_data": candidate,
         "recent_news": candidate.get("related_news") or [],
@@ -4206,6 +4229,7 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
               "holding_hours": risk["holding_hours"], "sizing": risk["sizing"],
               "estimated_costs": risk["estimated_costs"], "atr14": atr14,
               "broker_cost_evidence": cost_evidence,
+              "market_session_context": market_session_context,
               "requested_entry": entry, "stop_offset": risk["proposed_stop"]-entry,
               "target_offset": risk["proposed_take_profit"]-entry,
               "mean_reversion": strategy["decision_gate"].get("conditional_mean_reversion") or {}}

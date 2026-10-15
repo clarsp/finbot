@@ -700,12 +700,26 @@ def _fetch_company_fundamentals(ticker: str) -> Dict[str, Any]:
             "unavailable_reason": "Yahoo Finance did not return company financial statements.",
         }
 
+    try:
+        history_metadata = company.get_history_metadata() or {}
+    except Exception:
+        history_metadata = {}
+    regular_period = (history_metadata.get("currentTradingPeriod") or {}).get("regular") or {}
+
     def numeric_value(value: Any) -> Optional[float]:
         try:
             number = float(value)
         except (TypeError, ValueError):
             return None
         return number if math.isfinite(number) else None
+
+    def epoch_value(value: Any) -> Optional[float]:
+        if hasattr(value, "timestamp"):
+            try:
+                return float(value.timestamp())
+            except (TypeError, ValueError, OSError):
+                return None
+        return numeric_value(value)
 
     def statement_values(statement: Any, labels: tuple[str, ...]) -> list[Optional[float]]:
         if statement is None or getattr(statement, "empty", True):
@@ -829,6 +843,12 @@ def _fetch_company_fundamentals(ticker: str) -> Dict[str, Any]:
         "company_name": info.get("longName") or info.get("shortName"),
         "sector": info.get("sector"),
         "industry": info.get("industry"),
+        "exchange": info.get("exchange"),
+        "full_exchange_name": info.get("fullExchangeName"),
+        "exchange_timezone": info.get("exchangeTimezoneName"),
+        "yahoo_market_state": info.get("marketState"),
+        "exchange_session_start_epoch": epoch_value(regular_period.get("start")),
+        "exchange_session_end_epoch": epoch_value(regular_period.get("end")),
         "currency": info.get("currency"),
         "quote_currency": info.get("currency"),
         "financial_currency": info.get("financialCurrency"),
@@ -1206,6 +1226,8 @@ class EtoroBrokerAdapter:
             "supported_asset": supported_asset,
             "buy_enabled": instrument.get("isBuyEnabled"),
             "short_enabled": instrument.get("isSellEnabled", instrument.get("isShortEnabled")),
+            "exchange_name": instrument.get("internalExchangeName") or instrument.get("exchangeName"),
+            "currently_tradeable": instrument.get("isCurrentlyTradable", instrument.get("isTradable")),
             "instrument": instrument,
         }
 

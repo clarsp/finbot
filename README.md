@@ -4,6 +4,8 @@ Finbot pursues positive **net returns** through news research, explicit strategy
 
 The active eToro workflow discovers companies from Yahoo news/screens, enriches them with company fundamentals, asks OpenAI for evidence-based research, and runs the Strategist, Risk Manager, and Execution gates. It supports positive-news LONG trades, negative-news SHORT trades, and a separate measured conditional mean reversion track. An actual rejection stops that candidate; unavailable optional data is recorded separately from execution eligibility.
 
+Market timing is calculated in each instrument's primary-exchange timezone rather than a global ET clock. Research and lifecycle evidence distinguish the underlying regular session from eToro quote availability, retain local weekday/session context through every agent, and recalculate it before submission. These fields are observational until strategy evaluation shows that a specific session interaction improves net results.
+
 - **Local simulation:** `FINBOT_BROKER_PROVIDER=dummy`; local simulated records, no broker orders.
 - **eToro demo:** `FINBOT_BROKER_PROVIDER=etoro`, `ETORO_DEMO_TRADING=true`; automatic demo submission when enabled and all execution gates pass.
 - **Live orders:** blocked in the eToro adapter.
@@ -27,6 +29,7 @@ startup, uploads consistent versioned snapshots periodically, and makes a final
 backup during a normal shutdown. Do not mount an S3 bucket as the live SQLite
 filesystem. See [HOSTING.md](HOSTING.md) for configuration, IAM permissions,
 restore modes, and the point at which PostgreSQL becomes necessary.
+See [CONFIGURATION.md](CONFIGURATION.md) for the complete environment, persisted setting, agent rule, email, storage, and hosting map.
 
 ## Main controls
 

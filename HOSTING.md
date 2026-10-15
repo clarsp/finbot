@@ -6,6 +6,20 @@ Run exactly **one writable Finbot container**. Keep `/data/finbot.db` on the
 container's local SSD or a persistent block volume. S3 is used for recovery
 snapshots; it is not mounted as the live database filesystem.
 
+### Web entry point
+
+Streamlit already provides the application HTTP server. For a private hosted deployment, keep it and place a dedicated reverse proxy or managed ingress in front of the container:
+
+```text
+Internet → managed TLS / reverse proxy → Finbot Streamlit :8501
+                                      → persistent block volume /data
+                                      → optional periodic S3 snapshots
+```
+
+Terminate trusted HTTPS at the ingress, keep port 8501 private, inject credentials through the hosting secret store, and restrict access with an identity-aware proxy, VPN, or equivalent network policy in addition to the application login. Do not add Nginx or a Node server to the Finbot container solely to serve Streamlit; a separate proxy or the provider's load balancer has a clearer lifecycle.
+
+If the interface later needs dense admin navigation, responsive mobile layouts, real-time tables, or chart interactions that Streamlit cannot support cleanly, expose the existing Python services through a versioned FastAPI boundary and add a React/Next.js frontend incrementally. Separate the scheduler and broker worker from HTTP handling before running multiple web replicas.
+
 At startup, `start.sh` checks the configured restore policy before the
 scheduler or dashboard opens SQLite. While Finbot runs, `s3_backup.py` uses
 SQLite's online backup API to create a consistent temporary database, runs

@@ -12,6 +12,10 @@ Research receives supplied headlines, company financial data, recent price conte
 
 Completed Yahoo adjusted daily bars supply SMA50, SMA200 and ATR14. Yahoo session-close metadata determines whether today's bar is complete; if metadata is unavailable, today's bar is conservatively excluded. These indicators inform the strategy and risk review. They do not replace the news thesis.
 
+Each news candidate also carries exchange-aware session evidence. The Researcher resolves the primary exchange from eToro instrument metadata with Yahoo exchange/timezone metadata as supporting evidence, converts the observation into the exchange's IANA timezone, and labels opening discovery, morning, midday, afternoon, closing, a local lunch break, pre-market, after-hours or closed. Provider session timestamps override normal hours when they identify the current session, including early closes; otherwise the record explicitly says that only the weekday schedule was available. The Strategist, Risk Manager and Execution records retain this context, and the final submission performs a fresh session calculation. Missing exchange metadata does not reject research or independently authorize/reject a trade.
+
+The underlying exchange state and eToro state are stored separately. An available eToro quote outside the underlying regular session is not represented as an open underlying market. The broker remains the authority on whether an order can actually be submitted. Session and weekday are initially observational variables: they do not create a direction or change ATR targets until accumulated results demonstrate a net benefit after costs.
+
 ## Two-direction strategies
 
 **Directional news:** bullish research proposes LONG, bearish research proposes SHORT. Structural or uncertain news is not automatically reversed just because the daily trend disagrees. Existing confidence and company-evidence gates apply. Opposing daily trends require the configured countertrend confidence and receive half the normal risk budget; mixed/unavailable trends receive half risk. Missing optional data does not masquerade as a research rejection.
