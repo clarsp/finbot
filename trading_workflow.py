@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from price_structure import structure_target
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -87,7 +88,7 @@ def mean_reversion_setup(candidate: dict, side: str, rules: dict) -> dict:
 
 def size_order(*, side: str, entry: float, atr: float, equity: float, cash: float,
                leverage: int, positions: list[dict], risk_rules: dict, execution_rules: dict,
-               sector: str | None = None, multiplier: float = 1, setup: dict | None = None) -> dict:
+               sector: str | None = None, multiplier: float = 1, setup: dict | None = None, structure: dict | None = None) -> dict:
     """Risk sizing, then the smallest of units, margin, cash and portfolio caps."""
     entry, atr, equity = positive(entry, "Entry"), positive(atr, "ATR"), positive(equity, "Equity")
     if side not in {"LONG", "SHORT"} or leverage < 1 or int(leverage) != leverage:
@@ -105,6 +106,12 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
     positive(stop, "Stop price")
     positive(distance, "Stop distance")
     target = float(setup["target"]) if setup.get("approved") else entry + sign * distance * positive(risk_rules.get("target_reward_risk", 1.5), "Target R")
+    if not setup.get("approved"):
+        # Independent ceiling, preserving the existing 2 ATR stop / 1.5R default.
+        target = entry + sign*min(abs(target-entry), atr*positive(risk_rules.get('max_target_atr_multiple', 3.0), 'Max target ATR'))
+    target, target_evidence = structure_target(side, entry, target, atr, structure,
+        mode='nearest' if setup.get('approved') else risk_rules.get('structure_target_mode','range_boundary'),
+        range_months=risk_rules.get('structure_range_months',1), range_weeks=risk_rules.get('structure_range_weeks',4))
     positive(target, "Target price")
     reward = sign * (target - entry)
     gross = 0.0
@@ -156,9 +163,10 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
         errors.append("Risk on existing broker positions cannot be verified because stop, direction, fill, or quantity is missing.")
     if not units:
         errors.append("No risk budget remains for a new position." if risk_budget <= 0 else "No cash or portfolio exposure capacity remains for a new position.")
-    if reward <= cost_per_unit or reward/distance < float(risk_rules.get("minimum_reward_risk", 1)):
+    if reward <= cost_per_unit or reward/distance < float(risk_rules.get("minimum_reward_risk", 1)) or (target_evidence["adjusted"] and (reward-cost_per_unit)/distance < float(risk_rules.get("minimum_reward_risk", 1))):
         errors.append("The proposed target does not cover estimated costs and the minimum reward/risk ratio.")
     protection = {
+        "target_selection": target_evidence,
         "framework": "CONDITIONAL_MEAN_REVERSION" if setup.get("approved") else "DIRECTIONAL_NEWS",
         "atr14": atr,
         "entry_price": entry,
@@ -170,6 +178,8 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
         "target_atr_multiple": reward / atr,
         "reward_risk_ratio": reward / distance,
         "formula": (
+            target_evidence.get("formula", "Baseline target capped before daily/weekly/monthly support/resistance; stop preserved.")
+            if target_evidence["adjusted"] else
             "Mean-reversion stop and anchor target derived from the measured news reaction."
             if setup.get("approved") else
             "Stop = entry ± configured ATR multiple; take profit = entry ∓/± stop distance × target reward/risk."
@@ -182,6 +192,10 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
             "required_margin": units*entry/leverage, "notional": units*entry,
             "estimated_total_spend": units*(entry/leverage+cost_per_unit),
             "planned_stop_risk": units*distance, "estimated_costs": units*cost_per_unit,
+            "cost_assumptions": {"units": units, "spread_per_unit": spread,
+                                 "roundtrip_bps": configured_bps, "financing_annual_pct": annual*100,
+                                 "holding_hours": holding_hours, "currency": "USD",
+                                 "source": "entry-time configured forecast; broker opening fees reserved separately"},
             "estimated_net_target_profit": units*(reward-cost_per_unit),
             "unverifiable_positions": unknown, "execution_reasons": errors, "holding_hours": holding_hours,
             "protection": protection,

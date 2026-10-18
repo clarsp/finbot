@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from trade_economics import position_economics
 import html
 import json
 import os
@@ -11,7 +12,7 @@ import sqlite3
 import ssl
 from dataclasses import dataclass
 from email.message import EmailMessage
-from email.utils import getaddresses
+from email.utils import getaddresses, make_msgid
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +135,14 @@ def load_trade_evidence(database_path: Path, trade_id: int) -> dict[str, Any]:
         trade_row = connection.execute("SELECT * FROM trades WHERE id = ?", (int(trade_id),)).fetchone()
         if not trade_row:
             raise ValueError(f"Trade #{trade_id} does not exist.")
+        recovery_rows = []
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE name='broker_actions'").fetchone():
+            from broker_recovery import list_actions
+            recovery_rows = list_actions(connection,int(trade_id))
+        shadow_rows = []
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE name='shadow_exits'").fetchone():
+            from shadow_tracking import rows
+            shadow_rows = rows(connection, int(trade_id))
         event_rows = connection.execute(
             "SELECT id,created_at,stage,agent_name,status,decision,message,details "
             "FROM trade_events WHERE trade_id = ? ORDER BY id",
@@ -160,7 +169,8 @@ def load_trade_evidence(database_path: Path, trade_id: int) -> dict[str, Any]:
                 event["message"] = (
                     "Execution readiness passed; final broker checks completed and the later execution event submitted the order."
                 )
-    return _sanitize({"trade": dict(trade_row), "stages": events})
+    return _sanitize({"trade": dict(trade_row), "stages": events, "shadow_exits": shadow_rows, "broker_actions": recovery_rows,
+                      "position_economics": position_economics({**dict(trade_row), "events": events})})
 
 
 def _summary_lines(evidence: dict[str, Any]) -> list[str]:
@@ -180,6 +190,13 @@ def _summary_lines(evidence: dict[str, Any]) -> list[str]:
             f"- {event['created_at']} | {event['stage']} / {event['agent_name']} | "
             f"{event['decision']} ({event['status']}): {event['message']}"
         )
+    economics = evidence.get("position_economics") or position_economics({**trade, "events": evidence["stages"]})
+    lines.extend(["", "Position economics:",
+                  f"Opening exposure: {economics['opening_exposure']} | current exposure: {economics['current_exposure']}",
+                  f"Margin: {economics['margin']} ({economics['margin_source']}) | broker running P/L: {economics['broker_running_pnl']} | realised P/L: {economics['realized_pnl']}"])
+    for scenario in economics["scenarios"]:
+        lines.append(f"{scenario['scenario']}: per unit {scenario['profit_per_unit']} | gross {scenario['gross_position_pnl']} | estimated costs {scenario['estimated_costs']} | estimated net {scenario['estimated_net_position_pnl']} | estimated return on margin {scenario['estimated_return_on_margin_pct']}%")
+    lines.extend(economics["warnings"])
     broker_linked = bool(trade.get("broker_order_id") or trade.get("broker_position_id"))
     if broker_linked:
         state = "This lifecycle is broker-linked. Use its current status and reconciliation fields as the execution source of truth."
@@ -201,7 +218,7 @@ def build_trade_report_html(evidence: dict[str, Any]) -> str:
         "</details></section>"
         for event in evidence["stages"]
     )
-    summary = "".join(f"<li>{html.escape(line)}</li>" for line in _summary_lines(evidence)[:6])
+    summary = "".join(f"<li>{html.escape(line)}</li>" for line in _summary_lines(evidence) if line)
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='color-scheme' content='dark'>"
@@ -297,6 +314,7 @@ def send_trade_execution_email(
         return {"status": "disabled"}
     evidence = load_trade_evidence(database_path, trade_id)
     message = build_trade_message(settings, evidence, test_mode=test_mode)
+    message["Message-ID"] = make_msgid()
     context = ssl.create_default_context()
     if settings.security == "tls":
         smtp: smtplib.SMTP = smtplib.SMTP_SSL(
@@ -304,21 +322,44 @@ def send_trade_execution_email(
         )
     else:
         smtp = smtplib.SMTP(settings.host, settings.port, timeout=settings.timeout_seconds)
-    with smtp:
+    accepted = False
+    refused = {}
+    try:
         smtp.ehlo()
         if settings.security == "starttls":
             smtp.starttls(context=context)
             smtp.ehlo()
         if settings.username:
             smtp.login(settings.username, settings.password)
-        smtp.send_message(message)
+        # Reports can include evidence attachments. Give DATA acceptance more
+        # time than connection setup; never retry an ambiguous DATA timeout.
+        if smtp.sock is not None:
+            smtp.sock.settimeout(max(60, settings.timeout_seconds))
+        refused = smtp.send_message(message)
+        accepted = True
+    finally:
+        try:
+            smtp.quit()
+        except (smtplib.SMTPException, OSError):
+            # QUIT after successful DATA acceptance does not retract the email.
+            if not accepted:
+                smtp.close()
+        finally:
+            smtp.close()
     return {
-        "status": "sent",
+        "status": "partial" if refused else "sent",
+        "delivery_state": "smtp_accepted_partial" if refused else "smtp_accepted",
         "security": settings.security,
         "recipient_count": len(settings.recipients),
+        "accepted_recipient_count": len(settings.recipients)-len(refused),
+        "refused_recipient_count": len(refused),
+        "refusal_codes": [int(response[0]) for response in refused.values()],
+        "message_id": message['Message-ID'],
         "json_attached": settings.attach_json,
         "test_mode": test_mode,
+        "note": "SMTP acceptance does not confirm recipient inbox delivery.",
     }
+
 
 
 def test_smtp_connection() -> dict[str, Any]:

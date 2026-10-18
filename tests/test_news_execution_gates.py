@@ -97,16 +97,17 @@ class NewsExecutionGateRegressionTests(unittest.TestCase):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         connection.executescript("""
+            CREATE TABLE position_management (trade_id INTEGER PRIMARY KEY, architecture_version TEXT, origin TEXT);
             CREATE TABLE trades (
                 id INTEGER, symbol TEXT, company_name TEXT, status TEXT,
-                signal_provider TEXT
+                signal_provider TEXT, side TEXT DEFAULT 'LONG', broker_order_id TEXT, broker_position_id TEXT, opened_at TEXT, created_at TEXT, closed_at TEXT
             );
             CREATE TABLE trade_events (
                 id INTEGER, trade_id INTEGER, created_at TEXT, stage TEXT,
                 agent_name TEXT, status TEXT, decision TEXT, message TEXT,
                 details TEXT
             );
-            INSERT INTO trades VALUES
+            INSERT INTO trades (id,symbol,company_name,status,signal_provider) VALUES
                 (154, 'AVGO', 'Broadcom', 'ANALYSIS_ONLY',
                  'Yahoo Finance News + OpenAI research');
             INSERT INTO trade_events VALUES
@@ -253,7 +254,7 @@ class NewsExecutionGateRegressionTests(unittest.TestCase):
         rules = {**makemoney.DEFAULT_AGENT_RULES, "execution": {"enabled": True}}
         with patch.object(makemoney, "get_agent_rules", return_value=rules), patch.object(
             makemoney, "record_agent_event"
-        ):
+        ), patch.object(makemoney,'weekend_entry_block_reason',return_value=None):
             result = makemoney.ExecutionAgent().review_news_demo_candidate(
                 candidate={"ticker": "ACME"},
                 strategy={"position": "LONG", "decision_gate": {"accepted": True}},

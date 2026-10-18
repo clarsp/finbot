@@ -1,0 +1,75 @@
+# Confirm this is your existing app name, or deploy with: fly deploy -a YOUR_APP
+app = "finbot-tbfs1a"
+primary_region = "ams"
+kill_signal = "SIGTERM"
+kill_timeout = 120
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Update the single existing writer; do not use canary/bluegreen or extra replicas.
+[deploy]
+  strategy = "rolling"
+  max_unavailable = 1
+  wait_timeout = "10m"
+
+# Standard hosting defaults. Credentials belong in Fly Secrets, never this file.
+# These become environment variables automatically; no dashboard re-entry needed.
+[env]
+  FINBOT_DB_PATH = "/data/finbot.db"
+  FINBOT_ENV_CONFIG_PATH = "/data/runtime.env"
+  FINBOT_SKIP_INSTALL = "true"
+  FINBOT_LOG_TO_STDOUT = "true"
+  STREAMLIT_PORT = "8501"
+  ENABLE_HTTPS = "false"
+  FINBOT_PUBLIC_HTTPS = "true"
+  FINBOT_BROKER_PROVIDER = "etoro"
+  FINBOT_PORTFOLIO_ACCOUNT_SOURCE = "etoro_demo"
+  ETORO_DEMO_TRADING = "true"
+  ETORO_API_BASE_URL = "https://public-api.etoro.com"
+  FINBOT_RESEARCH_PROVIDER = "yfscreen"
+  FINBOT_NEWS_PROVIDER = "yfinance"
+  FINBOT_NEWS_INTERVAL_SECONDS = "3600"
+  FINBOT_NEWS_SYMBOL_LIMIT = "40"
+  OPENAI_BASE_URL = "https://api.openai.com/v1"
+  OPENAI_MODEL = "gpt-4o-mini"
+  FINBOT_S3_BACKUP_ENABLED = "true"
+  FINBOT_S3_PROVIDER = "tigris"
+  FINBOT_S3_BUCKET = "datadb"
+  FINBOT_S3_ENDPOINT_URL = "https://t3.storage.dev"
+  FINBOT_S3_PREFIX = "finbot/shared-demo"
+  FINBOT_S3_BACKUP_INTERVAL_SECONDS = "900"
+  FINBOT_S3_RESTORE_MODE = "if_missing"
+  # This deployment migrates an existing account: do not silently start empty.
+  FINBOT_S3_RESTORE_REQUIRED = "true"
+  FINBOT_S3_SERVER_SIDE_ENCRYPTION = "AES256"
+  AWS_REGION = "auto"
+
+[[mounts]]
+  source = "finbot_data"
+  destination = "/data"
+  initial_size = "3gb"
+  scheduled_snapshots = true
+  snapshot_retention = 5
+
+[http_service]
+  internal_port = 8501
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "120s"
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"
+    path = "/_stcore/health"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "2gb"
+
+[[restart]]
+  policy = "always"

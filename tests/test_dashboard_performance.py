@@ -44,7 +44,9 @@ class DashboardPerformanceTests(unittest.TestCase):
         rows=app.get_trade_history(trade_ids=ids,limit=3,offset=3)
         self.assertEqual([r['id'] for r in rows],list(reversed(ids))[3:6])
         self.assertTrue(all(len(r['events'])==2 for r in rows))
-        self.assertEqual(rows[0]['duplicate_of_trade_id'],rows[0]['id']-1)
+        self.assertEqual(rows[0]['previous_analysis_trade_id'],rows[0]['id']-1)
+        self.assertIsNone(rows[0]['duplicate_of_trade_id'])
+        self.assertFalse(rows[0]['is_duplicate'])
         self.assertEqual(app.get_trade_history(trade_ids=[]),[])
 
     def test_historical_cutoff_applies_to_lazy_evidence(self):
@@ -68,6 +70,7 @@ class DashboardPerformanceTests(unittest.TestCase):
         self.update(tid,created_at=(app.datetime.now(app.timezone.utc)-app.timedelta(minutes=2)).strftime('%Y-%m-%d %H:%M:%S'))
         app.record_trade_event(tid,'risk','risk_manager','completed','accepted','Sizing evidence',{'large_document':'marker-not-rendered-until-open'})
         ui=AppTest.from_file(str(Path(app.__file__).with_name('streamlit_app.py')),default_timeout=20)
+        ui.session_state['auth_token']=app.create_session_token('admin')
         ui.session_state['authenticated']=True;ui.session_state['username']='admin'
         with patch('integrations.EtoroBrokerAdapter',return_value=self.adapter),patch.object(app,'get_trade_history',wraps=app.get_trade_history) as history:
             ui.run()

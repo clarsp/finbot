@@ -78,7 +78,7 @@ Maintenance archives never-submitted analysis hourly after **3 days** by default
 
 ## Operation and test workflow
 
-Compose uses `./data/finbot.db` mounted at `/data/finbot.db`, plus `./logs`. Local Python defaults to a different `./finbot.db`. Stop services before copying SQLite files. Schema changes are additive; archival is reversible. Audit reports live beside the configured DB in `audit_logs/`.
+Compose uses Docker-managed `finbot_data` mounted at `/data`, plus `./logs`. Local Python defaults to a different `./finbot.db`. Run all live SQLite access inside Docker and export consistent backup snapshots for host-side inspection; do not share the live WAL database between macOS and Docker Linux. Schema changes are additive; archival is reversible. Audit reports live beside the configured DB in `audit_logs/`.
 
 Hosted single-replica deployments can enable consistent S3 snapshots and
 startup restoration. The live SQLite file stays on local or persistent block
@@ -100,3 +100,158 @@ All adapter requests use the configured `ETORO_USER_AGENT`. API debug logging re
 ## Dashboard loading
 
 Lifecycle lists use compact metadata, SQL pagination and on-demand evidence. Tabs and collapsed panels skip hidden content. Dashboard reads may be cached for five seconds; broker values carry the worker snapshot timestamp. Use **Refresh eToro positions** for an explicit current broker read. UI caches never authorize orders. See [DASHBOARD_PERFORMANCE.md](DASHBOARD_PERFORMANCE.md) for measurements and deployment details.
+
+## Support/resistance target experiment
+
+New entries use `daily_weekly_monthly_v2` with up to five years of completed
+adjusted daily bars. Daily swing zones use 120 sessions, pivots confirmed by
+two later bars, and at least two pivots separated by five bars within 0.25 ATR.
+Weekly highs/lows (104 periods) and monthly highs/lows (60 periods) provide
+additional potential barriers. Current-period extremes use completed daily
+bars only; their evolving status and source-through date are recorded rather
+than presented as confirmed swing resistance/support. Directional production
+uses the outer monthly range: the highest high for LONG or lowest low for SHORT
+from the current month plus one preceding calendar month by default. Missing
+monthly data falls back to the outer four-week range; missing dated range data
+falls back to the earlier nearest-level rule. The selected boundary caps the
+initial ATR target with a 0.1 daily ATR buffer; it never extends that initial
+target. Nearby levels remain recorded breakout obstacles, not automatic ceilings.
+A quote already beyond the monthly boundary does not silently authorize chasing
+a new high/low; normal directional and net-return checks apply. These levels
+are historical evidence, not a prediction of a successful breakout. Intraday
+structure is not yet included. Mean reversion retains its anchor and nearest cap.
+The nearest-level production mode remains selectable in the Risk Manager.
+
+Missing structure retains the baseline with unavailable evidence.
+`Risk Manager → structure_targets_enabled` defaults true; disable for baseline
+comparison. New entries with adjusted targets require minimum reward/risk
+**after** estimated costs, including broker opening fees at final submission.
+Leverage does not relax this gate. Stops retain ATR/reaction rules and are not
+tightened to manufacture a passing ratio. Absolute structure targets do not
+shift with fills. Lifecycle protection and policy evidence retain the baseline,
+selected target, timeframe, zone, method, and observation date.
+
+`scripts/recompute_structure_targets.py` previews linked open demo positions;
+`--trade-id ID` limits scope, and `--apply` submits eligible reviewed targets under
+the shared account lease. Existing-position management preserves broker stops,
+requires a fresh quote, clearance beyond the current executable price, and
+positive estimated net profit from actual entry. Original entry reward/risk is
+reported but does not veto profit taking on an existing position. No positions
+are closed when the proposed target has already been passed or is too close.
+Reports are stored beside the configured database in `audit_logs/`.
+
+## Position economics and broker close requests
+
+Expanded lifecycles show invested margin, opening/current market exposure,
+profit per unit, gross and estimated net position P/L at target and stop, and
+estimated return on margin. Actual broker units are the full exposure; no
+additional leverage multiplier is applied. Broker running P/L, saved cost
+forecasts, and confirmed realised profit are displayed separately, with
+observation timestamps and missing-data labels. Saved costs scale to the
+current quantity when their original sizing quantity is available; unknown
+costs do not become zero. Legacy positions without saved cost forecasts retain
+gross scenarios with net outcomes explicitly unavailable. New submissions
+save spread, round-trip bps, financing rate and horizon assumptions. Closing
+fees, duration changes and slippage can differ from the saved estimate.
+
+The demo close endpoint requires `InstrumentID` as well as the position ID.
+Maintenance uses the verified broker instrument; direct close calls resolve
+it from a unique open portfolio position when necessary. The returned
+`orderForClose.orderID` is retained in lifecycle evidence. Acknowledgment
+stays EXIT_PENDING until broker reconciliation confirms absence/closure.
+Live close routing remains blocked.
+
+An additional minimum dollar-profit floor remains undecided. Existing
+entry cost/reward/risk gates and positive-profit requirements for discretionary
+target reductions are unchanged while that policy is discussed.
+
+## Prospective shadow exit tracking
+
+Risk Manager freezes an optional shadow plan only at the shared final submission
+boundary, after normal research, strategy, account, cost and risk checks. Broker
+reconciliation starts comparisons only once a new directional fill has confirmed
+price, units and opening time. Previously opened positions and conditional mean
+reversion are not retrospectively enrolled.
+
+Defaults compare the production price/time exit baseline with 2-ATR and 3-ATR
+stops paired with 1-ATR and 2-ATR targets. Each uses the production holding limit
+plus 168/336 calendar hours. Alternative targets retain the earlier nearest-level cap using saved entry-time
+daily, weekly and monthly structure, including the 1 ATR shadow; wider stops reduce simulated quantity to preserve
+initial stop risk without exceeding the approved/fill quantity. Alternative net
+reward/risk eligibility is shown, not used to bypass the real entry gates.
+
+The Position Manager maintenance loop observes eToro bid for LONG and ask for
+SHORT, including after the actual position closes. Rows persist in SQLite and
+resume after restart. No additional orders or protection changes are sent by the
+shadow observer. The baseline freezes initial price/time rules; later thesis
+invalidation, manual actions and actual broker fills are not replayed.
+
+The Shadow comparison view and lifecycle details show ATR14, requested multiples,
+uncapped ATR prices, structure-capped prices, estimated outcomes, observation gaps
+and paired completed results. Sampled quote crossings do not prove first touches
+or executable fills. Gaps over 120 seconds and late horizon exits remain visible.
+Spread is already included in executable quotes; other costs and financing are
+estimates, with missing broker opening costs explicitly identified.
+
+Directional initial target distance is now explicitly bounded by Risk Manager's
+`max_target_atr_multiple` (default 3). Its formula is
+`min(stop_atr_multiple * target_reward_risk, max_target_atr_multiple)` before
+structure caps. The default 2-ATR stop and 1.5R target remain unchanged. This
+ceiling applies to new directional sizing, not existing orders or news-anchor
+mean-reversion targets.
+
+Companies analytics read retained lifecycle and research evidence directly,
+separating research acceptance from broker submission. Prior analysis references
+appear inside a lifecycle. A duplicate submission label requires broker-submitted
+records for the same symbol and direction, plus a shared broker reference or
+an overlapping recorded position lifetime. A later re-entry after closure is
+not a duplicate.
+
+Open-position target reviews run through Risk Manager and the shared demo
+protection update/reconciliation path under the account lease. They may extend a
+previously shortened target within the ATR/monthly boundary while preserving the
+broker stop, quantity and positive net payoff check. Expired holding limits,
+missing data, crossed stops, or insufficient clearance are reported as skips.
+Saved shadow plans and their initial baselines are immutable across these reviews.
+
+## Tracked execution recovery
+
+The normal maintenance workflow persists close/protection intent and recovery state in SQLite. Restarting retains attempts and next-check times. Historical pending requests are adopted without sending them again. Uncertain entry lookups and close-status checks back off; unknown close outcomes require evidence rather than a blind replacement. Broker-confirmed terminal close failures permit bounded replacement against the verified remaining position. Protection correction uses existing portfolio snapshots, spaced mismatches and identical fixed-price updates, with at most three writes by default. Oversight and each trade show pending actions, next checks, evidence and attention flags. No shared API budget or separate recovery agent bypasses the normal workflow.
+
+## Six-role architecture — 18 October 2026
+
+Researcher → Strategist → Risk Manager → Execution is the entry path. Execution performs final checks, durable submission and broker acknowledgment. **Position Manager** owns fill confirmation, held-position monitoring, protection, reconciliation, controlled recovery, exits and quote-observed shadow tracking. It uses the existing renewable account lease, adapter and persisted action state; it does not create a second scheduler or repeat orders during migration.
+
+Existing broker-linked active positions are adopted idempotently into `position_management`. Their policies, stop/target levels, holding limits, historical event authors and pending broker-action IDs, attempts and next-check times are preserved. New verified fills receive ownership metadata automatically. Historical trades remain available to analysis; shadow plans are never fabricated retrospectively.
+
+**Performance Analyst** is an advisory, deterministic evidence-review agent. The worker checks locally every 15 minutes and saves one immutable review of the previous completed Stockholm calendar day and previous completed Monday–Monday week. On first start/resume it reviews the latest completed periods; cumulative broker-confirmed results include earlier history. Frozen reviews record available evidence; late broker history is reflected in later reports. It adds no broker/LLM polling and cannot change rules or submit orders.
+
+Reports distinguish broker-reported realized net P/L from current entry exposure, count each broker position once, exclude unknown net P/L and show fees without subtracting them twice. Results are grouped by direction, symbol and captured-policy fingerprint; legacy attribution remains incomplete. Same-trade/same-horizon completed shadow pairs use estimated net costs and disclose observation gaps. The default 20-closure review threshold is a minimum reporting guard, not statistical proof of profitability. Recommendations stay advisory.
+
+Dashboards expose six agent roles, a five-role per-trade overview (Performance Analyst is portfolio-level), optional expanded Position Manager stages, a Position management view and a Performance reviews view. Existing trade details retain full historical events.
+
+## Weekend scheduler pacing — 18 October 2026
+
+Research Actions now separates weekend workload from permission to open new positions. Defaults: weekend pacing enabled; new weekend entries disabled; research every 360 minutes; news every 360 minutes; routine Position Manager checks every 15 minutes. Weekday intervals remain as configured. Effective weekend research/news intervals never run faster than their normal intervals.
+
+Saturday/Sunday are determined using the configurable IANA scheduler timezone (Europe/Stockholm by default). This is a calendar pacing policy, not an exchange holiday calendar or a claim that all international markets close simultaneously. Existing exchange-session evidence, broker availability, freshness and risk gates still apply. Enabling weekend entries grants no exemption from those gates. Entry policy is enforced both during Execution review and at the final submission workflow, including manual demo entries. Protection and exits are never blocked by this switch.
+
+Uncertain entries/closes and outstanding protection actions retain 60-second maintenance checks; ordinary acknowledged pending closes use slower weekend maintenance. Durable action-specific next-check times, Retry-After and write limits still apply. The worker heartbeat and daily/weekly advisory reviews continue independently. The worker wakes locally each minute to respond to urgent state, changed configuration and weekday transitions; it does not perform a broker poll on every wake during routine weekend pacing.
+
+News-attempt times and research claims persist across restarts. The scheduler resumes normal weekday cadence without waiting for a weekend interval to finish. Existing automatic/manual mode and suspension controls are preserved. Tests cover timezone boundaries, weekend spacing, restart deduplication, Monday resumption, entry controls and urgent maintenance. **181 tests pass**.
+
+## Consolidated review tools — 18 October 2026
+
+Position Manager now owns configuration audits. The old Overwatcher implementation is a compatibility helper (`TradeConfigurationAuditor`), not a seventh registered agent. A local audit runs at most once per 24 hours during successful maintenance, with an on-demand control under Position management. Its explicit scope is the latest 50 eligible trades. Reports persist in SQLite; existing JSONL audit files remain viewable under Legacy configuration audit reports. These checks do not query the broker or modify positions.
+
+Performance Analyst owns on-demand historical path analysis and the batch tool formerly on Trade lifecycles. Performance reviews → Historical path analysis provides access to requests, saved analyses and the historical path chart. Individual trades retain an Analyze historical path shortcut. New records retain their reference prices/timestamp and distinguish broker-position references, simulated references and unexecuted counterfactuals. They do not confirm fills or represent realized returns.
+
+New scheduled performance reviews incorporate the latest saved configuration-audit snapshot and historical analyses generated during their window. Existing immutable reviews and historical event authors are preserved. No scheduled historical-price fetching is added. The duplicate Trade Oversight sidebar action and separate Oversight navigation page are removed; recovery evidence lives under Position management. Analysis archive controls remain separate administrative tools. **187 regression tests pass**.
+
+## Shared profiles and login permissions — 18 October 2026
+
+The active trading runtime is now named **Finbot shared demo**. User memberships grant viewer, operator or owner access independently of platform-admin status. Existing admins retain shared-profile owner membership; new normal users default to viewers, with an explicit shared-access selection during registration. Platform admins can suspend/reactivate accounts; suspension revokes sessions without stopping the shared trading workflow. The last active platform admin and last active profile owner are protected.
+
+The active profile is visible in the dashboard. All signed-in users can manage their own login, create inactive draft profile/account/connection metadata, and share owned profiles. Broker/SMTP/AI credentials remain platform-admin-only. Backend action checks and guarded cached reads enforce roles, account suspension and profile access. Existing trading records are tagged to profile 1 without changing their policies or broker actions.
+
+Only the original shared profile can run or display trading data. Draft profiles are deliberately blocked from independent trading and from showing the shared profile's data as their own. Full broker/account isolation, additional adapters, per-profile workers and secret storage remain parked. [MULTITENANCY.md](MULTITENANCY.md) records the implemented boundary and contains a copy/paste prompt for that uplift.

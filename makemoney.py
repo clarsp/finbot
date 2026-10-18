@@ -17,11 +17,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from trading_workflow import VERSION as WORKFLOW_VERSION, size_order, mean_reversion_setup, reaction_from_bars, exit_reason
 import workflow_store
+import broker_recovery
+import performance_analysis
+import scheduler_policy
+from profile_access import AccessControl
+import profile_access
+import shadow_tracking
 from email_notifications import send_trade_execution_email
 from market_sessions import build_market_session_context
 
 # Load environment variables from .env.config if it exists
-env_config_path = Path(__file__).resolve().parent / ".env.config"
+env_config_path = Path(os.getenv("FINBOT_ENV_CONFIG_PATH", str(Path(__file__).resolve().parent / ".env.config")))
 if env_config_path.exists():
     with open(env_config_path) as f:
         for line in f:
@@ -112,6 +118,15 @@ DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
         "max_sector_exposure_pct": 0.35,
         "stop_atr_multiple": 2.0,
         "target_reward_risk": 1.5,
+        "max_target_atr_multiple": 3.0,
+        "shadow_tracking_enabled": True,
+        "shadow_stop_atr_multiples": [2.0, 3.0],
+        "shadow_target_atr_multiples": [1.0, 2.0],
+        "shadow_horizons_hours": [168.0, 336.0],
+        "structure_targets_enabled": True,
+        "structure_target_mode": "range_boundary",
+        "structure_range_months": 1,
+        "structure_range_weeks": 4,
         "minimum_reward_risk": 1.0,
         "news_max_hold_hours": 48.0,
         "mean_reversion_max_hold_hours": 24.0,
@@ -119,6 +134,8 @@ DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
         "estimated_financing_annual_pct": 8.0,
     },
     "execution": {"enabled": True, "status": "idle", "paper_trading_only": True, "max_trade_value": 2500, "max_trades_per_cycle": 2, "allowed_side": ["LONG", "SHORT"], "max_order_units": 5.0, "max_order_spend_usd": 200.0, "analysis_retention_days": 3, "max_research_age_hours": 24.0},
+    "position_manager": {"recovery_max_attempts": 3, "recovery_initial_check_seconds": 60, "recovery_max_check_seconds": 900, "recovery_escalate_hours": 2.0, "enabled": True, "status": "idle"},
+    "performance_analyst": {"enabled": True, "status": "idle", "minimum_closed_positions": 20},
 }
 
 INSTRUMENT_NAMES = {
@@ -145,9 +162,30 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+
+access=AccessControl(lambda:get_connection(),lambda token:validate_session_token(token))
+
+
+def permission(level):
+    def decorate(function):
+        def check():
+            if level=='admin':access.require_admin()
+            else:access.require_profile(level)
+        if asyncio.iscoroutinefunction(function):
+            @wraps(function)
+            async def async_call(*args,**kwargs):
+                check();return await function(*args,**kwargs)
+            return async_call
+        @wraps(function)
+        def sync_call(*args,**kwargs):
+            check();return function(*args,**kwargs)
+        return sync_call
+    return decorate
+
 def serialized_account(function):
     @wraps(function)
     async def wrapped(*args, **kwargs):
+        access.require_profile('operator')
         async with workflow_store.lease(get_connection, "etoro_demo_account"):
             return await function(*args, **kwargs)
     return wrapped
@@ -165,6 +203,7 @@ def load_news_reaction(symbol: str, headlines: list) -> dict:
         return {"available": False, "reason": f"Post-news price history unavailable ({type(error).__name__})."}
 
 
+@permission('operator')
 def cleanup_stale_analysis() -> dict:
     days = int(get_agent_rules()["execution"].get("analysis_retention_days", 3))
     conn = get_connection()
@@ -175,6 +214,7 @@ def cleanup_stale_analysis() -> dict:
         conn.close()
 
 
+@permission('operator')
 def restore_archived_analysis(trade_id: int) -> None:
     conn = get_connection()
     try:
@@ -183,6 +223,7 @@ def restore_archived_analysis(trade_id: int) -> None:
         conn.close()
 
 
+@permission('viewer')
 def get_broker_performance() -> dict:
     conn = get_connection()
     try:
@@ -193,13 +234,21 @@ def get_broker_performance() -> dict:
         conn.close()
 
 
-@serialized_account
 async def manage_etoro_demo_positions(settings=None) -> dict:
+    """Compatibility entrypoint; the Position Manager owns account maintenance."""
+    return await PositionManagerAgent().manage(settings)
+
+
+async def _manage_etoro_demo_positions(settings=None) -> dict:
     """Independent maintenance: broker history, fill-based protection and exits."""
+    ownership = get_connection()
+    adopted = performance_analysis.adopt(ownership)
+    ownership.close()
     settings = settings or IntegrationSettings.from_environment()
     if settings.broker_provider != "etoro" or not settings.etoro_demo_trading:
         return {"status": "not_demo"}
     adapter = EtoroBrokerAdapter(settings)
+    recovery = PositionManagerAgent().recovery_manager()
     account, snapshot, history = await asyncio.gather(
         asyncio.to_thread(adapter.get_account_snapshot), asyncio.to_thread(adapter.get_positions),
         asyncio.to_thread(adapter.get_closed_positions), return_exceptions=True)
@@ -215,7 +264,7 @@ async def manage_etoro_demo_positions(settings=None) -> dict:
         position = next((p for p in positions if str(p.get("position_id")).removesuffix(".0") == position_id), None)
         if not position and (trade.get("order_reference") or trade.get("broker_order_id")) and trade["status"] in {"SUBMITTING", "SUBMITTED_PENDING_RECONCILIATION", "RECONCILIATION_REQUIRED"}:
             try:
-                lookup = await asyncio.to_thread(adapter.lookup_order, order_id=trade.get("broker_order_id"), reference_id=trade.get("order_reference"))
+                lookup = await recovery.lookup_entry(trade, adapter) or {}
                 executions = lookup.get("positionExecutions") or []
                 if len(executions) == 1:
                     position_id = str(executions[0]["positionId"])
@@ -229,15 +278,21 @@ async def manage_etoro_demo_positions(settings=None) -> dict:
                     conn.commit(); conn.close()
             except Exception as error:
                 logger.warning("Order lookup unresolved for lifecycle %s: %s", trade["id"], type(error).__name__)
+        recovery.import_legacy(trade, position)
+        if position:
+            entry_action = recovery.get(trade['id'],'entry')
+            if entry_action: recovery.finish(entry_action,'RESOLVED','Broker portfolio confirms the entry position.')
+        await recovery.observe_close(trade, position, adapter)
+        await recovery.observe_protection(trade, position, adapter)
         completed = closed.get(position_id)
         if completed and not position:
             conn = get_connection()
             conn.execute("INSERT INTO broker_closed_positions(position_id,closed_at,net_profit,fees,payload) VALUES (?,?,?,?,?) ON CONFLICT(position_id) DO UPDATE SET closed_at=excluded.closed_at,net_profit=excluded.net_profit,fees=excluded.fees,payload=excluded.payload", (position_id, completed.get("closed_at"), completed.get("net_profit"), completed.get("fees"), json.dumps(completed)))
             conn.execute("UPDATE trades SET status=?, closed_at=?, close_rate=?, realized_pnl=?, broker_fees=COALESCE(?,broker_fees), reconciliation_status='broker_history_confirmed' WHERE id=?", ("CLOSED" if completed.get("net_profit") is not None else "CLOSED_PNL_UNAVAILABLE", completed.get("closed_at"), completed.get("close_rate"), completed.get("net_profit") or 0, completed.get("fees"), trade["id"]))
             conn.commit(); conn.close()
-            record_trade_event(trade["id"], "reconciliation", "execution", "completed", "accepted", "Broker closed-trade history confirms closure.", completed)
+            record_trade_event(trade["id"], "reconciliation", "position_manager", "completed", "accepted", "Broker closed-trade history confirms closure.", completed)
             continue
-        if not position or trade["status"] == "EXIT_PENDING":
+        if not position:
             continue
         policy = json.loads(trade.get("policy_json") or "{}")
         # Existing historical positions keep their original levels. New orders
@@ -246,7 +301,8 @@ async def manage_etoro_demo_positions(settings=None) -> dict:
         if trade.get("strategy_version") == WORKFLOW_VERSION and not policy.get("fill_adjusted") and position.get("open_rate"):
             if policy.get("framework") != "CONDITIONAL_MEAN_REVERSION":
                 stop = float(position["open_rate"]) + float(policy["stop_offset"])
-                target = float(position["open_rate"]) + float(policy["target_offset"])
+                if not policy.get("target_selection", {}).get("adjusted"):
+                    target = float(position["open_rate"]) + float(policy["target_offset"])
             policy["fill_adjusted"] = True
             conn = get_connection()
             conn.execute("UPDATE trades SET stop_loss_price=?,take_profit_price=?,policy_json=?,opened_at=COALESCE(opened_at,?) WHERE id=?", (stop, target, json.dumps(policy), position.get("opened_at") or datetime.now(timezone.utc).isoformat(), trade["id"]))
@@ -254,28 +310,25 @@ async def manage_etoro_demo_positions(settings=None) -> dict:
             trade.update(stop_loss_price=stop, take_profit_price=target, opened_at=trade.get("opened_at") or position.get("opened_at") or datetime.now(timezone.utc).isoformat())
         matches = stop is not None and position.get("stop_loss_price") is not None and abs(float(stop)-float(position["stop_loss_price"])) <= max(.01,abs(float(stop))*.0001)
         tp_matches = target is None and position.get("take_profit_price") is None or target is not None and position.get("take_profit_price") is not None and abs(float(target)-float(position["take_profit_price"])) <= max(.01,abs(float(target))*.0001)
-        last_patch = float(policy.get("last_protection_request", 0))
-        # The public API does not document a way to remove an existing take
-        # profit from an open position.  Keep reporting that mismatch, but do
-        # not repeatedly submit an unsupported clear request.  A requested
-        # numeric target can still be corrected together with the stop.
         protection_update_needed = not matches or (target is not None and not tp_matches)
-        protection_signature = json.dumps(
-            {"stop_loss_price": round(float(stop), 8), "take_profit_price": round(float(target), 8) if target is not None else None},
-            sort_keys=True,
-        ) if stop is not None else None
-        already_requested = policy.get("last_protection_request_signature") == protection_signature
-        if stop and protection_update_needed and not already_requested and time.time()-last_patch > 300:
+        if stop and protection_update_needed and not recovery.get(trade['id'],'protection'):
             try:
-                response = await asyncio.to_thread(adapter.modify_position, position_id, float(stop), float(target) if target is not None else None)
-                policy["last_protection_request"] = time.time()
-                policy["last_protection_request_signature"] = protection_signature
-                conn = get_connection()
-                conn.execute("UPDATE trades SET policy_json=?, reconciliation_status='protection_update_pending' WHERE id=?", (json.dumps(policy), trade["id"]))
-                conn.commit(); conn.close()
-                record_trade_event(trade["id"], "reconciliation", "execution", "waiting", "pending", "Broker accepted a protection update; verification awaits a new snapshot.", response)
+                await recovery.request_protection(trade,position,adapter,float(stop),float(target) if target is not None else None)
             except Exception as error:
-                logger.warning("Protection update failed for %s: %s", trade["id"], type(error).__name__)
+                logger.warning("Tracked protection correction awaits recovery for %s: %s",trade['id'],type(error).__name__)
+        if trade['status']=='EXIT_PENDING':
+            continue
+        mark = None
+        try:
+            rate = await asyncio.to_thread(adapter._get_rate, int(position["instrument_id"]))
+            mark = rate.get("bid" if trade["side"] == "LONG" else "ask")
+            if mark and math.isfinite(float(mark)) and float(mark) > 0:
+                position["current_rate"] = float(mark)
+                position["quote_observed_at"] = datetime.now(timezone.utc).isoformat()
+            else:
+                mark = None
+        except Exception:
+            mark = None
         if trade.get("strategy_version") != WORKFLOW_VERSION:
             continue
         captured = json.loads(trade.get("config_json") or "{}")
@@ -285,13 +338,7 @@ async def manage_etoro_demo_positions(settings=None) -> dict:
         if actual_spend is None:
             actual_spend = actual_units*float(position.get("open_rate") or 0)/max(1,float(position.get("leverage") or trade["leverage"]))
         size_violation = actual_units > float(caps["max_order_units"])+.000001 or float(actual_spend)+max(0,float(position.get("fees") or 0)) > float(caps["max_order_spend_usd"])+.01
-        mark = position.get("current_rate") or position.get("open_rate")
         reason = None
-        try:
-            rate = await asyncio.to_thread(adapter._get_rate, int(position["instrument_id"]))
-            mark = rate.get("bid" if trade["side"] == "LONG" else "ask")
-        except Exception:
-            mark = None
         if mark:
             reason = exit_reason({**trade, "policy": policy}, float(mark))
         else:
@@ -309,15 +356,14 @@ async def manage_etoro_demo_positions(settings=None) -> dict:
             reason = "actual_fill_exceeded_configured_units_or_spend_cap"
         if reason:
             try:
-                response = await asyncio.to_thread(adapter.close_position, position_id)
-                conn = get_connection()
-                conn.execute("UPDATE trades SET status='EXIT_PENDING',reconciliation_status='close_submitted' WHERE id=?", (trade["id"],))
-                conn.commit(); conn.close()
-                record_trade_event(trade["id"], "exit", "execution", "submitted", "pending", reason, response)
+                await recovery.request_close(trade,position,adapter,reason)
             except Exception as error:
-                record_trade_event(trade["id"], "exit", "execution", "waiting", "unavailable", f"Close request failed: {type(error).__name__}", {})
+                logger.warning("Tracked close awaits recovery for %s: %s",trade['id'],type(error).__name__)
     reconciliation = reconcile_news_demo_positions(positions)
+    try:PositionManagerAgent().audit_configuration_if_due()
+    except Exception:logger.exception('Local configuration audit failed; broker maintenance continues')
     sync_linked_test_workflows()
+    shadow_result = await PositionManagerAgent().observe_shadow_exits(adapter)
     if time.time() >= _benchmark_cache["until"]:
         try:
             bars = await asyncio.to_thread(load_daily_bars, "SPY", "1y")
@@ -328,7 +374,14 @@ async def manage_etoro_demo_positions(settings=None) -> dict:
     if isinstance(account, dict):
         workflow_store.record_snapshot(conn, account, snapshot, _benchmark_cache["value"])
     conn.close()
-    return {"status": "completed", "reconciliation": reconciliation}
+    conn = get_connection()
+    last = conn.execute("SELECT created_at FROM agent_events WHERE agent_name='position_manager' AND action='position_maintenance' ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    if adopted or not last or time.time()-performance_analysis.stamp(last['created_at']).timestamp() >= 900:
+        record_agent_event('position_manager','completed','position_maintenance',
+            f"Managed {len(positions)} broker positions; {adopted} ownership records adopted.",'observed',
+            {'reconciliation':reconciliation,'shadow':shadow_result,'adopted':adopted})
+    return {"status": "completed", "reconciliation": reconciliation, "shadow": shadow_result}
 
 
 def hash_password(password: str) -> str:
@@ -380,6 +433,7 @@ def ensure_db() -> None:
     for column, definition in {
         "avatar": "TEXT NOT NULL DEFAULT 'account_circle'",
         "is_admin": "INTEGER NOT NULL DEFAULT 0",
+        "is_active": "INTEGER NOT NULL DEFAULT 1",
     }.items():
         if column not in existing_user_columns:
             conn.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
@@ -464,12 +518,16 @@ def ensure_db() -> None:
         first_user = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
         if first_user:
             conn.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (first_user["id"],))
+    old_execution = conn.execute("SELECT rules_json FROM agent_rules WHERE agent_name='execution'").fetchone()
+    inherited_recovery = {k:v for k,v in json.loads(old_execution['rules_json']).items() if k.startswith('recovery_')} if old_execution else {}
     for agent_name, rules in DEFAULT_AGENT_RULES.items():
         existing = conn.execute(
             "SELECT rules_json FROM agent_rules WHERE agent_name = ?",
             (agent_name,),
         ).fetchone()
         if not existing:
+            if agent_name == 'position_manager':
+                rules = {**rules, **inherited_recovery}
             conn.execute(
                 "INSERT INTO agent_rules (agent_name, rules_json) VALUES (?, ?)",
                 (agent_name, json.dumps(rules, sort_keys=True)),
@@ -477,6 +535,8 @@ def ensure_db() -> None:
         else:
             saved_rules = json.loads(existing["rules_json"])
             merged_rules = {**rules, **saved_rules}
+            if agent_name == 'execution':
+                merged_rules = {k:v for k,v in merged_rules.items() if not k.startswith('recovery_')}
             leverage_keys = {
                 "researcher": ("default_leverage",),
                 "strategist": ("default_leverage", "max_leverage"),
@@ -495,6 +555,7 @@ def ensure_db() -> None:
                     (serialized_rules, agent_name),
                 )
     conn.commit()
+    profile_access.migrate(conn,os.getenv('FINBOT_BROKER_PROVIDER','etoro'))
     conn.close()
 
 
@@ -604,6 +665,7 @@ def calculate_leveraged_exit_prices(
     return stop_loss_price, take_profit_price, adjusted_exit_target
 
 
+@permission('viewer')
 def get_agent_rules() -> Dict[str, Dict[str, Any]]:
     conn = get_connection()
     rows = conn.execute("SELECT agent_name, rules_json FROM agent_rules").fetchall()
@@ -617,6 +679,7 @@ def get_agent_rules() -> Dict[str, Dict[str, Any]]:
     return data
 
 
+@permission('viewer')
 def get_ai_research_enabled() -> bool:
     conn = get_connection()
     row = conn.execute("SELECT value FROM app_settings WHERE key = 'ai_research_enabled'").fetchone()
@@ -624,6 +687,7 @@ def get_ai_research_enabled() -> bool:
     return bool(row and row["value"].lower() == "true")
 
 
+@permission('viewer')
 def get_etoro_api_debug_logging() -> bool:
     conn = get_connection()
     row = conn.execute(
@@ -633,6 +697,7 @@ def get_etoro_api_debug_logging() -> bool:
     return bool(row and row["value"].strip().lower() in {"1", "true", "yes", "on"})
 
 
+@permission('admin')
 def set_etoro_api_debug_logging(enabled: bool) -> None:
     conn = get_connection()
     conn.execute(
@@ -644,6 +709,7 @@ def set_etoro_api_debug_logging(enabled: bool) -> None:
     conn.close()
 
 
+@permission('viewer')
 def get_strategy_evaluation() -> Dict[str, Any]:
     conn = get_connection()
     row = conn.execute("SELECT value FROM app_settings WHERE key = 'strategy_evaluation_json'").fetchone()
@@ -674,6 +740,7 @@ def get_strategy_evaluation() -> Dict[str, Any]:
     return result
 
 
+@permission('viewer')
 def get_demo_automated_trading_enabled() -> bool:
     conn = get_connection()
     row = conn.execute("SELECT value FROM app_settings WHERE key = 'demo_automated_trading_enabled'").fetchone()
@@ -681,6 +748,7 @@ def get_demo_automated_trading_enabled() -> bool:
     return bool(row and row["value"].strip().lower() in {"1", "true", "yes", "on"})
 
 
+@permission('operator')
 def set_demo_automated_trading_enabled(enabled: bool) -> None:
     settings = IntegrationSettings.from_environment()
     if enabled and settings.broker_provider != "etoro":
@@ -780,6 +848,7 @@ async def _run_daily_trend_strategy_evaluation_retired() -> Dict[str, Any]:
     return result
 
 
+@permission('operator')
 async def run_strategy_evaluation() -> Dict[str, Any]:
     """Report the current news strategy's historical-evaluation evidence status."""
     result = {
@@ -800,6 +869,7 @@ async def run_strategy_evaluation() -> Dict[str, Any]:
     return result
 
 
+@permission('operator')
 def set_ai_research_enabled(enabled: bool) -> None:
     if enabled and not IntegrationSettings.from_environment().openai_api_key:
         raise ValueError("Set OPENAI_API_KEY in .env.config before enabling OpenAI research.")
@@ -828,6 +898,7 @@ def record_openai_usage(model: str, usage: Dict[str, int], rate_limits: Dict[str
     conn.close()
 
 
+@permission('admin')
 def sync_openai_token_allowance() -> None:
     conn = get_connection()
     conn.execute("BEGIN IMMEDIATE")
@@ -852,6 +923,7 @@ def sync_openai_token_allowance() -> None:
     conn.close()
 
 
+@permission('viewer')
 def get_openai_usage_summary() -> Dict[str, Any]:
     conn = get_connection()
     settings = {row["key"]: row["value"] for row in conn.execute(
@@ -875,16 +947,30 @@ def get_openai_usage_summary() -> Dict[str, Any]:
     }
 
 
-def configure_research_schedule(mode: str, interval_minutes: int) -> None:
+@permission('operator')
+def configure_research_schedule(mode: str, interval_minutes: int, **weekend_options) -> None:
     if mode not in {"manual", "automatic"}:
         raise ValueError("Research mode must be manual or automatic.")
     if not 1 <= interval_minutes <= 1440:
         raise ValueError("Research interval must be between 1 minute and 24 hours.")
+    for key,value in weekend_options.items():
+        if key not in scheduler_policy.DEFAULTS:raise ValueError('Unknown scheduler option: '+key)
+        default=scheduler_policy.DEFAULTS[key]
+        if isinstance(default,bool):
+            if not isinstance(value,bool):raise ValueError(key+' must be true or false.')
+        elif isinstance(default,int):
+            if isinstance(value,bool) or not isinstance(value,int) or not 1<=value<=1440:
+                raise ValueError(key+' must be an integer from 1 to 1440 minutes.')
+        else:
+            from zoneinfo import ZoneInfo,ZoneInfoNotFoundError
+            try:ZoneInfo(value)
+            except (ZoneInfoNotFoundError,ValueError,TypeError):raise ValueError('Choose a valid IANA scheduler timezone.')
     conn = get_connection()
     values = {
         "research_schedule_mode": mode,
         "research_schedule_interval_minutes": str(interval_minutes),
     }
+    values.update({'research_schedule_'+k:str(v).lower() if isinstance(v,bool) else str(v) for k,v in weekend_options.items()})
     conn.executemany(
         "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         values.items(),
@@ -893,6 +979,7 @@ def configure_research_schedule(mode: str, interval_minutes: int) -> None:
     conn.close()
 
 
+@permission('operator')
 def suspend_research_schedule(resume_at: Optional[str]) -> None:
     conn = get_connection()
     conn.execute(
@@ -903,7 +990,8 @@ def suspend_research_schedule(resume_at: Optional[str]) -> None:
     conn.close()
 
 
-def get_research_schedule() -> Dict[str, Any]:
+@permission('viewer')
+def get_research_schedule(now: Optional[datetime] = None) -> Dict[str, Any]:
     conn = get_connection()
     settings = {row["key"]: row["value"] for row in conn.execute(
         "SELECT key, value FROM app_settings WHERE key LIKE 'research_schedule_%'"
@@ -912,13 +1000,16 @@ def get_research_schedule() -> Dict[str, Any]:
     interval = int(settings.get("research_schedule_interval_minutes", "60"))
     suspended_until = settings.get("research_schedule_suspended_until", "")
     last_run = settings.get("research_schedule_last_run", "")
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    pacing = scheduler_policy.policy(settings,now)
     resume_at = datetime.fromisoformat(suspended_until) if suspended_until else None
     is_suspended = bool(resume_at and resume_at > now)
-    next_run = datetime.fromisoformat(last_run) + timedelta(minutes=interval) if last_run else now
+    next_run = scheduler_policy.due_at(settings,'research',datetime.fromisoformat(last_run),interval,now) if last_run else now
     if is_suspended:
         next_run = max(next_run, resume_at)
     return {
+        **pacing,
+        "effective_interval_minutes": scheduler_policy.interval(settings,'research',interval,now),
         "mode": settings.get("research_schedule_mode", "manual"),
         "interval_minutes": interval,
         "suspended_until": suspended_until,
@@ -928,6 +1019,7 @@ def get_research_schedule() -> Dict[str, Any]:
     }
 
 
+@permission('viewer')
 def get_latest_research_cycle_status() -> Optional[Dict[str, Any]]:
     conn = get_connection()
     candidate_pool = conn.execute(
@@ -980,6 +1072,7 @@ def get_latest_research_cycle_status() -> Optional[Dict[str, Any]]:
     }
 
 
+@permission('operator')
 def claim_due_research_cycle(now: Optional[datetime] = None) -> bool:
     now = now or datetime.now(timezone.utc)
     conn = get_connection()
@@ -996,9 +1089,8 @@ def claim_due_research_cycle(now: Optional[datetime] = None) -> bool:
             conn.rollback()
             return False
         last_run = settings.get("research_schedule_last_run", "")
-        due_at = datetime.fromisoformat(last_run) + timedelta(
-            minutes=int(settings.get("research_schedule_interval_minutes", "60"))
-        ) if last_run else now
+        due_at = scheduler_policy.due_at(settings,'research',datetime.fromisoformat(last_run),
+            int(settings.get("research_schedule_interval_minutes", "60")),now) if last_run else now
         if due_at > now:
             conn.rollback()
             return False
@@ -1012,6 +1104,41 @@ def claim_due_research_cycle(now: Optional[datetime] = None) -> bool:
         conn.close()
 
 
+
+@permission('operator')
+def claim_due_news_fetch(normal_seconds, now=None):
+    now=now or datetime.now(timezone.utc)
+    conn=get_connection()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        saved={r['key']:r['value'] for r in conn.execute("SELECT key,value FROM app_settings WHERE key LIKE 'research_schedule_%'")}
+        last=saved.get('research_schedule_last_news_fetch')
+        if last and scheduler_policy.due_at(saved,'news',datetime.fromisoformat(last),normal_seconds/60,now)>now:
+            conn.rollback();return False
+        conn.execute("INSERT INTO app_settings VALUES ('research_schedule_last_news_fetch',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(now.isoformat(),))
+        conn.commit();return True
+    finally:conn.close()
+
+
+def weekend_entry_block_reason(now=None):
+    schedule=get_research_schedule(now)
+    if schedule['is_weekend'] and not schedule['weekend_trading_enabled']:
+        return f"New weekend entries are disabled in scheduler timezone {schedule['timezone']}; research and position management continue."
+    return None
+
+
+def position_maintenance_interval(now=None):
+    schedule=get_research_schedule(now)
+    if not schedule['reduced_pacing']:return 60
+    conn=get_connection()
+    try:
+        urgent=conn.execute("""SELECT 1 FROM trades WHERE status IN ('SUBMITTING','SUBMITTED_PENDING_RECONCILIATION','RECONCILIATION_REQUIRED')
+            UNION ALL SELECT 1 FROM broker_actions WHERE state NOT IN ('APPLIED','CLOSED','SUPERSEDED','RESOLVED')
+            AND (kind IN ('entry','protection') OR state IN ('UNKNOWN','SUBMITTING')) LIMIT 1""").fetchone()
+    finally:conn.close()
+    return 60 if urgent else max(60,schedule['weekend_maintenance_minutes']*60)
+
+@permission('operator')
 def update_company_analytics(ticker: str, company_name: str, sector: str, signal: str, confidence: float, accepted: bool) -> None:
     """Update company analytics after analysis."""
     conn = get_connection()
@@ -1064,7 +1191,80 @@ def record_research_cycle_company(cycle_timestamp: str, ticker: str, signal: str
     conn.close()
 
 
-def get_company_analytics(days: int = 30) -> List[Dict[str, Any]]:
+@permission('viewer')
+def get_broker_actions(trade_id=None, active_only=False):
+    conn=get_connection()
+    try: return broker_recovery.list_actions(conn,trade_id,active_only)
+    finally: conn.close()
+
+
+@permission('viewer')
+def get_shadow_exits(trade_id=None):
+    conn = get_connection()
+    try:
+        return shadow_tracking.rows(conn, trade_id)
+    finally:
+        conn.close()
+
+
+def _company_lifecycles(days=30, ticker=None):
+    conn = get_connection()
+    try:
+        return [dict(r) for r in conn.execute("""SELECT t.*,
+            COALESCE(json_extract(e.details,'$.signal'), t.side) AS research_signal,
+            COALESCE(json_extract(e.details,'$.confidence'),0) AS research_confidence,
+            e.decision AS research_decision, e.created_at AS research_at,
+            COALESCE(json_extract(e.details,'$.evidence.fundamentals.sector'),
+                     json_extract(t.policy_json,'$.sector'),'Unknown') AS company_sector
+            FROM trades t LEFT JOIN trade_events e ON e.id=(
+                SELECT MIN(id) FROM trade_events WHERE trade_id=t.id AND stage='research')
+            WHERE julianday(t.created_at)>=julianday('now', ?)
+            AND (? IS NULL OR UPPER(t.symbol)=UPPER(?)) ORDER BY t.id DESC""",
+            (f'-{int(days)} days', ticker, ticker))]
+    finally:
+        conn.close()
+
+
+def _broker_submitted(trade):
+    return bool(trade.get('broker_order_id') or trade.get('broker_position_id'))
+
+
+@permission('viewer')
+def get_company_analytics(days=30):
+    groups = {}
+    for t in _company_lifecycles(days):
+        groups.setdefault(t['symbol'].upper(), []).append(t)
+    result = []
+    for symbol, trades in groups.items():
+        latest = trades[0]
+        accepted = sum(t['research_decision']=='accepted' for t in trades)
+        submitted = sum(_broker_submitted(t) for t in trades)
+        result.append(dict(ticker=symbol, company_name=latest.get('company_name') or INSTRUMENT_NAMES.get(symbol,symbol),
+            sector=latest['company_sector'], times_analyzed=len(trades),
+            last_analyzed_at=latest['research_at'] or latest['created_at'],
+            last_signal=latest['research_signal'], avg_confidence=sum(t['research_confidence'] or 0 for t in trades)/len(trades),
+            trade_count=submitted, trades_accepted=accepted, acceptance_rate=accepted/len(trades),
+            open_positions=sum(t['status']=='OPEN' and _broker_submitted(t) for t in trades),
+            not_executed=sum(not _broker_submitted(t) for t in trades),
+            realized_pnl=sum(float(t['realized_pnl'] or 0) for t in trades if t['status']=='CLOSED'),
+            source='trade lifecycles'))
+    return sorted(result, key=lambda r:r['times_analyzed'], reverse=True)
+
+
+@permission('viewer')
+def get_company_analysis_history(ticker, days=30):
+    trades = _company_lifecycles(days, ticker)
+    company = next((r for r in get_company_analytics(days) if r['ticker']==ticker.upper()), None)
+    return dict(company=company, trades=trades, analysis_cycles=[dict(
+        cycle_timestamp=t['research_at'] or t['created_at'], signal=t['research_signal'],
+        confidence=t['research_confidence'] or 0, trade_id=t['id'], decision=t['research_decision']) for t in trades])
+
+
+def get_least_analyzed_companies(limit=10):
+    return sorted(get_company_analytics(365), key=lambda r:(r['times_analyzed'],r['last_analyzed_at']))[:limit]
+
+
+def _legacy_get_company_analytics(days: int = 30) -> List[Dict[str, Any]]:
     """Get aggregated analytics per company."""
     conn = get_connection()
     cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
@@ -1078,7 +1278,7 @@ def get_company_analytics(days: int = 30) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def get_company_analysis_history(ticker: str, days: int = 30) -> List[Dict[str, Any]]:
+def _legacy_get_company_analysis_history(ticker: str, days: int = 30) -> List[Dict[str, Any]]:
     """Get analysis history for a specific company."""
     conn = get_connection()
     cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
@@ -1111,7 +1311,7 @@ def get_company_analysis_history(ticker: str, days: int = 30) -> List[Dict[str, 
     }
 
 
-def get_least_analyzed_companies(limit: int = 10) -> List[Dict[str, Any]]:
+def _legacy_get_least_analyzed_companies(limit: int = 10) -> List[Dict[str, Any]]:
     """Get companies analyzed least frequently to reduce repetition."""
     conn = get_connection()
     rows = conn.execute(
@@ -1123,6 +1323,7 @@ def get_least_analyzed_companies(limit: int = 10) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+@permission('viewer')
 def get_decision_timeline(start_at: Optional[str] = None, end_at: Optional[str] = None) -> List[Dict[str, Any]]:
     conditions = []
     parameters: List[str] = []
@@ -1142,15 +1343,27 @@ def get_decision_timeline(start_at: Optional[str] = None, end_at: Optional[str] 
     return [dict(row) for row in rows]
 
 
+@permission('operator')
 def update_agent_rules(agent_name: str, new_rules: Dict[str, Any]) -> Dict[str, Any]:
     current = get_agent_rules()
-    merged = current.get(agent_name, DEFAULT_AGENT_RULES.get(agent_name, {}))
+    if agent_name == 'execution' and any(k.startswith('recovery_') for k in new_rules):
+        recovery_rules = {k:v for k,v in new_rules.items() if k.startswith('recovery_')}
+        update_agent_rules('position_manager', recovery_rules)
+        new_rules = {k:v for k,v in new_rules.items() if not k.startswith('recovery_')}
+        if not new_rules:return get_agent_rules()['position_manager']
+    if agent_name == 'position_manager' and new_rules.get('enabled') is False:
+        raise ValueError('Position Manager cannot be disabled while broker safety maintenance is required.')
+    if agent_name == 'performance_analyst' and 'minimum_closed_positions' in new_rules:
+        n=new_rules['minimum_closed_positions']
+        if isinstance(n,bool) or not isinstance(n,(int,float)) or not math.isfinite(n) or not float(n).is_integer() or not 5<=n<=1000:
+            raise ValueError('Review sample threshold must be an integer between 5 and 1000.')
+    merged = dict(current.get(agent_name, DEFAULT_AGENT_RULES.get(agent_name, {})))
     merged.update(new_rules)
     for key, value in new_rules.items():
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             if not math.isfinite(float(value)):
                 raise ValueError(f"{key} must be finite.")
-            if key in {"max_order_units", "max_order_spend_usd", "analysis_retention_days", "max_research_age_hours", "stop_atr_multiple", "target_reward_risk", "max_open_positions", "risk_per_trade_pct", "max_total_risk_pct", "max_gross_exposure_pct", "max_single_position_exposure_pct", "max_stressed_loss_pct", "max_sector_exposure_pct", "news_max_hold_hours", "mean_reversion_max_hold_hours", "conditional_mean_reversion_min_atr_multiple", "conditional_mean_reversion_confirmation_atr", "conditional_mean_reversion_stop_cushion_atr"} and float(value) <= 0:
+            if key in {"max_order_units", "max_order_spend_usd", "analysis_retention_days", "max_research_age_hours", "stop_atr_multiple", "target_reward_risk", "max_target_atr_multiple", "max_open_positions", "risk_per_trade_pct", "max_total_risk_pct", "max_gross_exposure_pct", "max_single_position_exposure_pct", "max_stressed_loss_pct", "max_sector_exposure_pct", "news_max_hold_hours", "mean_reversion_max_hold_hours", "conditional_mean_reversion_min_atr_multiple", "conditional_mean_reversion_confirmation_atr", "conditional_mean_reversion_stop_cushion_atr"} and float(value) <= 0:
                 raise ValueError(f"{key} must be greater than zero.")
             if key in {"stress_gap_pct", "estimated_roundtrip_cost_bps", "estimated_financing_annual_pct"} and float(value) < 0:
                 raise ValueError(f"{key} cannot be negative.")
@@ -1161,8 +1374,28 @@ def update_agent_rules(agent_name: str, new_rules: Dict[str, Any]) -> Dict[str, 
             raise ValueError(f"{key} must be a positive integer.")
     if int(merged.get("analysis_retention_days", 3)) > 365:
         raise ValueError("Analysis retention cannot exceed 365 days.")
+    if agent_name == "risk_manager":
+        value = merged.get('max_target_atr_multiple')
+        if isinstance(value, bool) or not isinstance(value, (int,float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError('max_target_atr_multiple must be finite and positive.')
+        if merged.get('structure_target_mode') not in {'nearest','range_boundary'}:
+            raise ValueError('Structure target mode must be nearest or range_boundary.')
+        for key, maximum in [('structure_range_months',12),('structure_range_weeks',52)]:
+            value=merged.get(key)
+            if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or not float(value).is_integer() or not 1<=value<=maximum:
+                raise ValueError(f'{key} must be an integer from 1 to {maximum}.')
+        shadow_tracking.validate_rules(merged)
     if agent_name == "risk_manager" and not merged.get("enabled", True):
         raise ValueError("Risk Manager is a required execution gate.")
+    if agent_name == 'position_manager':
+        for key,low,high in [('recovery_max_attempts',1,5),('recovery_initial_check_seconds',60,900),('recovery_max_check_seconds',300,7200),('recovery_escalate_hours',.25,72)]:
+            value=merged.get(key)
+            if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or not low<=value<=high:
+                raise ValueError(f'{key} must be between {low} and {high}.')
+        if not float(merged['recovery_max_attempts']).is_integer():
+            raise ValueError('Recovery attempt limit must be a whole number.')
+        if merged['recovery_max_check_seconds']<merged['recovery_initial_check_seconds']:
+            raise ValueError('Maximum recovery check interval must be at least the initial interval.')
     if agent_name == "execution" and any(side not in {"LONG", "SHORT"} for side in merged.get("allowed_side", [])):
         raise ValueError("Execution directions must be LONG and/or SHORT.")
 
@@ -1176,6 +1409,7 @@ def update_agent_rules(agent_name: str, new_rules: Dict[str, Any]) -> Dict[str, 
     return merged
 
 
+@permission('operator')
 def record_agent_event(
     agent_name: str,
     status: str,
@@ -1200,6 +1434,7 @@ def record_agent_event(
     conn.close()
 
 
+@permission('viewer')
 def get_agent_summary(start_at: Optional[str] = None, end_at: Optional[str] = None) -> List[Dict[str, Any]]:
     conn = get_connection()
     rules_map = {name: dict(rules) for name, rules in DEFAULT_AGENT_RULES.items()}
@@ -1266,9 +1501,11 @@ def get_agent_summary(start_at: Optional[str] = None, end_at: Optional[str] = No
     return summaries
 
 
-def add_user(username: str, password: str, is_admin: bool = False) -> bool:
+@permission('admin')
+def add_user(username: str, password: str, is_admin: bool = False, profile_role: Optional[str] = 'viewer') -> bool:
     if not username or not password or len(password) < 12:
         return False
+    if profile_role is not None and profile_role not in profile_access.ROLES:raise ValueError('Choose viewer, operator or owner.')
 
     conn = get_connection()
     try:
@@ -1276,10 +1513,13 @@ def add_user(username: str, password: str, is_admin: bool = False) -> bool:
         if existing:
             return False
 
-        conn.execute(
+        cursor=conn.execute(
             "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, ?)",
-            (username, hash_password(password), int(is_admin)),
+            (username.strip(), hash_password(password), int(is_admin)),
         )
+        if profile_role is not None:
+            conn.execute('INSERT INTO profile_memberships VALUES (1,?,?)',(cursor.lastrowid,profile_role))
+        access.audit(conn,'create_user',{'username':username.strip(),'is_admin':bool(is_admin),'profile_role':profile_role})
         conn.commit()
         return True
     finally:
@@ -1287,25 +1527,28 @@ def add_user(username: str, password: str, is_admin: bool = False) -> bool:
 
 
 def get_user_profile(username: str) -> Optional[Dict[str, Any]]:
+    access.require_self(username)
     conn = get_connection()
     row = conn.execute(
-        "SELECT username, created_at, avatar, is_admin FROM users WHERE username = ?",
+        "SELECT id, username, created_at, avatar, is_admin, is_active FROM users WHERE username = ?",
         (username,),
     ).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
+@permission('admin')
 def list_users() -> List[Dict[str, Any]]:
     conn = get_connection()
     rows = conn.execute(
-        "SELECT username, created_at, avatar, is_admin FROM users ORDER BY username COLLATE NOCASE"
+        "SELECT id, username, created_at, avatar, is_admin, is_active FROM users ORDER BY username COLLATE NOCASE"
     ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
 
 def update_user_avatar(username: str, avatar: str) -> None:
+    access.require_self(username)
     if avatar not in PROFILE_AVATARS:
         raise ValueError("Choose one of the available profile avatars.")
     conn = get_connection()
@@ -1317,11 +1560,12 @@ def update_user_avatar(username: str, avatar: str) -> None:
 
 
 def change_user_password(username: str, current_password: str, new_password: str) -> None:
+    access.require_self(username)
     if len(new_password) < 12:
         raise ValueError("New password must contain at least 12 characters.")
     conn = get_connection()
     row = conn.execute(
-        "SELECT password_hash FROM users WHERE username = ?",
+        "SELECT password_hash,is_active FROM users WHERE username = ?",
         (username,),
     ).fetchone()
     if not row or not verify_password(row["password_hash"], current_password):
@@ -1331,55 +1575,85 @@ def change_user_password(username: str, current_password: str, new_password: str
         "UPDATE users SET password_hash = ? WHERE username = ?",
         (hash_password(new_password), username),
     )
+    conn.execute('UPDATE auth_sessions SET revoked=1 WHERE username=?',(username,))
     conn.commit()
     conn.close()
 
 
+@permission('admin')
 def set_user_admin(username: str, is_admin: bool) -> None:
-    conn = get_connection()
-    row = conn.execute("SELECT is_admin FROM users WHERE username = ?", (username,)).fetchone()
-    if not row:
-        conn.close()
-        raise ValueError("User account was not found.")
-    if row["is_admin"] and not is_admin:
-        admin_count = conn.execute("SELECT COUNT(*) AS count FROM users WHERE is_admin = 1").fetchone()["count"]
-        if admin_count <= 1:
-            conn.close()
-            raise ValueError("The last admin cannot be demoted.")
-    conn.execute("UPDATE users SET is_admin = ? WHERE username = ?", (int(is_admin), username))
-    conn.commit()
-    conn.close()
+    conn=get_connection()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        row=conn.execute('SELECT id,is_admin,is_active FROM users WHERE username=?',(username,)).fetchone()
+        if not row:raise ValueError('User account was not found.')
+        if row['is_admin'] and row['is_active'] and not is_admin:
+            if conn.execute('SELECT count(*) FROM users WHERE is_admin=1 AND is_active=1').fetchone()[0]<=1:
+                raise ValueError('The last active platform admin cannot be demoted.')
+        conn.execute('UPDATE users SET is_admin=? WHERE id=?',(int(is_admin),row['id']))
+        access.audit(conn,'set_platform_admin',{'username':username,'is_admin':bool(is_admin)})
+        conn.commit()
+    finally:conn.close()
 
 
+def _protect_active_profile_owners(conn,user_id):
+    for profile in conn.execute("SELECT profile_id FROM profile_memberships WHERE user_id=? AND role='owner'",(user_id,)):
+        count=conn.execute("SELECT count(*) FROM profile_memberships m JOIN users u ON u.id=m.user_id WHERE m.profile_id=? AND m.role='owner' AND u.is_active=1 AND u.id<>?",(profile['profile_id'],user_id)).fetchone()[0]
+        if count==0:raise ValueError('Transfer profile ownership to another active user first.')
+
+
+@permission('admin')
+def set_user_suspended(username: str, suspended: bool, acting_username: Optional[str] = None) -> None:
+    actor=access.identity()
+    acting=actor['username'] if actor else acting_username
+    if suspended and username==acting:raise ValueError('You cannot suspend your own signed-in account.')
+    conn=get_connection()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        row=conn.execute('SELECT id,is_admin,is_active FROM users WHERE username=?',(username,)).fetchone()
+        if not row:raise ValueError('User account was not found.')
+        if suspended and row['is_active']:
+            if row['is_admin'] and conn.execute('SELECT count(*) FROM users WHERE is_admin=1 AND is_active=1').fetchone()[0]<=1:
+                raise ValueError('The last active platform admin cannot be suspended.')
+            _protect_active_profile_owners(conn,row['id'])
+        conn.execute('UPDATE users SET is_active=? WHERE id=?',(0 if suspended else 1,row['id']))
+        if suspended:conn.execute('UPDATE auth_sessions SET revoked=1 WHERE username=?',(username,))
+        access.audit(conn,'suspend_user' if suspended else 'reactivate_user',{'username':username})
+        conn.commit()
+    finally:conn.close()
+
+
+@permission('admin')
 def delete_user(username: str, acting_username: str) -> None:
-    if username == acting_username:
-        raise ValueError("You cannot delete your own account while signed in.")
-    conn = get_connection()
-    row = conn.execute("SELECT is_admin FROM users WHERE username = ?", (username,)).fetchone()
-    if not row:
-        conn.close()
-        raise ValueError("User account was not found.")
-    if row["is_admin"]:
-        admin_count = conn.execute("SELECT COUNT(*) AS count FROM users WHERE is_admin = 1").fetchone()["count"]
-        if admin_count <= 1:
-            conn.close()
-            raise ValueError("The last admin cannot be deleted.")
-    conn.execute("DELETE FROM auth_sessions WHERE username = ?", (username,))
-    conn.execute("DELETE FROM users WHERE username = ?", (username,))
-    conn.commit()
-    conn.close()
+    actor=access.identity();acting=actor['username'] if actor else acting_username
+    if username==acting:raise ValueError('You cannot delete your own account while signed in.')
+    conn=get_connection()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        row=conn.execute('SELECT id,is_admin,is_active FROM users WHERE username=?',(username,)).fetchone()
+        if not row:raise ValueError('User account was not found.')
+        if row['is_admin'] and row['is_active'] and conn.execute('SELECT count(*) FROM users WHERE is_admin=1 AND is_active=1').fetchone()[0]<=1:
+            raise ValueError('The last active platform admin cannot be deleted.')
+        if row['is_active']:_protect_active_profile_owners(conn,row['id'])
+        conn.execute('DELETE FROM auth_sessions WHERE username=?',(username,))
+        # Keep connection provenance even when a login is deleted.
+        conn.execute('UPDATE broker_connections SET owner_user_id=NULL WHERE owner_user_id=?',(row['id'],))
+        conn.execute('DELETE FROM users WHERE id=?',(row['id'],))
+        access.audit(conn,'delete_user',{'username':username});conn.commit()
+    finally:conn.close()
 
 
 def authenticate_user(username: str, password: str) -> bool:
+    access.login_verified(None)
     if not username or not password:
         return False
 
     conn = get_connection()
     user = conn.execute(
-        "SELECT password_hash FROM users WHERE username = ?",
+        "SELECT password_hash,is_active FROM users WHERE username = ?",
         (username,),
     ).fetchone()
-    if not user or not verify_password(user["password_hash"], password):
+    if not user or not user['is_active'] or not verify_password(user["password_hash"], password):
         conn.close()
         return False
     if not user["password_hash"].startswith("scrypt$"):
@@ -1389,10 +1663,12 @@ def authenticate_user(username: str, password: str) -> bool:
         )
         conn.commit()
     conn.close()
+    access.login_verified(username)
     return True
 
 
 def create_session_token(username: str) -> str:
+    access.require_login_ticket(username)
     now = int(time.time())
     token_id = secrets.token_urlsafe(24)
     header = {"alg": "HS256", "typ": "JWT"}
@@ -1400,6 +1676,9 @@ def create_session_token(username: str) -> str:
     encode = lambda value: base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).rstrip(b"=").decode()
     signing_input = f"{encode(header)}.{encode(payload)}"
     conn = get_connection()
+    active=conn.execute('SELECT is_active FROM users WHERE username=?',(username,)).fetchone()
+    if not active or not active['is_active']:
+        conn.close();raise PermissionError('Cannot create a session for an inactive account.')
     secret = conn.execute("SELECT value FROM app_settings WHERE key = 'auth_signing_key'").fetchone()["value"]
     conn.execute(
         "INSERT INTO auth_sessions (token_id, username, expires_at) VALUES (?, ?, ?)",
@@ -1420,11 +1699,11 @@ def validate_session_token(token: str) -> Optional[str]:
         conn = get_connection()
         secret_row = conn.execute("SELECT value FROM app_settings WHERE key = 'auth_signing_key'").fetchone()
         session = conn.execute(
-            "SELECT username, expires_at, revoked FROM auth_sessions WHERE token_id = ?",
+            "SELECT s.username,s.expires_at,s.revoked,u.is_active FROM auth_sessions s JOIN users u ON u.username=s.username WHERE s.token_id = ?",
             (payload["jti"],),
         ).fetchone()
         conn.close()
-        if not secret_row or not session or session["revoked"] or session["expires_at"] <= int(time.time()):
+        if not secret_row or not session or not session['is_active'] or session["revoked"] or session["expires_at"] <= int(time.time()):
             return None
         expected = hmac.new(secret_row["value"].encode(), signing_input.encode(), hashlib.sha256).digest()
         supplied = base64.urlsafe_b64decode(signature_part + "=" * (-len(signature_part) % 4))
@@ -1436,6 +1715,9 @@ def validate_session_token(token: str) -> Optional[str]:
 
 
 def revoke_session_token(token: str) -> None:
+    username=validate_session_token(token)
+    if not username:return
+    access.require_self(username)
     try:
         payload = json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "==="))
     except (IndexError, ValueError, json.JSONDecodeError):
@@ -1446,10 +1728,13 @@ def revoke_session_token(token: str) -> None:
     conn.close()
 
 
+@permission('operator')
 def record_trade_event(
     trade_id: int, stage: str, agent_name: str, status: str, decision: str,
     message: str, details: Optional[Dict[str, Any]] = None,
 ) -> None:
+    if stage in {'protection','reconciliation','recovery','exit','shadow'}:
+        agent_name = 'position_manager'
     conn = get_connection()
     conn.execute(
         "INSERT INTO trade_events (trade_id, stage, agent_name, status, decision, message, details) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1459,6 +1744,7 @@ def record_trade_event(
     conn.close()
 
 
+@permission('operator')
 def set_starting_capital(amount: float) -> None:
     if amount <= 0:
         raise ValueError("Starting capital must be greater than zero.")
@@ -1474,6 +1760,7 @@ def set_starting_capital(amount: float) -> None:
     conn.close()
 
 
+@permission('viewer')
 def get_portfolio_summary(as_of: Optional[str] = None) -> Dict[str, float]:
     conn = get_connection()
     starting = float(conn.execute("SELECT value FROM app_settings WHERE key = 'starting_capital'").fetchone()["value"])
@@ -1510,6 +1797,7 @@ def get_portfolio_summary(as_of: Optional[str] = None) -> Dict[str, float]:
     }
 
 
+@permission('viewer')
 def get_open_positions() -> List[Dict[str, Any]]:
     """Return open positions and broker-linked submissions awaiting final reconciliation."""
     conn = get_connection()
@@ -1525,6 +1813,7 @@ def get_open_positions() -> List[Dict[str, Any]]:
     return result
 
 
+@permission('viewer')
 def get_trade_history(start_at: Optional[str] = None, end_at: Optional[str] = None, *,
                       include_details: bool = True, trade_ids: Optional[List[int]] = None,
                       limit: Optional[int] = None, offset: int = 0) -> List[Dict[str, Any]]:
@@ -1555,7 +1844,17 @@ def get_trade_history(start_at: Optional[str] = None, end_at: Optional[str] = No
             pagination = " LIMIT ? OFFSET ?"
             parameters.extend([int(limit), int(offset)])
         trades = conn.execute(f"""SELECT t.*,
-            (SELECT MAX(prior.id) FROM trades prior WHERE UPPER(prior.symbol)=UPPER(t.symbol) AND prior.id<t.id) AS duplicate_of_trade_id
+            (SELECT architecture_version FROM position_management pm WHERE pm.trade_id=t.id) AS management_architecture,
+            (SELECT origin FROM position_management pm WHERE pm.trade_id=t.id) AS management_origin,
+            (SELECT MAX(prior.id) FROM trades prior WHERE UPPER(prior.symbol)=UPPER(t.symbol) AND prior.id<t.id) AS previous_analysis_trade_id,
+            (SELECT MAX(prior.id) FROM trades prior WHERE UPPER(prior.symbol)=UPPER(t.symbol) AND prior.side=t.side AND prior.id<t.id
+             AND (prior.broker_order_id IS NOT NULL OR prior.broker_position_id IS NOT NULL
+                  OR EXISTS(SELECT 1 FROM trade_events pe WHERE pe.trade_id=prior.id AND pe.stage='execution' AND pe.decision='submitted'))
+             AND ((prior.broker_order_id IS NOT NULL AND prior.broker_order_id=t.broker_order_id)
+                  OR (prior.broker_position_id IS NOT NULL AND prior.broker_position_id=t.broker_position_id)
+                  OR (prior.closed_at IS NOT NULL AND julianday(prior.closed_at)>=julianday(COALESCE(t.opened_at,t.created_at)))
+                  OR (prior.closed_at IS NULL AND prior.status IN ('SUBMITTING','SUBMITTED_PENDING_RECONCILIATION','OPEN','RECONCILIATION_REQUIRED','EXIT_PENDING')))
+            ) AS duplicate_of_trade_id
             FROM trades t {where} ORDER BY t.id DESC{pagination}""", parameters).fetchall()
         if not trades:
             return []
@@ -1581,7 +1880,9 @@ def get_trade_history(start_at: Optional[str] = None, end_at: Optional[str] = No
         for trade in trades:
             item = dict(trade)
             item["company_name"] = item.get("company_name") or INSTRUMENT_NAMES.get(item["symbol"], item["symbol"])
-            item["is_duplicate"] = item["duplicate_of_trade_id"] is not None
+            item["is_duplicate"] = item["duplicate_of_trade_id"] is not None and bool(
+                item.get('broker_order_id') or item.get('broker_position_id') or any(
+                    e['stage']=='execution' and e['decision']=='submitted' for e in by_trade.get(item['id'], [])))
             item["events"] = by_trade.get(item["id"], [])
             item["evidence_loaded"] = include_details
             if not include_details:
@@ -1616,6 +1917,9 @@ def get_trade_history(start_at: Optional[str] = None, end_at: Optional[str] = No
 VALIDATION_STAGE_FOR_STATUS = {
     "OPEN": "execution",
     "CLOSED": "execution",
+    "EXIT_PENDING": "execution",
+    "RECONCILIATION_REQUIRED": "execution",
+    "CLOSED_PNL_UNAVAILABLE": "execution",
     "REJECTED_RESEARCH": "research",
     "REJECTED_STRATEGY": "strategy",
     "REJECTED_RISK": "risk",
@@ -1624,10 +1928,16 @@ VALIDATION_STAGE_FOR_STATUS = {
 }
 
 
+@permission('operator')
 async def validate_trade_outcome(trade_id: int, max_days: int = 14) -> Dict[str, Any]:
+    """Compatibility API for Performance Analyst's on-demand historical analysis."""
+    return await PerformanceAnalystAgent().analyze_historical_path(trade_id,max_days)
+
+
+async def _analyze_historical_trade_path(trade_id: int, max_days: int = 14) -> Dict[str, Any]:
     conn = get_connection()
     trade = conn.execute(
-        "SELECT id, symbol, side, status, entry_price, stop_loss_price, take_profit_price "
+        "SELECT id, symbol, side, status, entry_price, stop_loss_price, take_profit_price, broker_position_id "
         "FROM trades WHERE id = ?",
         (trade_id,),
     ).fetchone()
@@ -1662,11 +1972,15 @@ async def validate_trade_outcome(trade_id: int, max_days: int = 14) -> Dict[str,
     result["validated_at"] = datetime.now(timezone.utc).isoformat()
     result["validation_type"] = "historical_trade_outcome"
     result["validation_scope"] = (
-        "executed_paper_trade" if trade["status"] in {"OPEN", "CLOSED"}
+        "broker_position_reference" if trade['broker_position_id'] else
+        "simulated_position_reference" if trade["status"] in {"OPEN", "CLOSED"}
         else "counterfactual_opportunity"
     )
     result["trade_status_at_validation"] = trade["status"]
     result["decision_stage"] = stage
+    result['reference_prices'] = {key:trade[key] for key in ('entry_price','stop_loss_price','take_profit_price')}
+    result['reference_timestamp'] = execution['created_at']
+    result['analysis_owner'] = 'performance_analyst'
     if result.get("available"):
         message = (
             f"Historical path checked over up to {result['window_days']} days using "
@@ -1679,15 +1993,16 @@ async def validate_trade_outcome(trade_id: int, max_days: int = 14) -> Dict[str,
     record_trade_event(
         trade_id,
         "validation",
-        "risk_manager",
+        "performance_analyst",
         status,
-        "pending",
+        "observed",
         message,
         result,
     )
     return result
 
 
+@permission('operator')
 async def validate_pending_trade_outcomes(
     min_age_days: float = 1,
     max_age_days: float = 18,
@@ -1744,9 +2059,10 @@ async def validate_pending_trade_outcomes(
     }
 
 
+@permission('operator')
 def close_paper_trade(trade_id: int, exit_price: float) -> bool:
     conn = get_connection()
-    trade = conn.execute("SELECT * FROM trades WHERE id = ? AND status IN ('OPEN','RECONCILIATION_REQUIRED')", (trade_id,)).fetchone()
+    trade = conn.execute("SELECT * FROM trades WHERE id = ? AND status IN ('OPEN','RECONCILIATION_REQUIRED','EXIT_PENDING')", (trade_id,)).fetchone()
     if not trade:
         conn.close()
         return False
@@ -1757,7 +2073,7 @@ def close_paper_trade(trade_id: int, exit_price: float) -> bool:
         (exit_price, pnl, trade_id),
     )
     conn.execute(
-        "INSERT INTO trade_events (trade_id, stage, agent_name, status, decision, message, details) VALUES (?, 'exit', 'execution', 'completed', 'accepted', ?, ?)",
+        "INSERT INTO trade_events (trade_id, stage, agent_name, status, decision, message, details) VALUES (?, 'exit', 'position_manager', 'completed', 'accepted', ?, ?)",
         (trade_id, f"Paper position closed at {exit_price:.4f}; realized P&L {pnl:.2f}.", json.dumps({"exit_price": exit_price, "realized_pnl": pnl})),
     )
     conn.commit()
@@ -1765,6 +2081,7 @@ def close_paper_trade(trade_id: int, exit_price: float) -> bool:
     return True
 
 
+@permission('viewer')
 def get_test_workflow_runs(limit: int = 10) -> List[Dict[str, Any]]:
     conn = get_connection()
     rows = conn.execute(
@@ -1812,6 +2129,7 @@ def _load_test_workflow(workflow_id: int) -> Optional[Dict[str, Any]]:
     return item
 
 
+@permission('operator')
 def sync_linked_test_workflows() -> None:
     conn = get_connection()
     rows = conn.execute("SELECT * FROM test_workflows WHERE status NOT IN ('FAILED','REJECTED_EXECUTION')").fetchall()
@@ -1857,6 +2175,7 @@ def get_sample_research_inputs() -> List[Dict[str, Any]]:
 
 
 @serialized_account
+@permission('operator')
 async def run_demo_test_workflow(symbol: str, amount: float = 10.0) -> Dict[str, Any]:
     """Replay saved research through the same durable order path as automation."""
     symbol = str(symbol or "").strip().upper()
@@ -1910,6 +2229,7 @@ async def run_demo_test_workflow(symbol: str, amount: float = 10.0) -> Dict[str,
             "reason": details["steps"][-1].get("error")}
 
 
+@permission('operator')
 async def reconcile_demo_test_workflow(workflow_id: int) -> Dict[str, Any]:
     workflow = _load_test_workflow(workflow_id)
     if not workflow:
@@ -1952,6 +2272,7 @@ async def reconcile_demo_test_workflow(workflow_id: int) -> Dict[str, Any]:
 
 
 @serialized_account
+@permission('operator')
 async def close_demo_test_workflow(workflow_id: int) -> Dict[str, Any]:
     workflow = _load_test_workflow(workflow_id)
     if not workflow or workflow.get("status") != "OPEN" or not workflow.get("broker_position_id"):
@@ -1970,14 +2291,31 @@ async def close_demo_test_workflow(workflow_id: int) -> Dict[str, Any]:
         for item in broker_positions.get("positions", [])
     ):
         raise ValueError("The test position is no longer present in the broker snapshot; refresh its state before closing.")
-    position = await asyncio.to_thread(adapter.close_position, workflow["broker_position_id"])
-    details = workflow["details"]
-    details.setdefault("steps", []).append({"name": "test_close", "status": "submitted", "response": position})
-    _update_test_workflow(workflow_id, "EXIT_PENDING", details)
-    return {"workflow_id": workflow_id, "status": "EXIT_PENDING", "close": position}
+    # Older fixture workflows predate linked trade lifecycles. Adopt the known
+    # broker position for recovery tracking; this records an existing fill,
+    # never submits another entry order.
+    position=next(p for p in broker_positions['positions'] if str(p.get('position_id'))==str(workflow['broker_position_id']))
+    c=get_connection()
+    existing=c.execute('SELECT id FROM trades WHERE broker_position_id=?',(str(workflow['broker_position_id']),)).fetchall();c.close()
+    if len(existing)>1:raise ValueError('Multiple lifecycles reference the test position; resolve its identity before closing.')
+    if existing:trade_id=existing[0]['id']
+    else:
+        trade_id=save_trade(workflow['symbol'],position['side'],float(position.get('leverage') or 1),1,'OPEN',
+            notes='Existing legacy test position adopted for durable close tracking; no new order submitted.',
+            entry_price=position['open_rate'],quantity=abs(float(position['units'])),
+            allocated_capital=float(position.get('amount') or 0),stop_loss_price=position.get('stop_loss_price'),take_profit_price=position.get('take_profit_price'))
+        c=get_connection();c.execute('UPDATE trades SET broker_position_id=?,broker_fill_price=?,broker_fill_units=?,policy_json=? WHERE id=?',
+            (str(workflow['broker_position_id']),position['open_rate'],abs(float(position['units'])),json.dumps({'test_workflow_id':workflow_id,'framework':'LEGACY_TEST_RECOVERY'}),trade_id));c.commit();c.close()
+    details=workflow['details'];details['trade_id']=trade_id
+    _update_test_workflow(workflow_id,'OPEN',details)
+    result=await request_etoro_demo_close.__wrapped__(int(trade_id))
+    sync_linked_test_workflows()
+    return {'workflow_id':workflow_id,'status':'EXIT_PENDING','close':result}
+
 
 
 @serialized_account
+@permission('operator')
 async def request_etoro_demo_close(trade_id: int) -> Dict[str, Any]:
     settings = IntegrationSettings.from_environment()
     if settings.broker_provider != "etoro" or not settings.etoro_demo_trading:
@@ -1991,23 +2329,15 @@ async def request_etoro_demo_close(trade_id: int) -> Dict[str, Any]:
     snapshot = await asyncio.to_thread(adapter.get_positions)
     if not snapshot.get("available") or not any(str(p.get("position_id")) == str(trade["broker_position_id"]) for p in snapshot.get("positions", [])):
         raise ValueError("The broker did not verify that this position is currently open.")
-    result = await asyncio.to_thread(adapter.close_position, str(trade["broker_position_id"]))
-    conn = get_connection()
-    conn.execute(
-        "UPDATE trades SET status = 'EXIT_PENDING', reconciliation_status = 'close_submitted' WHERE id = ?",
-        (trade_id,),
-    )
-    conn.commit()
-    conn.close()
-    record_trade_event(
-        trade_id, "exit", "execution", "submitted", "pending",
-        "Close request submitted to eToro demo; awaiting portfolio reconciliation.",
-        {"broker_close": result},
-    )
-    return result
+    position = next(p for p in snapshot['positions'] if str(p.get('position_id'))==str(trade['broker_position_id']))
+    manager=PositionManagerAgent().recovery_manager()
+    manager.import_legacy(dict(trade),position)
+    return await manager.request_close(dict(trade),position,adapter,'User requested closure; awaiting broker confirmation.')
+
 
 
 @serialized_account
+@permission('operator')
 async def update_etoro_demo_protection(
     trade_id: int, stop_loss_price: float, take_profit_price: float,
 ) -> Dict[str, Any]:
@@ -2054,9 +2384,9 @@ async def update_etoro_demo_protection(
     if side not in {"LONG", "SHORT"}:
         raise ValueError("The stored position direction is unavailable.")
 
-    result = await asyncio.to_thread(
-        adapter.modify_position, str(trade["broker_position_id"]), stop, target,
-    )
+    result = await PositionManagerAgent().recovery_manager().request_protection(dict(trade),position,adapter,stop,target,explicit=True)
+    if result.get('deduplicated'):
+        return {'status':'pending','stop_loss_price':stop,'take_profit_price':target,'response':result}
     policy = json.loads(trade["policy_json"] or "{}")
     signature = json.dumps(
         {"stop_loss_price": round(stop, 8), "take_profit_price": round(target, 8)},
@@ -2073,14 +2403,14 @@ async def update_etoro_demo_protection(
     )
     conn.commit()
     conn.close()
-    record_trade_event(
-        int(trade_id), "protection", "execution", "submitted", "pending",
-        f"User submitted stop loss {stop:.4f} and take profit {target:.4f} to eToro demo; broker verification is pending.",
-        {"stop_loss_price": stop, "take_profit_price": target, "broker_response": result},
-    )
-    return {"status": "submitted", "stop_loss_price": stop, "take_profit_price": target, "response": result}
+    if result.get('already_applied'):
+        conn=get_connection()
+        conn.execute("UPDATE trades SET status='OPEN',reconciliation_status='reconciled',stop_state='broker_reported_matches_requested' WHERE id=?",(trade_id,));conn.commit();conn.close()
+        record_trade_event(int(trade_id),'protection','position_manager','completed','accepted','Fresh broker snapshot already reports the requested protection; no PATCH was sent.',{'stop_loss_price':stop,'take_profit_price':target})
+    return {"status": "already_applied" if result.get('already_applied') else "submitted", "stop_loss_price": stop, "take_profit_price": target, "response": result}
 
 
+@permission('operator')
 def save_signal(sector: str, signal: str, catalyst: str, confidence: float, payload: Dict[str, Any]) -> None:
     conn = get_connection()
     conn.execute(
@@ -2091,6 +2421,7 @@ def save_signal(sector: str, signal: str, catalyst: str, confidence: float, payl
     conn.close()
 
 
+@permission('operator')
 def save_news_articles(articles: List[Dict[str, Any]]) -> Dict[str, int]:
     conn = get_connection()
     inserted = 0
@@ -2148,6 +2479,7 @@ def save_news_articles(articles: List[Dict[str, Any]]) -> Dict[str, int]:
     return {"inserted": inserted, "updated": updated}
 
 
+@permission('viewer')
 def get_news_articles(
     start_at: Optional[str] = None,
     end_at: Optional[str] = None,
@@ -2215,6 +2547,7 @@ def classify_research_headlines(
     return totals
 
 
+@permission('operator')
 def update_news_relevance(article_key: str, status: str, tickers: List[str], reason: str) -> None:
     conn = get_connection()
     conn.execute(
@@ -2225,6 +2558,7 @@ def update_news_relevance(article_key: str, status: str, tickers: List[str], rea
     conn.close()
 
 
+@permission('operator')
 async def run_hourly_news_fetch() -> Dict[str, int]:
     settings = IntegrationSettings.from_environment()
     if settings.news_provider not in {"yfinance", "yahoo", "yahoo_finance"}:
@@ -2266,6 +2600,7 @@ async def run_hourly_news_fetch() -> Dict[str, int]:
         return {"fetched": 0, "inserted": 0, "updated": 0}
 
 
+@permission('operator')
 def save_trade(
     symbol: str,
     side: str,
@@ -2296,6 +2631,7 @@ def save_trade(
     return trade_id
 
 
+@permission('operator')
 def save_risk_event(pnl: float, volatility: float, action: str, details: str) -> None:
     conn = get_connection()
     conn.execute(
@@ -2306,6 +2642,7 @@ def save_risk_event(pnl: float, volatility: float, action: str, details: str) ->
     conn.close()
 
 
+@permission('viewer')
 def get_dashboard_summary(start_at: Optional[str] = None, end_at: Optional[str] = None, *, include_details: bool = True) -> Dict[str, Any]:
     conn = get_connection()
     conditions = []
@@ -2613,6 +2950,56 @@ class StrategistAgent:
 
 
 class RiskManagerAgent:
+    def build_shadow_plan(self, risk, policy, instrument_id):
+        return shadow_tracking.build_plan(get_agent_rules()["risk_manager"], risk, policy, instrument_id)
+
+    def review_open_position_target(self, trade, position, quote, bars):
+        """Review a target-only change; existing stop and broker quantity stay fixed."""
+        from price_structure import multi_timeframe_structure, structure_target
+        result={'id':trade['id'],'symbol':trade['symbol'],'status':'skipped'}
+        if not is_fresh_etoro_quote(quote):
+            return {**result,'reason':'No fresh eToro quote'}
+        policy=json.loads(trade.get('policy_json') or '{}')
+        if policy.get('framework') == 'CONDITIONAL_MEAN_REVERSION':
+            return {**result,'reason':'Mean-reversion anchor target retained'}
+        rules=get_agent_rules()['risk_manager']
+        if not rules.get('structure_targets_enabled',True):
+            return {**result,'reason':'Structure targets disabled'}
+        structure=multi_timeframe_structure(bars)
+        if not structure.get('available'):
+            return {**result,'reason':structure.get('reason','Structure unavailable')}
+        side=trade['side']
+        if side not in {'LONG','SHORT'} or position.get('side',side)!=side:
+            return {**result,'reason':'Position direction unavailable or inconsistent'}
+        sign=1 if side=='LONG' else -1
+        entry=float(position['open_rate']); units=abs(float(position['units']))
+        stop=float(position['stop_loss_price']); old=float(position['take_profit_price'])
+        mark=float(quote['bid' if side=='LONG' else 'ask'])
+        atr=float(bars.iloc[-1]['atr14'])
+        source_atr=float(policy.get('atr14') or atr)
+        captured=json.loads(trade.get('config_json') or '{}').get('risk_manager') or rules
+        baseline=entry+sign*source_atr*min(float(captured.get('stop_atr_multiple',2))*float(captured.get('target_reward_risk',1.5)), float(rules.get('max_target_atr_multiple',3)))
+        target,evidence=structure_target(side,entry,baseline,atr,structure,
+            mode=rules.get('structure_target_mode','range_boundary'),
+            range_months=rules.get('structure_range_months',1),range_weeks=rules.get('structure_range_weeks',4))
+        result.update(entry=entry,current_price=mark,stop=stop,old_target=old,new_target=target,
+            baseline_target=baseline,baseline_atr=source_atr,
+            baseline_atr_source='entry-time policy' if policy.get('atr14') else 'current completed bars; entry-time ATR unavailable',evidence=evidence)
+        if not all(math.isfinite(v) and v>0 for v in [entry,units,stop,old,mark,atr,source_atr,target]):
+            return {**result,'reason':'Invalid broker or market fields'}
+        hours=float(policy.get('holding_hours',48))
+        opened=position.get('opened_at') or trade.get('opened_at')
+        if opened and policy.get('holding_hours') and datetime.now(timezone.utc)>=shadow_tracking.timestamp(opened)+timedelta(hours=hours):
+            return {**result,'reason':'Existing thesis holding limit has expired; no target extension'}
+        cost_per_unit=entry*(float(rules.get('estimated_roundtrip_cost_bps',10))/10000+float(rules.get('estimated_financing_annual_pct',8))/100*hours/8760)+max(0,float(trade.get('broker_fees') or 0))/units
+        reward=sign*(target-entry); risk=max(0,sign*(entry-stop))
+        result.update(estimated_net_profit=units*(reward-cost_per_unit),net_reward_risk=(reward-cost_per_unit)/risk if risk else None)
+        if sign*(mark-stop)<=0 or sign*(target-mark)<=max(.01,.05*atr) or reward<=cost_per_unit:
+            return {**result,'reason':'Target fails current-price clearance, unchanged-stop or positive net profit check'}
+        if abs(target-old)<max(.01,abs(old)*.00001):
+            return {**result,'status':'unchanged','reason':'Broker target already matches the range rule'}
+        return {**result,'status':'eligible','reason':'Fresh range target passes existing-position checks; stop preserved'}
+
     def review_news_demo_candidate(
         self,
         *,
@@ -2715,6 +3102,7 @@ class RiskManagerAgent:
                     execution_rules={**execution_rules, "observed_spread": max(0, float(quote.get("ask") or 0)-float(quote.get("bid") or 0))},
                     multiplier=risk_budget_multiplier,
                     setup=strategy.get("decision_gate", {}).get("conditional_mean_reversion"),
+                    structure=daily_trend.get("price_structure") if rules.get("structure_targets_enabled", True) else None,
                 )
                 execution_reasons.extend(sized.pop("execution_reasons"))
                 forecast = (candidate.get("ai_analysis") or {}).get("forecast_horizon_hours")
@@ -2812,6 +3200,83 @@ class RiskManagerAgent:
         }
 
 
+class PositionManagerAgent:
+    """Owns held positions, protection, reconciliation, recovery and exit actions."""
+    @serialized_account
+    async def manage(self, settings=None):
+        return await _manage_etoro_demo_positions(settings)
+
+    def audit_configuration(self):
+        access.require_profile('operator')
+        result=TradeConfigurationAuditor().audit_all_trades()
+        conn=get_connection()
+        try:
+            cursor=conn.execute('INSERT INTO configuration_audits(created_at,evidence) VALUES (?,?)',(result['timestamp'],json.dumps(result,sort_keys=True)))
+            conn.commit();result['audit_id']=cursor.lastrowid
+        finally:conn.close()
+        record_agent_event('position_manager','completed','configuration_audit',
+            f"Configuration audit: {result['total_trades_audited']} checked, {result['trades_with_issues']} with issues (latest 50 eligible).",
+            'attention' if result['trades_with_issues'] else 'observed',{'audit_id':result['audit_id'],'trades_with_issues':result['trades_with_issues']})
+        return result
+
+    def audit_configuration_if_due(self):
+        conn=get_connection()
+        try:row=conn.execute('SELECT created_at FROM configuration_audits ORDER BY id DESC LIMIT 1').fetchone()
+        finally:conn.close()
+        if row and time.time()-performance_analysis.stamp(row['created_at']).timestamp()<86400:return None
+        return self.audit_configuration()
+
+    def recovery_manager(self):
+        access.require_profile('operator')
+        return broker_recovery.RecoveryManager(get_connection, record_trade_event, get_agent_rules()['position_manager'])
+
+    async def get_position_quote(self, adapter, position):
+        """Quote a verified held instrument without repeating symbol discovery."""
+        access.require_profile('operator')
+        instrument_id=position.get('instrument_id')
+        if instrument_id is None:
+            return {'available':False,'reason':'Verified position instrument ID unavailable'}
+        try:
+            rate=await asyncio.to_thread(adapter._get_rate,int(instrument_id))
+            bid=float(rate['bid']);ask=float(rate['ask'])
+            if not math.isfinite(bid) or not math.isfinite(ask) or not 0<bid<=ask:
+                raise ValueError('Invalid executable bid/ask')
+            return {'available':True,'provider':'eToro','instrument_id':str(instrument_id),
+                'bid':bid,'ask':ask,'price':(bid+ask)/2,
+                'fetched_at':datetime.now(timezone.utc).isoformat(),
+                'source':'eToro verified held instrument ID'}
+        except Exception as error:
+            return {'available':False,'reason':f'Position quote unavailable: {type(error).__name__}'}
+
+    async def observe_shadow_exits(self, adapter):
+        access.require_profile('operator')
+        # Runs under the same account lease as normal position maintenance.
+        conn = get_connection()
+        instruments = [r[0] for r in conn.execute("SELECT DISTINCT instrument_id FROM shadow_exits WHERE status='ACTIVE'")]
+        conn.close()
+        completed = []
+        unavailable = []
+        for instrument_id in instruments:
+            try:
+                rate = await asyncio.to_thread(adapter._get_rate, int(instrument_id))
+                if not isinstance(rate, dict):
+                    continue
+                conn = get_connection()
+                try:
+                    completed.extend(shadow_tracking.observe(conn, instrument_id, rate))
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception as error:
+                unavailable.append(instrument_id)
+                logger.warning("Shadow quote unavailable for %s: %s", instrument_id, type(error).__name__)
+        for event in completed:
+            record_trade_event(event['trade_id'], 'shadow', 'position_manager', 'completed', 'observed',
+                f"Shadow {event['variant']} / {event['horizon_hours']:g}h: {event['status']}; no broker order sent.", event)
+        return {'completed': len(completed), 'unavailable_instruments': unavailable}
+
+
+
 class ExecutionAgent:
     def review_news_demo_candidate(
         self,
@@ -2825,6 +3290,8 @@ class ExecutionAgent:
         """Evaluate demo execution readiness without using historical evaluation as a lock."""
         rules = get_agent_rules().get("execution", DEFAULT_AGENT_RULES["execution"])
         reasons = []
+        weekend_reason=weekend_entry_block_reason()
+        if weekend_reason:reasons.append(weekend_reason)
         if not bool(rules.get("enabled", True)):
             reasons.append("Execution Agent is disabled.")
         if not strategy.get("decision_gate", {}).get("accepted"):
@@ -3214,7 +3681,7 @@ def calculate_candidate_success_score(
     }
 
 
-class OverwatcherAgent:
+class TradeConfigurationAuditor:
     """Validates agent configurations are correctly applied and monitors trade health."""
     
     def __init__(self):
@@ -3307,17 +3774,19 @@ class OverwatcherAgent:
         
         return checks
     
-    def audit_trade(self, trade_id: int) -> None:
+    def audit_trade(self, trade_id: int) -> Dict[str, Any]:
         """Log trade validation results to audit log."""
         result = self.validate_trade_configuration(trade_id)
         with open(self.audit_log_path, "a") as f:
             f.write(json.dumps(result) + "\n")
+        return result
     
     def audit_all_trades(self) -> Dict[str, Any]:
         """Audit all OPEN and recently CLOSED trades."""
+        access.require_profile('operator')
         conn = get_connection()
         trades = conn.execute(
-            "SELECT id FROM trades WHERE status IN ('OPEN', 'CLOSED', 'RECONCILIATION_REQUIRED', 'EXIT_PENDING') ORDER BY created_at DESC LIMIT 50"
+            "SELECT id FROM trades WHERE status IN ('OPEN', 'CLOSED', 'CLOSED_PNL_UNAVAILABLE', 'RECONCILIATION_REQUIRED', 'EXIT_PENDING') ORDER BY created_at DESC,id DESC LIMIT 50"
         ).fetchall()
         conn.close()
         
@@ -3325,12 +3794,14 @@ class OverwatcherAgent:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "total_trades_audited": len(trades),
             "audit_log_file": str(self.audit_log_path),
-            "trades_audited": []
+            "trades_audited": [], "results": [], "scope": "latest_50_eligible_trades"
         }
         
         for trade in trades:
-            self.audit_trade(trade["id"])
+            result = self.audit_trade(trade["id"])
+            summary["results"].append(result)
             summary["trades_audited"].append(trade["id"])
+        summary['trades_with_issues'] = sum(bool(r.get('issues')) for r in summary['results'])
         
         # Log summary
         with open(self.audit_log_path, "a") as f:
@@ -3338,6 +3809,10 @@ class OverwatcherAgent:
         
         logger.info(f"Audit complete: {len(trades)} trades audited. Log: {self.audit_log_path}")
         return summary
+
+
+# Compatibility name for external scripts; audits are owned by Position Manager.
+OverwatcherAgent = TradeConfigurationAuditor
 
 
 def _parse_risk_setting(name: str, default: float) -> float:
@@ -3436,6 +3911,7 @@ def reconciliation_blocks_new_order(trade: Dict[str, Any]) -> bool:
     return not known_position_mismatch
 
 
+@permission('operator')
 def reconcile_news_demo_positions(positions: List[Dict[str, Any]]) -> Dict[str, int]:
     """Reconcile local demo lifecycles to a verified broker positions list."""
     conn = get_connection()
@@ -3518,10 +3994,25 @@ def reconcile_news_demo_positions(positions: List[Dict[str, Any]]) -> Dict[str, 
             else "broker_stop_differs_from_requested_stop" if not stop_matches
             else "unexpected_broker_take_profit"
         )
+        policy["broker_observation"] = {
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "provider": "eToro", "position_id": str(position_id),
+            "units": float(fill_units), "entry_price": float(fill_price),
+            "current_price": position.get("current_rate"),
+            "quote_observed_at": position.get("quote_observed_at"),
+            "margin": position.get("amount"), "leverage": position.get("leverage"),
+            "reported_running_pnl": position.get("unrealized_pnl"),
+            "reported_fees": position.get("fees"),
+        }
+        conn.execute("INSERT OR IGNORE INTO position_management VALUES (?,?,?,?)", (trade['id'],performance_analysis.VERSION,datetime.now(timezone.utc).isoformat(),'verified_fill'))
+        created = shadow_tracking.initialize(conn, {**trade, "policy_json": json.dumps(policy)}, position)
+        if created:
+            conn.execute("INSERT INTO trade_events (trade_id,stage,agent_name,status,decision,message,details) VALUES (?,'shadow','position_manager','completed','observed',?,?)", (trade['id'], f'Initialized {created} prospective shadow exits from the verified fill; actual order unchanged.', json.dumps({'rows':created,'plan_version':1})))
+        conn.execute("UPDATE trades SET policy_json=? WHERE id=?", (json.dumps(policy),trade["id"]))
         conn.execute(
-            "UPDATE trades SET status = ?, broker_position_id = ?, broker_fill_price = ?, broker_fill_units = ?, entry_price = ?, quantity = ?, current_price = ?, broker_fees = COALESCE(?, broker_fees), reconciliation_status = ?, stop_state = ?, allocated_capital=COALESCE(?,allocated_capital), notes=CASE WHEN ?='OPEN' THEN 'eToro demo position confirmed from the broker portfolio; fill, quantity and protection were reconciled.' ELSE notes END WHERE id = ?",
+            "UPDATE trades SET status = ?, broker_position_id = ?, broker_fill_price = ?, broker_fill_units = ?, entry_price = ?, quantity = ?, current_price = COALESCE(?,current_price), broker_fees = COALESCE(?, broker_fees), reconciliation_status = ?, stop_state = ?, allocated_capital=COALESCE(?,allocated_capital), notes=CASE WHEN ?='OPEN' THEN 'eToro demo position confirmed from the broker portfolio; fill, quantity and protection were reconciled.' ELSE notes END WHERE id = ?",
             (status, str(position_id), float(fill_price), float(fill_units), float(fill_price), float(fill_units),
-             position.get("current_rate") or fill_price, position.get("fees"),
+             position.get("current_rate"), position.get("fees"),
              reconciliation_reason,
              "broker_reported_matches_requested" if stop_matches else "stop_not_confirmed", position.get("amount"), status, trade["id"]),
         )
@@ -3531,7 +4022,7 @@ def reconcile_news_demo_positions(positions: List[Dict[str, Any]]) -> Dict[str, 
     conn.commit()
     conn.close()
     for trade_id, decision, message in event_messages:
-        record_trade_event(trade_id, "reconciliation", "execution", "completed", decision, message, {})
+        record_trade_event(trade_id, "reconciliation", "position_manager", "completed", decision, message, {})
     return counts
 
 
@@ -3601,6 +4092,7 @@ def news_candidate_lifecycle_status(
     return "ANALYSIS_ONLY"
 
 
+@permission('operator')
 async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] = None) -> Dict[str, Any]:
     """Discover news, run every agent gate, and submit eligible automated demo orders."""
     settings = settings or IntegrationSettings.from_environment()
@@ -3720,7 +4212,7 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
         } for article in headlines]
         quote_price = quote.get("ask") or quote.get("price")
         try:
-            bars = await asyncio.to_thread(load_daily_bars, ticker, "1y")
+            bars = await asyncio.to_thread(load_daily_bars, ticker, "5y")
         except Exception as error:
             logger.info("Historical price context unavailable for %s: %s", ticker, type(error).__name__)
             bars = None
@@ -4053,8 +4545,12 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
 
 
 @serialized_account
+@permission('operator')
 async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
     """Submit one explicitly confirmed, freshly rechecked analysis candidate to eToro demo."""
+    weekend_reason=weekend_entry_block_reason()
+    if weekend_reason:raise ValueError(weekend_reason)
+
     settings = IntegrationSettings.from_environment()
     if settings.broker_provider != "etoro" or not settings.etoro_demo_trading:
         raise ValueError("Manual orders are available only for the configured eToro demo account.")
@@ -4113,7 +4609,7 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
            for pos in snapshot.get("positions", [])):
         raise ValueError("An eToro position already exists for this symbol.")
     bars, fundamentals, reaction = await asyncio.gather(
-        asyncio.to_thread(load_daily_bars, symbol, "1y"),
+        asyncio.to_thread(load_daily_bars, symbol, "5y"),
         fetch_company_fundamentals(symbol),
         asyncio.to_thread(load_news_reaction, symbol, articles),
     )
@@ -4213,8 +4709,8 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
         risk["estimated_costs"] += opening_cost
         risk["estimated_total_spend"] += opening_cost
         risk["estimated_net_target_profit"] -= opening_cost
-        if risk["estimated_net_target_profit"] <= 0:
-            raise ValueError("Broker costs leave no estimated positive target payoff.")
+        if risk["estimated_net_target_profit"] <= 0 or (risk.get("protection", {}).get("target_selection", {}).get("adjusted") and risk["estimated_net_target_profit"] / risk["planned_stop_risk"] < float(get_agent_rules()["risk_manager"].get("minimum_reward_risk", 1))):
+            raise ValueError("Broker costs leave insufficient net target payoff or net reward/risk.")
     required_margin = units * float(entry) / leverage
     cash = account.get("cash_available")
     if cash is None or float(cash) < required_margin + risk["estimated_costs"]:
@@ -4227,12 +4723,18 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
               "research_prompt_version": "news_reaction_v2",
               "test_workflow_id": candidate.get("test_workflow_id"), "framework": strategy["decision_gate"].get("strategy_framework") or "DIRECTIONAL_NEWS",
               "holding_hours": risk["holding_hours"], "sizing": risk["sizing"],
-              "estimated_costs": risk["estimated_costs"], "atr14": atr14,
+              "estimated_costs": risk["estimated_costs"], "cost_assumptions": risk.get("cost_assumptions", {}), "atr14": atr14,
               "broker_cost_evidence": cost_evidence,
               "market_session_context": market_session_context,
               "requested_entry": entry, "stop_offset": risk["proposed_stop"]-entry,
               "target_offset": risk["proposed_take_profit"]-entry,
+              "target_selection": risk.get("protection", {}).get("target_selection", {}),
               "mean_reversion": strategy["decision_gate"].get("conditional_mean_reversion") or {}}
+    plan = RiskManagerAgent().build_shadow_plan(risk, policy, instrument['instrument_id'])
+    if plan:
+        policy['shadow_plan'] = plan
+    weekend_reason=weekend_entry_block_reason()
+    if weekend_reason:raise ValueError(weekend_reason)
     conn = get_connection()
     cursor = conn.execute(
         "UPDATE trades SET status='SUBMITTING', side=?, entry_price=?, current_price=?, quote_provider=?, quote_timestamp=?, quantity=?, leverage=?, stop_loss_price=?, take_profit_price=?, allocated_capital=?, strategy_version=?, policy_json=?, config_json=?, order_reference=? WHERE id=? AND status IN ('ANALYSIS_ONLY','DEFERRED_CAPACITY')",
@@ -4246,7 +4748,7 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
         raise ValueError("This candidate has already been submitted or changed; refresh the lifecycle.")
 
     record_trade_event(trade_id, "strategy", "strategist", "completed", "accepted",
-                       "Fresh manual demo-order strategy recheck passed.", {**strategy, "candidate_context": candidate})
+                       "Fresh demo-order strategy recheck passed.", {**strategy, "candidate_context": candidate})
     record_trade_event(trade_id, "risk", "risk_manager", "completed", "accepted",
                        "Fresh account, positions, quote, ATR, sizing, and stop checks passed.", risk)
     attempted_submission = False
@@ -4294,9 +4796,12 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
         if email_result.get("status") == "sent":
             record_trade_event(
                 trade_id, "notification", "execution", "completed", "accepted",
-                "Successful demo-order lifecycle email sent to the configured recipient(s).",
+                "SMTP server accepted the demo-order notification for all configured recipients; inbox delivery is unconfirmed.",
                 email_result,
             )
+        elif email_result.get('status') == 'partial':
+            record_trade_event(trade_id, 'notification', 'execution', 'completed', 'partial',
+                'SMTP server accepted some recipients and refused others; inspect notification evidence.', email_result)
     except Exception as error:
         # Notification delivery must never change a broker-acknowledged order
         # into an execution failure or encourage a duplicate submission.
@@ -4320,6 +4825,7 @@ async def _run_retired_etoro_trend_cycle(settings: Optional[IntegrationSettings]
     raise ValueError("The SMA-only order path is retired; use the active news workflow.")
 
 
+@permission('operator')
 async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]:
     ai_enabled = get_ai_research_enabled() if use_openai is None else use_openai
     settings = IntegrationSettings.from_environment()
@@ -4893,8 +5399,105 @@ async def maintenance_loop() -> None:
             logger.info("Account maintenance will retry after the current operation.")
         except Exception:
             logger.exception("Maintenance failed; retrying next minute")
-        await asyncio.sleep(60)
+        # Wake locally every minute so configuration changes and weekday transitions
+        # do not wait out a fifteen-minute sleep; external work has its own due time.
+        elapsed=0
+        while elapsed<position_maintenance_interval():
+            await asyncio.sleep(60)
+            elapsed+=60
 
+
+
+
+@permission('admin')
+def get_storage_backup_status():
+    from s3_backup import BackupSettings,read_status
+    settings=BackupSettings.from_environment()
+    result={'configuration':settings.public(),'status':read_status(settings)}
+    conn=get_connection()
+    try:result['restore']={r['key']:r['value'] for r in conn.execute("SELECT key,value FROM app_settings WHERE key IN ('backup_restored_at','backup_restored_from')")}
+    finally:conn.close()
+    return result
+
+
+@permission('admin')
+def backup_database_now():
+    from s3_backup import BackupSettings,S3SQLiteBackup
+    settings=BackupSettings.from_environment()
+    if not settings.enabled:raise ValueError('S3 backups are disabled in environment configuration.')
+    backup=S3SQLiteBackup(settings)
+    uploaded=backup.create_snapshot()
+    return {'uploaded':uploaded,'verified':backup.verify_latest()}
+
+
+@permission('admin')
+def verify_database_backup():
+    from s3_backup import BackupSettings,S3SQLiteBackup
+    settings=BackupSettings.from_environment()
+    if not settings.enabled:raise ValueError('S3 backups are disabled in environment configuration.')
+    return S3SQLiteBackup(settings).verify_latest()
+
+@permission('viewer')
+def get_managed_positions():
+    conn=get_connection()
+    try:
+        return [dict(r) for r in conn.execute("""SELECT t.id,t.symbol,t.side,t.status,t.broker_position_id,
+            t.stop_loss_price,t.take_profit_price,t.reconciliation_status,t.stop_state,
+            pm.architecture_version,pm.origin,pm.adopted_at
+            FROM position_management pm JOIN trades t ON t.id=pm.trade_id
+            WHERE t.status IN ('OPEN','EXIT_PENDING','RECONCILIATION_REQUIRED','SUBMITTED_PENDING_RECONCILIATION')
+            ORDER BY t.id DESC""")]
+    finally:conn.close()
+
+
+@permission('viewer')
+def get_configuration_audits(limit=20):
+    conn=get_connection()
+    try:return [{**dict(r),'evidence':json.loads(r['evidence'])} for r in conn.execute('SELECT * FROM configuration_audits ORDER BY id DESC LIMIT ?',(limit,))]
+    finally:conn.close()
+
+
+@permission('viewer')
+def get_historical_path_analyses(limit=50):
+    conn=get_connection()
+    try:return [{**dict(r),'details':json.loads(r['details'])} for r in conn.execute("""SELECT e.*,t.symbol FROM trade_events e JOIN trades t ON t.id=e.trade_id
+        WHERE e.stage='validation' AND json_extract(e.details,'$.validation_type')='historical_trade_outcome'
+        ORDER BY e.id DESC LIMIT ?""",(limit,))]
+    finally:conn.close()
+
+@permission('viewer')
+def get_performance_reviews(limit=30):
+    conn=get_connection()
+    try:return performance_analysis.list_reviews(conn,limit)
+    finally:conn.close()
+
+
+class PerformanceAnalystAgent(performance_analysis.PerformanceAnalystAgent):
+    def run_due(self,now=None):
+        access.require_profile('operator')
+        return super().run_due(now)
+
+    async def analyze_historical_path(self,trade_id,max_days=14):
+        access.require_profile('operator')
+        return await _analyze_historical_trade_path(trade_id,max_days)
+
+    def __init__(self):
+        super().__init__(get_connection,get_agent_rules()['performance_analyst'])
+
+
+async def performance_review_loop():
+    while True:
+        try:
+            async with workflow_store.lease(get_connection,'performance_reviews'):
+                for report in PerformanceAnalystAgent().run_due():
+                    record_agent_event('performance_analyst','completed',report['cadence']+'_review',
+                        f"Advisory review saved: {report['summary']['closed_positions']} confirmed closures; no rules or orders changed.",
+                        'observed',report)
+        except workflow_store.AccountBusy:
+            pass
+        except Exception:
+            logger.exception('Performance review failed; retrying in fifteen minutes')
+        await asyncio.sleep(900)
 
 async def heartbeat_loop() -> None:
     while True:
@@ -4911,15 +5514,14 @@ async def main() -> None:
     ensure_db()
     settings = IntegrationSettings.from_environment()
     maintenance = asyncio.create_task(maintenance_loop())
+    analyst = asyncio.create_task(performance_review_loop())
     heartbeat = asyncio.create_task(heartbeat_loop())
-    last_news_fetch = 0.0
     try:
         while True:
-            if heartbeat.done() or maintenance.done():
+            if heartbeat.done() or maintenance.done() or analyst.done():
                 raise RuntimeError("A required worker task exited; supervisor must restart the worker.")
             now = time.monotonic()
-            if now-last_news_fetch >= settings.news_interval_seconds:
-                last_news_fetch = now
+            if claim_due_news_fetch(settings.news_interval_seconds):
                 try:
                     await run_hourly_news_fetch()
                 except Exception:
@@ -4932,9 +5534,10 @@ async def main() -> None:
                     logger.exception("Scheduled research cycle failed")
             await asyncio.sleep(min(10, settings.news_interval_seconds))
     finally:
+        analyst.cancel()
         maintenance.cancel()
         heartbeat.cancel()
-        await asyncio.gather(maintenance, heartbeat, return_exceptions=True)
+        await asyncio.gather(maintenance, heartbeat, analyst, return_exceptions=True)
 
 
 if __name__ == "__main__":

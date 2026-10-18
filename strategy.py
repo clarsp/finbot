@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, Optional
 
 import pandas as pd
 import yfinance as yf
+from price_structure import multi_timeframe_structure
 
 
 STRATEGY_VERSION = "news_reaction_v2"
@@ -88,6 +89,7 @@ def evaluate_latest_signal(symbol: str, bars: pd.DataFrame) -> Dict[str, Any]:
         "sma50": sma50 if math.isfinite(sma50) and sma50 > 0 else None,
         "sma200": sma200 if math.isfinite(sma200) and sma200 > 0 else None,
         "atr14": atr14 if math.isfinite(atr14) and atr14 > 0 else None,
+        "price_structure": multi_timeframe_structure(bars),
     }
     if base["close"] is None or base["atr14"] is None:
         return {**base, "available": False, "trend_state": "unknown", "reason": "Daily close or ATR14 data is invalid."}

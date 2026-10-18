@@ -139,11 +139,15 @@ class DatabaseTests(unittest.TestCase):
         self.stack.enter_context(patch.object(app,'DB_PATH',Path(self.temp.name)/'finbot.db'))
         self.stack.enter_context(patch.dict(os.environ,{'FINBOT_PASSWORD':'test-only-password','FINBOT_USERNAME':'admin'}))
         app.ensure_db()
+        # Entry-path fixtures explicitly allow weekends; scheduler tests cover the default restriction.
+        app.configure_research_schedule('manual',60,weekend_trading_enabled=True)
         self.rules=copy.deepcopy(app.DEFAULT_AGENT_RULES)
         self.stack.enter_context(patch.object(app,'get_agent_rules',return_value=self.rules))
         self.settings=types.SimpleNamespace(broker_provider='etoro',etoro_demo_trading=True,openai_api_key='')
         self.stack.enter_context(patch.object(app.IntegrationSettings,'from_environment',return_value=self.settings))
         self.adapter=MagicMock()
+        self.adapter.close_position.return_value={"order_id":"close-1"}
+        self.adapter.modify_position.return_value={"operationId":"patch-1"}
         self.adapter.get_account_snapshot.return_value={'available':True,'equity':10000,'cash_available':10000}
         self.adapter.get_positions.return_value={'available':True,'positions':[]}
         self.adapter.resolve_instrument.return_value={'instrument_id':'1','currency':'USD','tradeable':True,'supported_asset':True,'buy_enabled':True,'short_enabled':True}
@@ -295,9 +299,10 @@ class DatabaseTests(unittest.TestCase):
         for side,mark,stop,target in [('LONG',107,96,106),('SHORT',93,104,94)]:
             tid=self.trade('bullish' if side=='LONG' else 'bearish')
             policy={'fill_adjusted':True,'holding_hours':48}
-            self.update(tid,status='OPEN',side=side,broker_position_id='p',broker_order_id='o',strategy_version=workflow.VERSION,
+            position_id='p-'+side.lower()
+            self.update(tid,status='OPEN',side=side,broker_position_id=position_id,broker_order_id='o',strategy_version=workflow.VERSION,
                         policy_json=json.dumps(policy),config_json=json.dumps(self.rules),stop_loss_price=stop,take_profit_price=target)
-            self.adapter.get_positions.return_value={'available':True,'positions':[dict(position_id='p',instrument_id='1',side=side,
+            self.adapter.get_positions.return_value={'available':True,'positions':[dict(position_id=position_id,instrument_id='1',side=side,
                 units=1,amount=50,open_rate=100,current_rate=mark,stop_loss_price=stop,take_profit_price=target)]}
             self.adapter._get_rate.return_value={'bid':mark,'ask':mark}
             asyncio.run(app.manage_etoro_demo_positions(self.settings))
@@ -312,7 +317,9 @@ class DatabaseTests(unittest.TestCase):
             amount=50,open_rate=100,current_rate=100,stop_loss_price=96,take_profit_price=600)]}
         self.adapter.modify_position.return_value={'accepted':True}
         asyncio.run(app.manage_etoro_demo_positions(self.settings))
-        self.adapter.modify_position.assert_called_once_with('p',96.0,106.0)
+        self.adapter.modify_position.assert_called_once()
+        self.assertEqual(self.adapter.modify_position.call_args.args,('p',96.0,106.0))
+        self.assertTrue(self.adapter.modify_position.call_args.kwargs['request_id'])
         self.assertEqual(self.row(tid)['status'],'RECONCILIATION_REQUIRED')
 
     def test_unknown_order_resolves_by_persisted_reference_without_resubmission(self):
@@ -321,6 +328,24 @@ class DatabaseTests(unittest.TestCase):
         asyncio.run(app.manage_etoro_demo_positions(self.settings))
         self.adapter.lookup_order.assert_called_once_with(order_id=None,reference_id='ref')
         self.assertEqual(self.row(tid)['status'],'REJECTED_EXECUTION');self.submit.assert_not_awaited()
+
+    def test_reconciliation_keeps_broker_observations_distinct_from_forecasts(self):
+        tid=self.trade()
+        self.update(tid,status='OPEN',broker_position_id='p',broker_order_id='o',
+                    stop_loss_price=96,take_profit_price=106,
+                    policy_json=json.dumps({'estimated_costs':2,'fill_adjusted':True}))
+        position=dict(position_id='p',instrument_id='1',side='LONG',units=1,
+                      amount=50,open_rate=100,current_rate=102,stop_loss_price=96,
+                      take_profit_price=106,unrealized_pnl=1.8,leverage=2,fees=.2)
+        app.reconcile_news_demo_positions([position])
+        policy=json.loads(self.row(tid)['policy_json'])
+        self.assertEqual(policy['estimated_costs'],2)
+        self.assertEqual(policy['broker_observation']['reported_running_pnl'],1.8)
+        self.assertEqual(policy['broker_observation']['margin'],50)
+        position['current_rate']=None
+        app.reconcile_news_demo_positions([position])
+        self.assertIsNone(json.loads(self.row(tid)['policy_json'])['broker_observation']['current_price'])
+        self.assertEqual(self.row(tid)['current_price'],102)
 
     def test_sample_replay_uses_shared_gates_lifecycle_and_smaller_stake(self):
         fixture=dict(symbol='ACME',signal='bullish',confidence=.95,notes='Positive earnings',timestamp='2026-10-10T12:00Z',source='fixture')
@@ -349,7 +374,7 @@ class DatabaseTests(unittest.TestCase):
         async def stop_after_three(_):
             sleeps.append(1)
             if len(sleeps)==3:raise asyncio.CancelledError()
-        with patch.object(app,'manage_etoro_demo_positions',AsyncMock()) as manager,patch.object(app.asyncio,'sleep',side_effect=stop_after_three):
+        with patch.object(app,'position_maintenance_interval',return_value=60),patch.object(app,'manage_etoro_demo_positions',AsyncMock()) as manager,patch.object(app.asyncio,'sleep',side_effect=stop_after_three):
             with self.assertRaises(asyncio.CancelledError):asyncio.run(app.maintenance_loop())
         self.assertEqual(manager.await_count,3)
         c=app.get_connection();self.assertEqual(c.execute('SELECT COUNT(*) FROM archived_analysis').fetchone()[0],1);c.close()
@@ -371,6 +396,7 @@ class DatabaseTests(unittest.TestCase):
         # The dashboard performs broker/UI billing reads, all mocked here.
         with patch('integrations.get_portfolio_account_snapshot',return_value={'available':False}),patch('integrations.fetch_openai_month_to_date_costs',AsyncMock(return_value={'available':False})),patch('integrations.EtoroBrokerAdapter',return_value=self.adapter):
             ui=AppTest.from_file(str(Path(app.__file__).with_name('streamlit_app.py')),default_timeout=20)
+            ui.session_state['auth_token']=app.create_session_token('admin')
             ui.session_state['authenticated']=True
             ui.session_state['username']='admin'
             ui.run()
@@ -462,7 +488,7 @@ class DashboardAndHealthTests(unittest.TestCase):
         from typing import Any, Dict, Optional
         source=Path(app.__file__).with_name('streamlit_app.py').read_text()
         tree=ast.parse(source)
-        functions=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in {'_lifecycle_event_decision','_trade_chart_events'}]
+        functions=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in {'_lifecycle_event_decision','_trade_chart_events','_trade_management_events'}]
         namespace={'Any':Any,'Dict':Dict,'Optional':Optional}
         exec(compile(ast.Module(body=functions,type_ignores=[]),'chart_helpers','exec'),namespace)
         return namespace['_trade_chart_events']
@@ -478,6 +504,36 @@ class DashboardAndHealthTests(unittest.TestCase):
         latest,_=self.chart_helpers()({'events':events,'broker_order_id':'o','broker_fill_price':100})
         self.assertEqual(latest['execution']['chart_decision'],'executed')
         self.assertEqual(latest['execution']['chart_reconciliation'],'TP mismatch')
+
+    def test_pending_execution_is_visible_without_capacity_reason(self):
+        event=dict(stage='execution',agent_name='execution',status='completed',decision='pending',
+                   message='A fresh verified quote is required.',details={})
+        latest,_=self.chart_helpers()({'events':[event]})
+        self.assertEqual(latest['execution']['decision'],'pending')
+
+    def test_skipped_execution_is_visible_without_implying_submission(self):
+        event=dict(stage='execution',agent_name='execution',status='skipped',decision='skipped',details={})
+        latest,_=self.chart_helpers()({'events':[event]})
+        self.assertEqual(latest['execution']['chart_decision'],'skipped')
+
+    def test_management_checks_collapse_separately_from_entry(self):
+        import ast
+        from typing import Any, Dict
+        tree=ast.parse(Path(app.__file__).with_name('streamlit_app.py').read_text())
+        functions=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_trade_management_events']
+        namespace={'Any':Any,'Dict':Dict}
+        exec(compile(ast.Module(body=functions,type_ignores=[]),'management_helpers','exec'),namespace)
+        events=[dict(stage='execution',decision='submitted',status='completed'),
+                dict(stage='recovery',decision='attention',status='attention'),
+                dict(stage='recovery',decision='accepted',status='completed'),
+                dict(stage='exit',decision='pending',status='submitted')]
+        rows=namespace['_trade_management_events']({'events':events,'status':'EXIT_PENDING'})
+        self.assertNotIn('execution',rows)
+        self.assertEqual(rows['recovery']['chart_decision'],'verified')
+        self.assertEqual(rows['recovery']['chart_count'],2)
+        self.assertEqual(rows['exit']['chart_decision'],'pending')
+        rows=namespace['_trade_management_events']({'events':events,'status':'CLOSED_PNL_UNAVAILABLE'})
+        self.assertEqual(rows['exit']['chart_decision'],'closed')
 
     def test_healthcheck_requires_fresh_worker_and_frontend(self):
         import healthcheck

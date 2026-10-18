@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional, Protocol
+from email.utils import parsedate_to_datetime
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -54,9 +55,11 @@ def _redact_etoro_log_value(value: Any, key: str = "") -> Any:
 
 
 class EtoroAPIError(ValueError):
-    def __init__(self, message: str, api_logs: Optional[list[Dict[str, Any]]] = None) -> None:
+    def __init__(self, message: str, api_logs: Optional[list[Dict[str, Any]]] = None, *, status_code=None, retry_after_seconds=None) -> None:
         super().__init__(message)
         self.api_logs = api_logs or []
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 def _broker_time(value: Any) -> Optional[str]:
@@ -1148,9 +1151,17 @@ class EtoroBrokerAdapter:
                 error.code,
                 message,
             )
+            retry_after = None
+            raw_retry_after = (error.headers or {}).get('Retry-After')
+            if raw_retry_after:
+                try:
+                    retry_after = max(0, float(raw_retry_after))
+                except ValueError:
+                    try: retry_after = max(0, (parsedate_to_datetime(raw_retry_after)-datetime.now(timezone.utc)).total_seconds())
+                    except (TypeError, ValueError): pass
             raise EtoroAPIError(
                 f"eToro request failed with HTTP {error.code} (request ID {request_id}): {message}",
-                api_logs=self.api_logs,
+                api_logs=self.api_logs, status_code=error.code, retry_after_seconds=retry_after,
             ) from error
         except URLError as error:
             api_log["response"] = {"status": "connection_error", "body": str(error.reason)}
@@ -1366,7 +1377,7 @@ class EtoroBrokerAdapter:
                 "stop_loss_price": _first_numeric_by_keys(position, ("stopLossRate", "stopLossPrice", "stopLoss")),
                 "take_profit_price": _first_numeric_by_keys(position, ("takeProfitRate", "takeProfitPrice", "takeProfit")),
                 "no_take_profit": position.get("isNoTakeProfit"),
-                "fees": _first_numeric_by_keys(position, ("totalExternalCosts", "fees", "openFee")),
+                "fees": _first_numeric_by_keys(position, ("totalFees", "totalExternalCosts", "fees", "openFee")),
                 "raw": _redact_etoro_log_value(position),
             })
         return {"available": True, "provider": "eToro", "mode": "demo", "positions": normalized, "fetched_at": datetime.now(timezone.utc).isoformat()}
@@ -1460,13 +1471,13 @@ class EtoroBrokerAdapter:
             raise ValueError("An order or persisted reference ID is required.")
         return self._request_json("GET", "/api/v2/trading/info/demo/orders:lookup", params=params)
 
-    def modify_position(self, position_id: str, stop: float, target: Optional[float]) -> Dict[str, Any]:
+    def modify_position(self, position_id: str, stop: float, target: Optional[float], *, request_id=None) -> Dict[str, Any]:
         if not self.settings.etoro_demo_trading:
             raise ValueError("Live position modification is disabled.")
         payload = {"stopLossRate": stop, "stopLossType": "fixed"}
         if target is not None:
             payload["takeProfitRate"] = target
-        return self._request_json("PATCH", f"/api/v2/trading/demo/positions/{str(position_id).removesuffix('.0')}", payload=payload)
+        return self._request_json("PATCH", f"/api/v2/trading/demo/positions/{str(position_id).removesuffix('.0')}", payload=payload, **({"request_id": request_id} if request_id else {}))
 
     def estimate_order_costs(self, symbol: str, side: str, units: float, leverage: int) -> Dict[str, Any]:
         if not self.settings.etoro_demo_trading:
@@ -1476,19 +1487,41 @@ class EtoroBrokerAdapter:
             "symbol": symbol, "settlementType": "cfd", "orderType": "mkt",
             "leverage": leverage, "units": units, "orderCurrency": "usd"})
 
-    def close_position(self, position_id: str) -> Dict[str, Any]:
+    def lookup_close_order(self, order_id):
+        if not self.settings.etoro_demo_trading:
+            raise ValueError("Live close-order lookup is disabled.")
+        if not str(order_id).strip():
+            raise ValueError("A close order ID is required.")
+        return self._request_json("GET", f"/api/v1/trading/info/demo/close-orders/{str(order_id).removesuffix('.0')}")
+
+    def close_position(self, position_id: str, instrument_id=None, *, request_id=None) -> Dict[str, Any]:
         if not self.settings.etoro_demo_trading:
             raise ValueError("Live eToro execution is disabled in this application.")
         if not str(position_id).strip():
             raise ValueError("A broker position ID is required to close an eToro position.")
+        position_id = str(position_id).removesuffix(".0")
+        if instrument_id is None:
+            snapshot = self.get_positions()
+            matches = [p for p in snapshot.get("positions", [])
+                       if str(p.get("position_id")).removesuffix(".0") == position_id]
+            if not snapshot.get("available") or len(matches) != 1:
+                raise ValueError("A unique open broker position is required to resolve its instrument ID.")
+            instrument_id = matches[0].get("instrument_id")
+        try:
+            number = float(instrument_id)
+            if not math.isfinite(number) or number <= 0 or not number.is_integer():
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise ValueError("A valid broker instrument ID is required to close the position.") from None
         response = self._request_json(
             "POST",
             f"/api/v1/trading/execution/demo/market-close-orders/positions/{position_id}",
-            payload={"UnitsToDeduct": None},
+            payload={"InstrumentID": int(number), "UnitsToDeduct": None},
+            **({"request_id": request_id} if request_id else {}),
         )
         return {
             "provider": "eToro", "mode": "demo", "position_id": str(position_id),
-            "order_id": response.get("orderId") or (response.get("data") or {}).get("orderId"),
+            "order_id": response.get("orderId") or (response.get("orderForClose") or {}).get("orderID") or (response.get("data") or {}).get("orderId"),
             "response": _redact_etoro_log_value(response),
         }
 

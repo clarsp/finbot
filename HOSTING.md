@@ -1,108 +1,149 @@
-# Hosting Finbot with SQLite and S3 backups
+# Hosting this Finbot deployment on Fly.io
 
-## Supported architecture
+## What you need to add to Fly
 
-Run exactly **one writable Finbot container**. Keep `/data/finbot.db` on the
-container's local SSD or a persistent block volume. S3 is used for recovery
-snapshots; it is not mounted as the live database filesystem.
+**Your eToro API keys, OpenAI API key and SMTP password are NOT in SQLite.**
+They must be provided to Fly. Entering connection settings in the GUI does not
+put them in the database: the GUI writes a separate environment file.
 
-### Web entry point
+For this deployment, use these three sources:
 
-Streamlit already provides the application HTTP server. For a private hosted deployment, keep it and place a dedicated reverse proxy or managed ingress in front of the container:
+| Source | What it supplies | What you need to do |
+|---|---|---|
+| `fly.toml` | Standard hosting, demo broker, news/OpenAI defaults, Tigris bucket, TLS and volume settings | Deploy the repository with this file. No manual re-entry of those settings. |
+| Fly Secrets | API credentials plus your current SMTP configuration | Import the private file prepared below once. |
+| Tigris SQLite backup | Users, memberships, agent rules, schedules, toggles, trades and evidence | Finbot restores automatically onto an empty volume. |
 
-```text
-Internet → managed TLS / reverse proxy → Finbot Streamlit :8501
-                                      → persistent block volume /data
-                                      → optional periodic S3 snapshots
-```
+### One import instead of entering variables individually
 
-Terminate trusted HTTPS at the ingress, keep port 8501 private, inject credentials through the hosting secret store, and restrict access with an identity-aware proxy, VPN, or equivalent network policy in addition to the application login. Do not add Nginx or a Node server to the Finbot container solely to serve Streamlit; a separate proxy or the provider's load balancer has a clearer lifecycle.
+A private import file has been prepared locally at **data/fly-secrets.env**.
+It is ignored by Git and has mode 600. It contains real credentials; do not
+commit it, paste it into chat, or include it in the Docker image.
 
-If the interface later needs dense admin navigation, responsive mobile layouts, real-time tables, or chart interactions that Streamlit cannot support cleanly, expose the existing Python services through a versioned FastAPI boundary and add a React/Next.js frontend incrementally. Separate the scheduler and broker worker from HTTP handling before running multiple web replicas.
+It contains these seven currently configured credentials:
 
-At startup, `start.sh` checks the configured restore policy before the
-scheduler or dashboard opens SQLite. While Finbot runs, `s3_backup.py` uses
-SQLite's online backup API to create a consistent temporary database, runs
-`PRAGMA quick_check`, and uploads both:
+| Fly variable | Meaning |
+|---|---|
+| `AWS_ACCESS_KEY_ID` | Tigris Access Key ID |
+| `AWS_SECRET_ACCESS_KEY` | Tigris Secret Access Key |
+| `ETORO_API_KEY` | eToro public API key |
+| `ETORO_USER_KEY` | eToro user key |
+| `OPENAI_API_KEY` | OpenAI API key |
+| `FINBOT_SMTP_PASSWORD` | SMTP password |
+| `FINBOT_PASSWORD` | Required launcher/bootstrap password; does not reset existing DB users |
 
-- `s3://BUCKET/PREFIX/latest/finbot.db` for startup recovery.
-- `s3://BUCKET/PREFIX/snapshots/YYYY/MM/DD/finbot-TIMESTAMP.db` for history.
+It also contains your effective email settings: `FINBOT_SMTP_HOST`,
+`FINBOT_SMTP_PORT`, `FINBOT_SMTP_SECURITY`, `FINBOT_SMTP_USERNAME`,
+`FINBOT_SMTP_FROM`, `FINBOT_TRADE_EMAIL_ENABLED`, `FINBOT_TRADE_EMAIL_TO`,
+`FINBOT_TRADE_EMAIL_ATTACH_JSON`, `FINBOT_SMTP_TIMEOUT_SECONDS`, and
+`FINBOT_TRADE_EMAIL_SUBJECT_PREFIX`.
+These preferences are included so you do not have to copy runtime.env or
+reconfigure the GUI on Fly. Fly Secrets can store ordinary settings too.
 
-On normal container shutdown, the scheduler stops first and the backup daemon
-attempts one final snapshot. A forced host or container failure can lose writes
-made after the last periodic snapshot, so a persistent volume is still the
-preferred primary storage.
-
-## Configuration
-
-```dotenv
-FINBOT_DB_PATH=/data/finbot.db
-FINBOT_S3_BACKUP_ENABLED=true
-FINBOT_S3_BUCKET=my-private-finbot-backups
-FINBOT_S3_PREFIX=production/finbot
-FINBOT_S3_BACKUP_INTERVAL_SECONDS=900
-FINBOT_S3_RESTORE_MODE=if_newer
-FINBOT_S3_RESTORE_REQUIRED=false
-FINBOT_S3_SERVER_SIDE_ENCRYPTION=AES256
-AWS_REGION=eu-north-1
-```
-
-Restore modes:
-
-- `if_newer` (recommended): restore when the local database is absent or the
-  S3 `latest` object is newer.
-- `if_missing`: restore only on ephemeral/new storage.
-- `always`: replace the local database from S3 at every container start.
-- `never`: upload backups but do not restore automatically.
-
-Set `FINBOT_S3_RESTORE_REQUIRED=true` when starting without an existing S3
-snapshot must fail rather than initialize an empty database.
-
-For AWS, attach an IAM task/instance role to the workload instead of putting
-long-lived access keys in `.env.config`. The role needs these permissions for
-the configured bucket prefix:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": ["s3:GetObject", "s3:PutObject"],
-    "Resource": "arn:aws:s3:::my-private-finbot-backups/production/finbot/*"
-  }]
-}
-```
-
-If bucket policy validation requires it, also grant `s3:ListBucket` scoped to
-the prefix. Enable S3 bucket versioning and a lifecycle rule to expire old
-`snapshots/` objects after your chosen retention period. When using KMS, set
-`FINBOT_S3_SERVER_SIDE_ENCRYPTION=aws:kms`, set `FINBOT_S3_KMS_KEY_ID`, and add
-the corresponding KMS permissions to the workload role.
-
-## Deployment rules
-
-1. Keep the service replica count at one. Two local SQLite copies can diverge
-   and both workers can submit orders.
-2. Prefer a persistent block volume at `/data`, with S3 as disaster recovery.
-3. Use `if_missing` with a persistent volume, or `if_newer` when the host can
-   restart on a new machine.
-4. Use a private bucket, block public access, encryption, and versioning.
-5. Move to PostgreSQL before adding replicas, separate scheduler workers, or
-   zero-downtime rolling deployments with overlapping containers.
-
-## Operations
-
-Create a backup on demand inside a running container:
+With Fly CLI installed and authenticated, run from the repository:
 
 ```sh
-docker compose exec finbot /app/.venv/bin/python /app/s3_backup.py backup
+fly secrets import --stage -a finbot-tbfs1a < data/fly-secrets.env
 ```
 
-Review backup activity:
+This stages the values without restarting an existing Fly deployment. The next
+deploy applies them. The export/import has **not** been uploaded automatically.
+
+If credentials or GUI email settings change before migration, regenerate the file:
 
 ```sh
-docker compose logs finbot | grep finbot.s3_backup
+.venv/bin/python scripts/export_fly_secrets.py
 ```
 
-The application never sends the WAL or journal files to S3. The uploaded file
-is a standalone, validated SQLite database produced through SQLite itself.
+The exporter reads the running local Docker container, captures credentials in
+memory and writes the private file. It prints no values, sends no email and
+does not contact Fly. It intentionally excludes unrelated environment variables.
+Optional OpenAI admin/org settings and eToro account IDs are included only if
+configured; none are currently needed for this setup.
+
+Fly keeps imported secrets in its vault and injects them when Machines boot.
+You do not need to re-enter them on every restart or deploy.
+Do not import the entire local .env.config: that could override Fly-specific
+paths and hosting policies. If this Fly app already has a runtime.env, its SMTP
+values can override imported email settings; review that file before migration.
+
+## Why /data/runtime.env is not on your Mac
+
+`/data` is a path **inside the Docker container**, backed by the named Docker
+volume `finbot_finbot_data`. It is not `/data` on your Mac, nor the repository's
+`data/` directory. Docker Desktop stores that volume inside its Linux VM.
+
+At the configuration check on 18 October, this file existed inside Docker and
+contained eight GUI-saved SMTP preferences. The API keys and SMTP password
+were supplied separately from your host `.env.config`. Both sources are merged
+into the private Fly import file above. **You do not need to locate or transfer
+runtime.env for this migration route.**
+
+On Fly, the same path is on the Fly volume. Future GUI edits can create/update
+it there. SQLite backups do not include this file or API credentials.
+See [CONFIGURATION.md](CONFIGURATION.md#which-settings-live-where) for the exact
+precedence rules. This import consolidates the current effective values without
+changing the application's existing configuration mechanism.
+
+## Deployment when ready
+
+The prepared manifest targets **finbot-tbfs1a**, region **ams**, with one shared
+CPU, **2 GiB RAM**, and a **3 GB** persistent volume.
+
+1. Make the current source and fly.toml available to the build. A GitHub build
+   cannot see uncommitted local changes.
+2. Import the file above using `--stage`.
+3. Stop the local trading container and let its final successful backup finish
+   before starting Fly. Never run both schedulers against the same account and
+   backup prefix.
+4. Check `fly status -a finbot-tbfs1a` and `fly volumes list -a finbot-tbfs1a`.
+   Reuse the correct existing volume, or create it once:
+   `fly volumes create finbot_data --region ams --size 3 -a finbot-tbfs1a`.
+   If the app already has multiple Machines, reduce it to the intended single
+   writer before deployment.
+5. Deploy with `fly deploy --ha=false -a finbot-tbfs1a`. The manifest does not
+   enforce a maximum Machine count; verify exactly one is running.
+6. Check recovered users, positions and broker reconciliation before enabling
+   new automated demo entries. Check email configuration; no test mail is sent
+   by this procedure.
+
+There has been no Fly deployment from this workspace. The Fly CLI was not
+installed at preparation time; the TOML was parsed and checked locally, but
+server-side validation is still pending. After successful import, keep the
+private export securely or delete it; it can be regenerated from local Docker.
+
+## What persists, and when Tigris is used
+
+The mounted `/data` holds the live SQLite database and GUI runtime file.
+Normal restart/redeploy with the same volume reuses that database and skips
+Tigris restoration. An empty/replacement volume downloads the latest validated
+snapshot from `s3://datadb/finbot/shared-demo/latest/finbot.db`.
+
+Recovery pauses new automated entries. This Fly manifest requires a remote
+snapshot when the local DB is absent; it will not silently initialize an empty
+account. An existing damaged database needs explicit stopped-service recovery;
+startup does not overwrite existing local DB/WAL data.
+
+Backups use SQLite's online backup API, SHA256 metadata and SQLite integrity
+checks. Uploads run every 15 minutes and a final snapshot is attempted after
+writers stop during graceful shutdown. Abrupt failure can lose changes after
+the last successful off-site snapshot. Keep the persistent volume as primary
+storage; Tigris is recovery storage, not a mounted database filesystem.
+
+Fly terminates public HTTPS; the app uses internal HTTP port 8501.
+Local Compose continues to use HTTPS at https://localhost:8501.
+Fly idle stopping is disabled so the scheduler runs without browser traffic.
+The manifest allows 120 seconds for graceful shutdown and enables daily
+volume snapshots with five-day retention. Tigris versioned objects accumulate;
+choose bucket lifecycle retention separately.
+
+For local administration, run SQLite operations inside Docker. Never open
+Docker's live database/WAL from host tools, remove its named volume with
+`docker compose down -v`, or prune that volume.
+
+Official references:
+[app configuration](https://docs.fly.io/reference/configuration),
+[Fly Secrets](https://docs.fly.io/apps/secrets),
+[secret import](https://fly.io/docs/flyctl/secrets-import/),
+[persistent volumes](https://docs.fly.io/volumes/overview),
+[single-Machine deployment](https://fly.io/docs/apps/app-availability/).

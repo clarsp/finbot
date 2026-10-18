@@ -1,9 +1,13 @@
 import os
+import signal
+import threading
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
+from database_runtime import database_lock
+from s3_backup import BackupSettings
 
 
 def get_free_port(start_port: int = 8501, max_attempts: int = 10) -> int:
@@ -19,13 +23,17 @@ def get_free_port(start_port: int = 8501, max_attempts: int = 10) -> int:
 
 
 def generate_self_signed_cert() -> tuple[str, str]:
-    cert_dir = Path(__file__).resolve().parent / "certs"
-    cert_dir.mkdir(exist_ok=True)
+    cert_dir = Path(os.getenv("FINBOT_TLS_CERT_DIR", str(Path(__file__).resolve().parent / "certs")))
+    cert_dir.mkdir(parents=True, exist_ok=True)
 
     cert_path = cert_dir / "localhost.crt"
     key_path = cert_dir / "localhost.key"
 
-    if not cert_path.exists() or not key_path.exists():
+    valid = cert_path.exists() and key_path.exists() and subprocess.run(
+        ["openssl", "x509", "-checkend", "86400", "-noout", "-in", str(cert_path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+    if not valid:
         subprocess.run(
             [
                 "openssl",
@@ -42,9 +50,14 @@ def generate_self_signed_cert() -> tuple[str, str]:
                 "365",
                 "-subj",
                 "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
             ],
             check=True,
         )
+        key_path.chmod(0o600)
 
     return str(cert_path), str(key_path)
 
@@ -65,6 +78,16 @@ def get_python_executable() -> str:
 
 
 def main() -> None:
+    settings=BackupSettings.from_environment()
+    previous_handlers={sig:signal.getsignal(sig) for sig in (signal.SIGTERM,signal.SIGINT)}
+    try:
+        with database_lock(settings.database_path,'runtime'):
+            _run_application()
+    finally:
+        for sig,handler in previous_handlers.items():signal.signal(sig,handler)
+
+
+def _run_application() -> None:
     project_dir = Path(__file__).resolve().parent
     python_executable = get_python_executable()
     print(f"Using Python environment: {python_executable}", flush=True)
@@ -77,6 +100,10 @@ def main() -> None:
     except OSError:
         port = get_free_port(preferred_port)
 
+    shutdown=threading.Event()
+    previous_handlers={sig:signal.getsignal(sig) for sig in (signal.SIGTERM,signal.SIGINT)}
+    def request_shutdown(_signal,_frame):shutdown.set()
+    for sig in previous_handlers:signal.signal(sig,request_shutdown)
     backup_process = None
 
     # Start the scheduler daemon in the background
@@ -98,7 +125,7 @@ def main() -> None:
     log_destination = "container stdout" if log_scheduler_to_stdout else "scheduler.log"
     print(f"Scheduler daemon started (PID: {scheduler_process.pid}); logging to {log_destination}")
 
-    if os.getenv("FINBOT_S3_BACKUP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}:
+    if BackupSettings.from_environment().enabled:
         try:
             backup_process = subprocess.Popen(
                 [python_executable, "s3_backup.py", "daemon"],
@@ -135,12 +162,12 @@ def main() -> None:
         print(f"Starting Streamlit on port {port}...")
         frontend = subprocess.Popen(cmd)
         try:
-            while frontend.poll() is None:
+            while frontend.poll() is None and not shutdown.is_set():
                 if scheduler_process.poll() is not None:
                     raise RuntimeError("Scheduler exited; restarting the workload is required.")
                 if backup_process is not None and backup_process.poll() is not None:
                     raise RuntimeError("S3 backup daemon exited; restarting the workload is required.")
-                time.sleep(2)
+                shutdown.wait(2)
             if frontend.returncode:
                 raise RuntimeError(f"Streamlit exited with status {frontend.returncode}")
         finally:
@@ -167,12 +194,13 @@ def main() -> None:
             print("Stopping S3 backup daemon and creating a final snapshot...")
             backup_process.terminate()
             try:
-                backup_process.wait(timeout=60)
+                backup_process.wait(timeout=90)
             except subprocess.TimeoutExpired:
                 backup_process.kill()
                 backup_process.wait()
         if scheduler_log is not None:
             scheduler_log.close()
+        for sig,handler in previous_handlers.items():signal.signal(sig,handler)
 
 
 if __name__ == "__main__":

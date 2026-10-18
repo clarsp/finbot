@@ -10,6 +10,12 @@ import zlib
 
 
 def ensure_schema(conn):
+    import performance_analysis
+    performance_analysis.ensure_schema(conn)
+    import broker_recovery
+    broker_recovery.ensure_schema(conn)
+    import shadow_tracking
+    shadow_tracking.ensure_schema(conn)
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS workflow_leases (name TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS archived_analysis (trade_id INTEGER PRIMARY KEY, archived_at TEXT DEFAULT CURRENT_TIMESTAMP, payload BLOB NOT NULL);
