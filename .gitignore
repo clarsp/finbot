@@ -9,3 +9,5 @@ __pycache__/
 logs/
 certs/
 data/
+# Local Docker image export; build/deploy images instead of committing archives.
+/finbot.tar
