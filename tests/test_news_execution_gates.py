@@ -48,6 +48,15 @@ class NewsExecutionGateRegressionTests(unittest.TestCase):
         self.assertEqual(grouped["ACME"][0]["published_at"], None)
         self.assertEqual(makemoney.newest_known_article_time(grouped["ACME"]), 0.0)
 
+    def test_multiple_headlines_and_related_tickers_produce_one_candidate_key_per_symbol(self):
+        articles=[{'ticker':'ACME','title':'First item','related_tickers':['ACME','OTHER']},
+                  {'ticker':'ACME','title':'Second item','related_tickers':['OTHER']},
+                  {'ticker':'OTHER','title':'Third item'}]
+        grouped=makemoney.group_news_candidates(articles)
+        self.assertEqual(list(grouped),['ACME','OTHER'])
+        self.assertEqual(len(grouped['ACME']),2)
+        self.assertEqual(len(grouped['OTHER']),3)
+
     def test_quote_freshness_uses_check_time_not_cycle_start(self):
         checked_at = makemoney.datetime(2026, 10, 13, 3, 26, 32, tzinfo=makemoney.timezone.utc)
         quote = {
@@ -284,7 +293,7 @@ class NewsExecutionGateRegressionTests(unittest.TestCase):
             settings = types.SimpleNamespace(broker_provider="etoro", etoro_demo_trading=True)
             with patch.object(makemoney, "DB_PATH", database_path), patch.object(
                 makemoney.IntegrationSettings, "from_environment", return_value=settings
-            ):
+            ), patch.dict(os.environ, {"FINBOT_PASSWORD": "unit-test-password"}):
                 makemoney.ensure_db()
                 makemoney.set_demo_automated_trading_enabled(True)
                 makemoney.ensure_db()
@@ -319,7 +328,7 @@ class NewsExecutionGateRegressionTests(unittest.TestCase):
         adapter = object.__new__(EtoroBrokerAdapter)
         adapter.settings = types.SimpleNamespace(etoro_demo_trading=True, etoro_api_debug_logging=False)
         adapter.api_logs = []
-        adapter._find_instrument = MagicMock(return_value={"instrumentId": 123, "currency": "USD"})
+        adapter._find_instrument = MagicMock(return_value={"instrumentId": 123, "currency": "USD", "isCurrentlyTradable": True, "internalAssetClassName": "Stocks"})
         adapter._request_json = MagicMock(return_value={"orderId": 456})
 
         adapter.submit_order({
@@ -333,6 +342,12 @@ class NewsExecutionGateRegressionTests(unittest.TestCase):
         self.assertIs(payload["isNoTakeProfit"], True)
 
     def test_news_research_cycle_handles_fresh_quote_without_name_error(self):
+        # Scheduled research now reads its persisted refresh queue. Keep this
+        # regression isolated from the developer database, like workflow tests.
+        temporary=self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(makemoney,'DB_PATH',Path(temporary)/'finbot.db'))
+        self.enterContext(patch.dict(os.environ,{'FINBOT_PASSWORD':'test-bootstrap-only'}))
+        makemoney.ensure_db()
         now = makemoney.datetime.now(makemoney.timezone.utc).isoformat()
         settings = types.SimpleNamespace(
             broker_provider="etoro", etoro_demo_trading=True, openai_api_key=""
@@ -375,7 +390,7 @@ class NewsExecutionGateRegressionTests(unittest.TestCase):
             patches = [
                 patch.object(makemoney, "get_demo_automated_trading_enabled", return_value=False),
                 patch.object(makemoney, "get_strategy_evaluation", return_value={"status": "inconclusive"}),
-                patch.object(makemoney, "EtoroBrokerAdapter", return_value=adapter),
+                patch.object(makemoney, "create_broker_adapter", return_value=adapter),
                 patch.object(makemoney, "reconcile_news_demo_positions", return_value={"errors": 0}),
                 patch.object(makemoney, "YahooFinanceNewsProvider", NewsProvider),
                 patch.object(makemoney, "save_news_articles", return_value={"inserted": 1, "updated": 0}),

@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass,field
 from datetime import datetime,timezone
+import gzip
 import hashlib
 import json
 import logging
@@ -35,7 +36,7 @@ def configuration_environment():
         for line in path.read_text(encoding='utf-8').splitlines():
             if '=' in line and not line.lstrip().startswith('#'):
                 key,value=line.strip().split('=',1)
-                if key.startswith(('FINBOT_S3_','AWS_')) or key in {'FINBOT_DB_PATH','BUCKET_NAME'}:
+                if key.startswith(('FINBOT_S3_','FINBOT_REPORTING_','AWS_')) or key in {'FINBOT_DB_PATH','BUCKET_NAME'}:
                     values.setdefault(key,value.strip().strip('"').strip("'"))
     return values
 
@@ -44,7 +45,7 @@ def safe_error(error):
     # Transfer helpers wrap ClientError; preserve its code without its message.
     root=error
     for _ in range(8):
-        code=str(getattr(root,'response',{}).get('Error',{}).get('Code',''))
+        code=str((getattr(root,'response',None) or {}).get('Error',{}).get('Code',''))
         if code:
             return type(error).__name__+': '+re.sub('[^A-Za-z0-9_-]','',code)[:80]
         following=root.__cause__ or root.__context__
@@ -94,7 +95,7 @@ class BackupSettings:
         is_tigris=provider=='tigris' or bool(endpoint and urlsplit(endpoint).hostname in {'t3.storage.dev','fly.storage.tigris.dev'})
         mode=env.get('FINBOT_S3_RESTORE_MODE','if_missing').strip().lower()
         if mode not in {'never','if_missing','if_newer','always'}:raise ValueError('Invalid FINBOT_S3_RESTORE_MODE.')
-        interval=int(env.get('FINBOT_S3_BACKUP_INTERVAL_SECONDS','900'))
+        interval=int(env.get('FINBOT_S3_BACKUP_INTERVAL_SECONDS','3600'))
         if interval<60:raise ValueError('Backup interval must be at least 60 seconds.')
         settings=cls(enabled=boolean('FINBOT_S3_BACKUP_ENABLED'),
             database_path=Path(env.get('FINBOT_DB_PATH','/data/finbot.db')).expanduser().resolve(),
@@ -113,6 +114,9 @@ class BackupSettings:
     @property
     def latest_key(self):return f"{self.prefix+'/' if self.prefix else ''}latest/finbot.db"
 
+    @property
+    def previous_key(self):return f"{self.prefix+'/' if self.prefix else ''}previous/finbot.db"
+
     def versioned_key(self,timestamp):
         stamp=timestamp.astimezone(timezone.utc).strftime('%Y/%m/%d/finbot-%Y%m%dT%H%M%S.%fZ')
         return f"{self.prefix+'/' if self.prefix else ''}snapshots/{stamp}-{uuid4().hex[:8]}.db"
@@ -121,7 +125,7 @@ class BackupSettings:
         return dict(enabled=self.enabled,provider=self.provider,bucket=self.bucket,prefix=self.prefix,
             endpoint=self.endpoint_url,region=self.region,interval_seconds=self.interval_seconds,restore_mode=self.restore_mode,
             credentials_configured=bool(self.access_key_id and self.secret_access_key) if self.provider=='tigris' else 'SDK credential chain',
-            latest_key=self.latest_key)
+            latest_key=self.latest_key,previous_key=self.previous_key,retained_copies=2,compression='gzip')
 
 
 def status_path(settings):return settings.database_path.parent/'backup_status.json'
@@ -153,7 +157,7 @@ class S3SQLiteBackup:
                 raise RuntimeError('Tigris access key and secret are not configured.')
             import boto3
             from botocore.config import Config
-            options:dict[str,Any]={'config':Config(signature_version='s3v4',connect_timeout=5,read_timeout=30,
+            options:dict[str,Any]={'config':Config(signature_version='s3v4',connect_timeout=5,read_timeout=90,
                 retries={'max_attempts':3,'mode':'standard'},
                 s3={'addressing_style':'virtual' if self.settings.provider=='tigris' else 'auto'},
                 request_checksum_calculation='when_required',response_checksum_validation='when_required')}
@@ -185,7 +189,7 @@ class S3SQLiteBackup:
             with database_lock(self.settings.database_path,'backup'):
                 result=self._create_snapshot(now)
             write_status(self.settings,last_success_at=datetime.now(timezone.utc).isoformat(),last_key=result['key'],
-                sha256=result['sha256'],bytes=result['bytes'],last_error=None)
+                sha256=result['sha256'],bytes=result['bytes'],compressed_bytes=result['compressed_bytes'],last_error=None)
             return result
         except Exception as error:
             write_status(self.settings,last_error=safe_error(error));raise
@@ -201,20 +205,77 @@ class S3SQLiteBackup:
             finally:dest.close();source.close()
             self._validate_database(snapshot)
             digest=checksum(snapshot);size=snapshot.stat().st_size
-            args=self._upload_args(digest,created_at);key=self.settings.versioned_key(created_at)
-            self.s3.upload_file(str(snapshot),self.settings.bucket,key,ExtraArgs=args)
-            self.s3.upload_file(str(snapshot),self.settings.bucket,self.settings.latest_key,ExtraArgs=args)
-        logger.info('Uploaded validated SQLite snapshot to s3://%s/%s',self.settings.bucket,key)
-        return dict(bucket=self.settings.bucket,key=key,sha256=digest,bytes=size)
-
-    def _download_validated(self,path):
-        # Body and metadata belong to the SAME GET, avoiding head/latest races.
-        response=self.s3.get_object(Bucket=self.settings.bucket,Key=self.settings.latest_key)
-        body=response['Body']
+            compressed=Path(directory)/'finbot.db.gz'
+            with snapshot.open('rb') as source, gzip.open(compressed,'wb',compresslevel=1) as dest:
+                shutil.copyfileobj(source,dest)
+            args=self._upload_args(digest,created_at)
+            args['Metadata']['compression']='gzip'
+            args['ContentType']='application/gzip'
+            key=self.settings.versioned_key(created_at)+'.gz'
+            self.s3.upload_file(str(compressed),self.settings.bucket,key,ExtraArgs=args)
+            # Prove the uploaded object is recoverable before replacing either copy.
+            self._download_validated(Path(directory)/'verify.db',key)
+            try:
+                self._download_validated(Path(directory)/'previous-check.db')
+            except Exception as error:
+                code=str((getattr(error,'response',None) or {}).get('Error',{}).get('Code',''))
+                if code not in {'404','NoSuchKey','NotFound'}:raise
+                self._copy(key,self.settings.previous_key)
+            else:
+                self._copy(self.settings.latest_key,self.settings.previous_key)
+            self._copy(key,self.settings.latest_key)
+            self._download_validated(Path(directory)/'latest-check.db')
+            uploaded_bytes=compressed.stat().st_size
+        logger.info('Uploaded verified compressed SQLite backup; bytes=%s compressed_bytes=%s',size,uploaded_bytes)
+        # Only Finbot snapshot objects in this profile's prefix are eligible.
+        # Cleanup failure never invalidates a successfully verified new backup.
         try:
-            with Path(path).open('wb') as handle:shutil.copyfileobj(body,handle)
+            removed=self.prune_snapshots()
+            write_status(self.settings,last_cleanup_error=None,removed_snapshots=removed)
+        except Exception as error:
+            write_status(self.settings,last_cleanup_error=safe_error(error))
+            logger.warning('Backup verified; retention cleanup failed (%s).',safe_error(error))
+        return dict(bucket=self.settings.bucket,key=self.settings.latest_key,sha256=digest,bytes=size,compressed_bytes=uploaded_bytes)
+
+    def _copy(self,source,destination):
+        options={}
+        if self.settings.server_side_encryption:options['ServerSideEncryption']=self.settings.server_side_encryption
+        if self.settings.server_side_encryption=='aws:kms' and self.settings.kms_key_id:options['SSEKMSKeyId']=self.settings.kms_key_id
+        self.s3.copy_object(Bucket=self.settings.bucket,Key=destination,
+            CopySource={'Bucket':self.settings.bucket,'Key':source},MetadataDirective='COPY',**options)
+
+    def prune_snapshots(self):
+        """Keep latest + previous; never delete unrelated bucket objects."""
+        with tempfile.TemporaryDirectory(prefix='finbot-retention-check-') as directory:
+            self._download_validated(Path(directory)/'latest.db')
+            self._download_validated(Path(directory)/'previous.db',self.settings.previous_key)
+        prefix=f"{self.settings.prefix+'/' if self.settings.prefix else ''}snapshots/"
+        keys=[]
+        for page in self.s3.get_paginator('list_objects_v2').paginate(Bucket=self.settings.bucket,Prefix=prefix):
+            for item in page.get('Contents',[]):
+                key=item['Key']
+                suffix=key[len(prefix):]
+                if re.fullmatch(r'\d{4}/\d{2}/\d{2}/finbot-[A-Za-z0-9.\-]+\.db(?:\.gz)?',suffix):keys.append(key)
+        # Complete inventory before deleting; report any partial service errors.
+        for offset in range(0,len(keys),1000):
+            result=self.s3.delete_objects(Bucket=self.settings.bucket,Delete={'Objects':[{'Key':k} for k in keys[offset:offset+1000]],'Quiet':True})
+            if result.get('Errors'):raise RuntimeError('Some snapshot deletions failed; retry retention cleanup.')
+        return len(keys)
+
+    def _download_validated(self,path,key=None):
+        # Body and metadata belong to the SAME GET, avoiding head/latest races.
+        response=self.s3.get_object(Bucket=self.settings.bucket,Key=key or self.settings.latest_key)
+        body=response['Body']
+        metadata=response.get('Metadata') or {}
+        try:
+            with Path(path).open('wb') as handle:
+                if metadata.get('compression')=='gzip':
+                    with gzip.GzipFile(fileobj=body,mode='rb') as decompressed:shutil.copyfileobj(decompressed,handle)
+                elif metadata.get('compression'):
+                    raise RuntimeError('Unsupported backup compression format.')
+                else:shutil.copyfileobj(body,handle)
         finally:body.close()
-        expected=(response.get('Metadata') or {}).get('sha256')
+        expected=metadata.get('sha256')
         digest=checksum(path)
         if not expected or digest!=expected:raise RuntimeError('Backup SHA256 metadata is missing or does not match the downloaded snapshot.')
         self._validate_database(path)
@@ -246,7 +307,7 @@ class S3SQLiteBackup:
             try:
                 try:self._download_validated(temporary)
                 except Exception as error:
-                    code=str(getattr(error,'response',{}).get('Error',{}).get('Code',''))
+                    code=str((getattr(error,'response',None) or {}).get('Error',{}).get('Code',''))
                     if code in {'404','NoSuchKey','NotFound'} and not self.settings.restore_required:
                         logger.warning('No remote snapshot exists yet; initializing a new database is permitted.');return False
                     raise
@@ -277,12 +338,24 @@ def run_daemon(backup):
     def stop(_signum,_frame):stopping.set()
     signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
     logger.info('S3 backup daemon started; interval=%s seconds',backup.settings.interval_seconds)
+    report_thread=None
+    def start_report():
+        nonlocal report_thread
+        if str(configuration_environment().get('FINBOT_REPORTING_ENABLED','false')).lower() not in {'true','1','yes','on'}:return
+        if report_thread is not None and report_thread.is_alive():return
+        from reporting_export import scheduled_publish
+        report_thread=threading.Thread(target=scheduled_publish,args=(backup.settings,),name='reporting-export',daemon=True)
+        report_thread.start()
     delay=min(10,backup.settings.interval_seconds)
     while not stopping.wait(delay):
-        try:backup.create_snapshot()
+        try:
+            backup.create_snapshot()
+            start_report()
         except Exception as error:logger.error('Scheduled backup failed (%s); retrying next interval.',safe_error(error))
         delay=backup.settings.interval_seconds
-    try:backup.create_snapshot()
+    try:
+        backup.create_snapshot()
+        # Reporting is best effort; daemon threads never delay the final recovery backup.
     except FileNotFoundError:logger.warning('No database exists for final backup.')
     except Exception as error:logger.error('Final backup failed (%s).',safe_error(error))
 

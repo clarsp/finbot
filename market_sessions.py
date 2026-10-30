@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 EXCHANGES: Dict[str, Dict[str, Any]] = {
+    "S&P500": {"timezone": "America/New_York", "open": "09:30", "close": "16:00"},
     "NASDAQ": {"timezone": "America/New_York", "open": "09:30", "close": "16:00"},
     "NYSE": {"timezone": "America/New_York", "open": "09:30", "close": "16:00"},
     "NYSE ARCA": {"timezone": "America/New_York", "open": "09:30", "close": "16:00"},
@@ -90,6 +91,8 @@ def build_market_session_context(
         now_utc = now_utc.replace(tzinfo=timezone.utc)
     now_utc = now_utc.astimezone(timezone.utc)
     broker_quote_state = "QUOTE_AVAILABLE" if quote.get("available") else "QUOTE_UNAVAILABLE"
+    if quote.get("available") and quote.get("executable") is False:
+        broker_quote_state = "QUOTE_INDICATIVE"
     if instrument.get("currently_tradeable") is False:
         broker_quote_state = "BROKER_MARKED_UNAVAILABLE"
     result: Dict[str, Any] = {
@@ -99,7 +102,11 @@ def build_market_session_context(
         "observed_at": now_utc.isoformat(),
         "underlying_session_state": "UNKNOWN",
         "market_session": "UNKNOWN",
-        "etoro_execution_state": broker_quote_state,
+        "broker_execution_state": broker_quote_state,
+        "broker_quote_available": bool(quote.get("available")),
+        "broker_quote_executable": bool(quote.get("available") and quote.get("executable") is not False),
+        "broker_quote_timestamp": quote.get("fetched_at"),
+        "etoro_execution_state": broker_quote_state,  # Legacy evidence aliases.
         "etoro_quote_available": bool(quote.get("available")),
         "etoro_quote_timestamp": quote.get("fetched_at"),
         "is_regular_session": False,

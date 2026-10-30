@@ -72,7 +72,7 @@ class DashboardPerformanceTests(unittest.TestCase):
         ui=AppTest.from_file(str(Path(app.__file__).with_name('streamlit_app.py')),default_timeout=20)
         ui.session_state['auth_token']=app.create_session_token('admin')
         ui.session_state['authenticated']=True;ui.session_state['username']='admin'
-        with patch('integrations.EtoroBrokerAdapter',return_value=self.adapter),patch.object(app,'get_trade_history',wraps=app.get_trade_history) as history:
+        with patch('integrations.create_broker_adapter',return_value=self.adapter),patch.object(app,'get_trade_history',wraps=app.get_trade_history) as history:
             ui.run()
             self.assertFalse(ui.exception,[e.message for e in ui.exception])
             self.assertFalse(any(c.kwargs.get('include_details',True) for c in history.call_args_list))
@@ -82,3 +82,35 @@ class DashboardPerformanceTests(unittest.TestCase):
             self.assertFalse(ui.exception,[e.message for e in ui.exception])
             self.assertTrue(any(c.kwargs.get('include_details',True) for c in history.call_args_list))
             self.adapter.get_positions.assert_not_called()
+
+class ClosedDashboardTests(unittest.TestCase):
+    setUp=_fixtures.DatabaseTests.setUp
+    trade=_fixtures.DatabaseTests.trade
+    row=_fixtures.DatabaseTests.row
+    update=_fixtures.DatabaseTests.update
+
+    def test_closed_view_defaults_to_current_week_and_refresh_reads_changes(self):
+        from streamlit.testing.v1 import AppTest
+        from datetime import datetime,timezone
+        tid=self.trade()
+        self.update(tid,status='CLOSED',broker_position_id='closed-p',closed_at=datetime.now(timezone.utc).isoformat())
+        c=app.get_connection()
+        c.execute('INSERT INTO broker_closed_positions VALUES (?,?,?,?,?)',('closed-p',datetime.now(timezone.utc).isoformat(),9,0,'{}'));c.commit();c.close()
+        ui=AppTest.from_file(str(Path(app.__file__).with_name('streamlit_app.py')),default_timeout=30)
+        ui.session_state['auth_token']=app.create_session_token('admin')
+        ui.session_state['authenticated']=True;ui.session_state['username']='admin'
+        ui.session_state['main_navigation']='Closed trades'
+        ui.run()
+        self.assertFalse(ui.exception,[e.message for e in ui.exception])
+        self.assertEqual(ui.selectbox(key='closed_trade_period').value,'this_week')
+        self.assertEqual(next(m.value for m in ui.metric if m.label=='Closed trades'),'1')
+        c=app.get_connection()
+        c.execute('INSERT INTO broker_closed_positions VALUES (?,?,?,?,?)',('second-p',datetime.now(timezone.utc).isoformat(),3,0,'{}'));c.commit();c.close()
+        ui.button(key='closed_refresh').click().run()
+        self.assertFalse(ui.exception,[e.message for e in ui.exception])
+        self.assertEqual(next(m.value for m in ui.metric if m.label=='Closed trades'),'2')
+        ui.selectbox(key='closed_trade_period').select('last_week').run()
+        self.assertTrue(any('excludes' in m.value for m in ui.info))
+        ui.button(key='closed_show_latest').click().run()
+        self.assertEqual(ui.selectbox(key='closed_trade_period').value,'all_history')
+        self.assertEqual(next(m.value for m in ui.metric if m.label=='Closed trades'),'2')

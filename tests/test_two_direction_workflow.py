@@ -87,7 +87,7 @@ class SizingTests(unittest.TestCase):
             self.assertEqual(workflow.exit_reason(trade,stop,now),'stop_level_observed')
             self.assertEqual(workflow.exit_reason(trade,target,now),'take_profit_level_observed')
             self.assertIsNone(workflow.exit_reason(trade,100,now))
-            self.assertEqual(workflow.exit_reason(trade,100,now+timedelta(hours=3)),'thesis_time_expired')
+            self.assertIsNone(workflow.exit_reason(trade,100,now+timedelta(hours=300)))
 
     def test_mean_reversion_needs_temporary_confident_turning_research(self):
         candidate={'price':95,'confidence':.9,'ai_analysis':{'reaction_assessment':'temporary'},
@@ -131,6 +131,19 @@ class SizingTests(unittest.TestCase):
 
 
 class DatabaseTests(unittest.TestCase):
+    def test_unchanged_neutral_does_not_create_another_trade_lifecycle(self):
+        researcher=MagicMock()
+        researcher.analyze_news_candidate=AsyncMock(return_value=dict(status='available',signal='neutral',confidence=.5,
+            neutral_reason='conflicting_evidence',neutral_reuse={'fingerprint':'same-evidence','reuse_count':1}))
+        articles=[dict(ticker='ACME',title='Acme mixed earnings',article_key='test-neutral',url='https://example.test/n',source='test',summary='',published_at=None,fetched_at=datetime.now(timezone.utc).isoformat())]
+        provider=MagicMock();provider.fetch_news=AsyncMock(return_value=articles)
+        with patch.object(app,'YahooFinanceNewsProvider',return_value=provider), patch.object(app,'ResearcherAgent',return_value=researcher), patch.object(app,'fetch_market_trends',AsyncMock(return_value={'available':False})):
+            asyncio.run(app.run_etoro_news_research_cycle(self.settings))
+        conn=app.get_connection()
+        self.assertEqual(conn.execute('SELECT COUNT(*) FROM trades').fetchone()[0],0)
+        conn.close()
+        self.submit.assert_not_awaited()
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
         self.stack=ExitStack()
@@ -153,7 +166,7 @@ class DatabaseTests(unittest.TestCase):
         self.adapter.resolve_instrument.return_value={'instrument_id':'1','currency':'USD','tradeable':True,'supported_asset':True,'buy_enabled':True,'short_enabled':True}
         self.adapter.estimate_order_costs.return_value={}
         self.adapter.get_closed_positions.return_value={'available':True,'positions':[]}
-        self.stack.enter_context(patch.object(app,'EtoroBrokerAdapter',return_value=self.adapter))
+        self.stack.enter_context(patch.object(app,'create_broker_adapter',return_value=self.adapter))
         self.stack.enter_context(patch.object(app,'load_daily_bars',return_value=pd.DataFrame([{'Close':100,'sma50':95,'sma200':90,'atr14':2}],index=pd.to_datetime(['2026-10-13'],utc=True))))
         self.stack.enter_context(patch.object(app,'load_news_reaction',return_value={'available':False}))
         self.stack.enter_context(patch.object(app,'fetch_company_fundamentals',AsyncMock(return_value={'company_name':'Acme','data_status':'available'})))
@@ -229,6 +242,17 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'expired'):asyncio.run(app.place_analysis_candidate_demo_order(tid))
         self.submit.assert_not_awaited()
 
+    def test_known_preflight_failure_is_not_marked_as_broker_rejection_or_uncertain(self):
+        from brokers.errors import BrokerPreflightError
+        tid=self.trade();self.submit.side_effect=BrokerPreflightError('HTTP 403 during instrument lookup')
+        with self.assertRaises(BrokerPreflightError):asyncio.run(app.place_analysis_candidate_demo_order(tid))
+        row=self.row(tid)
+        self.assertEqual(row['status'],'ANALYSIS_ONLY')
+        self.assertEqual(row['reconciliation_status'],'not_submitted')
+        self.assertEqual(row['quantity'],0)
+        self.assertIn('Order not submitted',row['notes'])
+        self.assertNotIn('requires broker reconciliation',row['notes'])
+
     def test_timeout_keeps_reference_and_blocks_blind_resubmission(self):
         tid=self.trade();self.submit.side_effect=ValueError('HTTP 408 request timed out')
         with self.assertRaises(ValueError):asyncio.run(app.place_analysis_candidate_demo_order(tid))
@@ -239,7 +263,7 @@ class DatabaseTests(unittest.TestCase):
 
     def test_stale_quote_never_submits(self):
         with patch.object(app,'fetch_market_quote',AsyncMock(return_value=dict(available=True,provider='eToro',ask=100,bid=99,fetched_at='2020-01-01T00:00Z'))):
-            with self.assertRaisesRegex(ValueError,'fresh eToro'):asyncio.run(app.place_analysis_candidate_demo_order(self.trade()))
+            with self.assertRaisesRegex(ValueError,'fresh executable broker'):asyncio.run(app.place_analysis_candidate_demo_order(self.trade()))
         self.submit.assert_not_awaited()
 
     def test_definite_rejection_releases_reserved_capital(self):
@@ -304,7 +328,7 @@ class DatabaseTests(unittest.TestCase):
                         policy_json=json.dumps(policy),config_json=json.dumps(self.rules),stop_loss_price=stop,take_profit_price=target)
             self.adapter.get_positions.return_value={'available':True,'positions':[dict(position_id=position_id,instrument_id='1',side=side,
                 units=1,amount=50,open_rate=100,current_rate=mark,stop_loss_price=stop,take_profit_price=target)]}
-            self.adapter._get_rate.return_value={'bid':mark,'ask':mark}
+            self.adapter.get_rate.return_value={'bid':mark,'ask':mark}
             asyncio.run(app.manage_etoro_demo_positions(self.settings))
             self.assertEqual(self.row(tid)['status'],'EXIT_PENDING')
             self.assertIsNone(self.row(tid)['closed_at'])
@@ -394,7 +418,7 @@ class DatabaseTests(unittest.TestCase):
     def test_admin_dashboard_renders_without_provider_requests(self):
         from streamlit.testing.v1 import AppTest
         # The dashboard performs broker/UI billing reads, all mocked here.
-        with patch('integrations.get_portfolio_account_snapshot',return_value={'available':False}),patch('integrations.fetch_openai_month_to_date_costs',AsyncMock(return_value={'available':False})),patch('integrations.EtoroBrokerAdapter',return_value=self.adapter):
+        with patch('integrations.get_portfolio_account_snapshot',return_value={'available':False}),patch('integrations.fetch_openai_month_to_date_costs',AsyncMock(return_value={'available':False})),patch('integrations.create_broker_adapter',return_value=self.adapter):
             ui=AppTest.from_file(str(Path(app.__file__).with_name('streamlit_app.py')),default_timeout=20)
             ui.session_state['auth_token']=app.create_session_token('admin')
             ui.session_state['authenticated']=True
@@ -413,12 +437,30 @@ class DatabaseTests(unittest.TestCase):
         c=app.get_connection();stages={r['stage'] for r in c.execute('SELECT * FROM trade_events')};c.close()
         self.assertTrue({'research','strategy','risk','execution'} <= stages)
 
+    def test_held_refresh_uses_normal_researcher_without_new_order(self):
+        import position_policy
+        tid=self.trade();self.update(tid,status='OPEN',broker_position_id='held')
+        c=app.get_connection();position_policy.request_research(c,'ACME','old');c.commit();c.close()
+        researcher=MagicMock();researcher.analyze_news_candidate=AsyncMock(return_value=dict(status='available',signal='neutral',confidence=.5,company_relevance='direct',reaction_assessment='uncertain'))
+        article=dict(article_key='held-fixture',fetched_at=datetime.now(timezone.utc).isoformat(),ticker='ACME',title='Company update',published_at=None)
+        provider=MagicMock();provider.fetch_news=AsyncMock(return_value=[])
+        with patch.object(app,'YahooFinanceNewsProvider',return_value=provider) as provider_class,patch.object(app,'ResearcherAgent',return_value=researcher),patch.object(app,'get_ai_research_enabled',return_value=False),patch.object(app,'fetch_market_trends',AsyncMock(return_value={})),patch.object(app,'get_strategy_evaluation',return_value={'status':'inconclusive'}):
+            provider_class._fetch_ticker_news.return_value=[article]
+            result=asyncio.run(app.run_etoro_news_research_cycle(self.settings))
+        researcher.analyze_news_candidate.assert_awaited_once()
+        self.submit.assert_not_awaited()
+        c=app.get_connection()
+        self.assertEqual(c.execute('SELECT count(*) FROM held_research_requests').fetchone()[0],0)
+        self.assertEqual(c.execute('SELECT count(*) FROM trades').fetchone()[0],1)
+        latest=json.loads(c.execute("SELECT details FROM trade_events WHERE trade_id=? AND stage='research' ORDER BY id DESC LIMIT 1",(tid,)).fetchone()[0]);c.close()
+        self.assertEqual(latest['signal'],'neutral')
+
 
 class AdapterTests(unittest.TestCase):
     def test_short_payload_and_reference_are_exact(self):
         adapter=object.__new__(EtoroBrokerAdapter)
         adapter.settings=types.SimpleNamespace(etoro_demo_trading=True,etoro_api_debug_logging=False)
-        adapter.api_logs=[];adapter._find_instrument=MagicMock(return_value={'instrumentId':123,'currency':'USD'})
+        adapter.api_logs=[];adapter._find_instrument=MagicMock(return_value={'instrumentId':123,'currency':'USD','isCurrentlyTradable':True,'internalAssetClassName':'Stocks'})
         adapter._request_json=MagicMock(return_value={'orderId':123456789012345678})
         result=adapter.submit_order(dict(symbol='ACME',side='SHORT',units=2,leverage=2,stop_loss_price=104,take_profit_price=94,currency='usd',reference_id='stable-reference'))
         payload=adapter._request_json.call_args.kwargs['payload']
@@ -434,7 +476,7 @@ class AdapterTests(unittest.TestCase):
         adapter.api_logs=[]
         response=MagicMock();response.status=200;response.read.return_value=b'{}';response.__enter__.return_value=response
         import integrations
-        with patch.object(integrations,'urlopen',return_value=response) as request:
+        with patch('brokers.etoro.urlopen',return_value=response) as request:
             for method in ['GET','POST','PATCH']:
                 adapter._request_json(method,'/fake',payload={'symbol':'ACME'} if method!='GET' else None)
                 self.assertEqual(request.call_args.args[0].get_header('User-agent'),'Finbot-Test/1.0')

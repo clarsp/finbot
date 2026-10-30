@@ -1,3 +1,5 @@
+from brokers.factory import demo_execution_enabled, account_lease_name
+from brokers.contracts import instrument_blockers, validate_runtime_binding
 import asyncio
 import base64
 import hashlib
@@ -19,6 +21,10 @@ from trading_workflow import VERSION as WORKFLOW_VERSION, size_order, mean_rever
 import workflow_store
 import broker_recovery
 import performance_analysis
+import outcome_notifications
+import position_timing
+import position_policy
+import native_trailing
 import scheduler_policy
 from profile_access import AccessControl
 import profile_access
@@ -37,7 +43,7 @@ if env_config_path.exists():
                 os.environ.setdefault(key, value)
 
 from integrations import (
-    EtoroBrokerAdapter,
+    create_broker_adapter,
     IntegrationSettings,
     OpenAIResearchAdapter,
     YahooFinanceNewsProvider,
@@ -127,14 +133,14 @@ DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
         "structure_target_mode": "range_boundary",
         "structure_range_months": 1,
         "structure_range_weeks": 4,
-        "minimum_reward_risk": 1.0,
+        "minimum_reward_risk": 0.0,
         "news_max_hold_hours": 48.0,
         "mean_reversion_max_hold_hours": 24.0,
         "estimated_roundtrip_cost_bps": 10.0,
         "estimated_financing_annual_pct": 8.0,
     },
     "execution": {"enabled": True, "status": "idle", "paper_trading_only": True, "max_trade_value": 2500, "max_trades_per_cycle": 2, "allowed_side": ["LONG", "SHORT"], "max_order_units": 5.0, "max_order_spend_usd": 200.0, "analysis_retention_days": 3, "max_research_age_hours": 24.0},
-    "position_manager": {"recovery_max_attempts": 3, "recovery_initial_check_seconds": 60, "recovery_max_check_seconds": 900, "recovery_escalate_hours": 2.0, "enabled": True, "status": "idle"},
+    "position_manager": {**position_policy.TRAILING_DEFAULTS, "profit_trailing_mode": "scheduled", "profit_trailing_enabled": False, "profit_review_exits_enabled": True, "profit_exit_min_net_usd": 1.0, "profit_exit_min_margin_pct": 0.5, "profit_exit_slippage_bps": 10.0, "pending_entry_max_minutes": 60.0, "recovery_max_attempts": 3, "recovery_initial_check_seconds": 60, "recovery_max_check_seconds": 900, "recovery_escalate_hours": 2.0, "enabled": True, "status": "idle"},
     "performance_analyst": {"enabled": True, "status": "idle", "minimum_closed_positions": 20},
 }
 
@@ -146,6 +152,10 @@ INSTRUMENT_NAMES = {
     "MSFT": "Microsoft Corporation",
     "NVDA": "NVIDIA Corporation",
     "USOIL": "WTI Crude Oil",
+    "SPX500": "S&P 500 Index (Non Expiry)",
+    "SPY": "SPDR S&P 500 ETF Trust",
+    "VOO": "Vanguard S&P 500 ETF",
+    "IVV": "iShares Core S&P 500 ETF",
     "XLE": "Energy Select Sector SPDR Fund",
     "XOM": "Exxon Mobil Corporation",
 }
@@ -182,11 +192,20 @@ def permission(level):
         return sync_call
     return decorate
 
+def runtime_broker_adapter(settings):
+    conn = get_connection()
+    try:
+        validate_runtime_binding(conn, settings.broker_provider)
+    finally:
+        conn.close()
+    return create_broker_adapter(settings)
+
+
 def serialized_account(function):
     @wraps(function)
     async def wrapped(*args, **kwargs):
         access.require_profile('operator')
-        async with workflow_store.lease(get_connection, "etoro_demo_account"):
+        async with workflow_store.lease(get_connection, account_lease_name(IntegrationSettings.from_environment())):
             return await function(*args, **kwargs)
     return wrapped
 
@@ -245,9 +264,9 @@ async def _manage_etoro_demo_positions(settings=None) -> dict:
     adopted = performance_analysis.adopt(ownership)
     ownership.close()
     settings = settings or IntegrationSettings.from_environment()
-    if settings.broker_provider != "etoro" or not settings.etoro_demo_trading:
+    if not demo_execution_enabled(settings):
         return {"status": "not_demo"}
-    adapter = EtoroBrokerAdapter(settings)
+    adapter = runtime_broker_adapter(settings)
     recovery = PositionManagerAgent().recovery_manager()
     account, snapshot, history = await asyncio.gather(
         asyncio.to_thread(adapter.get_account_snapshot), asyncio.to_thread(adapter.get_positions),
@@ -255,6 +274,21 @@ async def _manage_etoro_demo_positions(settings=None) -> dict:
     if not isinstance(snapshot, dict) or not snapshot.get("available"):
         return {"status": "broker_unavailable"}
     positions = snapshot["positions"]
+    # Refresh already-recorded outcomes from the existing history read. No new
+    # broker requests, and no unrelated account history is imported.
+    if isinstance(history,dict) and history.get('available'):
+        conn=get_connection()
+        try:
+            for completed in history.get('positions',[]):
+                position_id=outcome_notifications.pid(completed.get('position_id'))
+                if position_id and not any(outcome_notifications.pid(p.get('position_id'))==position_id for p in positions):
+                    conn.execute("UPDATE broker_closed_positions SET closed_at=COALESCE(?,closed_at),net_profit=COALESCE(?,net_profit),fees=COALESCE(?,fees),payload=? WHERE position_id=?",
+                        (completed.get('closed_at'),completed.get('net_profit'),completed.get('fees'),json.dumps(completed),position_id))
+            conn.executemany("INSERT INTO app_settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [('closed_history_synced_at',datetime.now(timezone.utc).isoformat()),
+                 ('closed_history_complete',str(bool(history.get('complete',False))).lower())])
+            conn.commit()
+        finally:conn.close()
     conn = get_connection()
     rows = [dict(r) for r in conn.execute("SELECT * FROM trades WHERE status IN ('SUBMITTING','SUBMITTED_PENDING_RECONCILIATION','OPEN','RECONCILIATION_REQUIRED','EXIT_PENDING','CLOSED_PNL_UNAVAILABLE') AND (broker_order_id IS NOT NULL OR broker_position_id IS NOT NULL OR order_reference IS NOT NULL)")]
     conn.close()
@@ -271,8 +305,9 @@ async def _manage_etoro_demo_positions(settings=None) -> dict:
                     conn = get_connection()
                     conn.execute("UPDATE trades SET broker_position_id=?, broker_order_id=COALESCE(?,broker_order_id), status='SUBMITTED_PENDING_RECONCILIATION' WHERE id=?", (position_id, str(lookup.get("orderId")) if lookup.get("orderId") is not None else None, trade["id"]))
                     conn.commit(); conn.close()
+                    trade.update(broker_position_id=position_id,broker_order_id=str(lookup.get("orderId")) if lookup.get("orderId") is not None else trade.get("broker_order_id"))
                     position = next((p for p in positions if str(p.get("position_id")) == position_id), None)
-                elif str((lookup.get("status") or {}).get("name", "")).lower() in {"rejected", "cancelled", "canceled"}:
+                elif broker_recovery.named_status(lookup) in {"rejected", "cancelled", "canceled", "expired"}:
                     conn = get_connection()
                     conn.execute("UPDATE trades SET status='REJECTED_EXECUTION', reconciliation_status='broker_confirmed_rejection', allocated_capital=0, quantity=0 WHERE id=?", (trade["id"],))
                     conn.commit(); conn.close()
@@ -289,11 +324,22 @@ async def _manage_etoro_demo_positions(settings=None) -> dict:
             conn = get_connection()
             conn.execute("INSERT INTO broker_closed_positions(position_id,closed_at,net_profit,fees,payload) VALUES (?,?,?,?,?) ON CONFLICT(position_id) DO UPDATE SET closed_at=excluded.closed_at,net_profit=excluded.net_profit,fees=excluded.fees,payload=excluded.payload", (position_id, completed.get("closed_at"), completed.get("net_profit"), completed.get("fees"), json.dumps(completed)))
             conn.execute("UPDATE trades SET status=?, closed_at=?, close_rate=?, realized_pnl=?, broker_fees=COALESCE(?,broker_fees), reconciliation_status='broker_history_confirmed' WHERE id=?", ("CLOSED" if completed.get("net_profit") is not None else "CLOSED_PNL_UNAVAILABLE", completed.get("closed_at"), completed.get("close_rate"), completed.get("net_profit") or 0, completed.get("fees"), trade["id"]))
+            outcome_notifications.queue_closure(conn, position_id)
             conn.commit(); conn.close()
             record_trade_event(trade["id"], "reconciliation", "position_manager", "completed", "accepted", "Broker closed-trade history confirms closure.", completed)
             continue
         if not position:
             continue
+        migrated_policy=position_timing.migrate_open_policy(trade)
+        if migrated_policy is not None and not recovery.get(trade['id'],'close'):
+            conn=get_connection()
+            conn.execute('UPDATE trades SET policy_json=? WHERE id=?',(json.dumps(migrated_policy),trade['id']))
+            conn.commit();conn.close()
+            trade['policy_json']=json.dumps(migrated_policy)
+            record_trade_event(trade['id'],'timing','position_manager','completed','accepted',
+                'Time-based closure disabled; elapsed time schedules evidence-based reassessment.',
+                {k:migrated_policy.get(k) for k in ('previous_hard_limit_hours','review_after_hours','review_interval_hours','time_exit_enabled','timing_policy_version')})
+        native_trailing.adopt_verified_stop(get_connection,trade,position)
         policy = json.loads(trade.get("policy_json") or "{}")
         # Existing historical positions keep their original levels. New orders
         # carry a versioned policy whose directional ATR levels follow the fill.
@@ -319,16 +365,49 @@ async def _manage_etoro_demo_positions(settings=None) -> dict:
         if trade['status']=='EXIT_PENDING':
             continue
         mark = None
+        native_status = None
         try:
-            rate = await asyncio.to_thread(adapter._get_rate, int(position["instrument_id"]))
+            rate = await asyncio.to_thread(adapter.get_rate, int(position["instrument_id"]))
             mark = rate.get("bid" if trade["side"] == "LONG" else "ask")
             if mark and math.isfinite(float(mark)) and float(mark) > 0:
                 position["current_rate"] = float(mark)
                 position["quote_observed_at"] = datetime.now(timezone.utc).isoformat()
+                if isinstance(rate,dict):
+                    position['executable_quote']={'available':True,'provider':'eToro','bid':rate.get('bid'),'ask':rate.get('ask'),'fetched_at':position['quote_observed_at']}
             else:
                 mark = None
         except Exception:
             mark = None
+        # Scheduled entry-ATR trailing also covers adopted, broker-owned positions.
+        if recovery.rules.get('profit_trailing_enabled', False) and mark:
+            conn = get_connection()
+            try:
+                trailing = position_policy.observe_trailing_profit(conn, trade, position, rate, time.time(), recovery.rules)
+            except (ValueError, TypeError, KeyError):
+                trailing = None
+            finally:
+                conn.close()
+            if recovery.rules.get('profit_trailing_mode','scheduled')=='broker':
+                try:
+                    conn=get_connection()
+                    try:
+                        fast=position_policy.observe_trailing_profit(conn,trade,position,rate,time.time(),recovery.rules,peak_only=True)
+                    finally:conn.close()
+                    native_status=await native_trailing.reconcile(recovery,trade,position,adapter,fast)
+                except (ValueError,TypeError,KeyError) as error:
+                    native_status={'status':'unavailable','error_type':type(error).__name__,'confirmed':False}
+            if trailing:
+                trailing['mode']=recovery.rules.get('profit_trailing_mode','scheduled')
+                if native_status:trailing['broker_trailing']=native_status
+                record_trade_event(trade['id'], 'profit_trailing', 'position_manager', 'completed',
+                    'close_due' if trailing['close_due'] else 'tracking',
+                    'Scheduled entry-ATR price trailing observation.', trailing)
+                if trailing['close_due'] and not (native_status or {}).get('confirmed'):
+                    try:
+                        await recovery.request_close(trade, position, adapter, 'profit_trailing:drawdown')
+                    except Exception as error:
+                        logger.warning('Tracked profit-trailing close awaits recovery for %s: %s', trade['id'], type(error).__name__)
+                    continue
         if trade.get("strategy_version") != WORKFLOW_VERSION:
             continue
         captured = json.loads(trade.get("config_json") or "{}")
@@ -341,19 +420,29 @@ async def _manage_etoro_demo_positions(settings=None) -> dict:
         reason = None
         if mark:
             reason = exit_reason({**trade, "policy": policy}, float(mark))
-        else:
-            # Time expiry needs no invented price to close a known position.
-            reason = exit_reason({**trade, "policy": policy, "stop_loss_price": None, "take_profit_price": None}, 0)
+            if reason=='stop_level_observed' and (native_status or {}).get('confirmed'):
+                # The native broker stop owns this execution; keep reconciling
+                # instead of adding a competing market-close request.
+                continue
         if not reason:
             conn = get_connection()
-            latest = conn.execute("SELECT details FROM trade_events WHERE stage='research' AND trade_id IN (SELECT id FROM trades WHERE symbol=?) ORDER BY id DESC LIMIT 1", (trade["symbol"],)).fetchone()
+            latest = conn.execute("SELECT created_at,details FROM trade_events WHERE stage='research' AND trade_id IN (SELECT id FROM trades WHERE symbol=?) ORDER BY id DESC LIMIT 1", (trade["symbol"],)).fetchone()
             conn.close()
             evidence = json.loads(latest["details"]) if latest else {}
-            ai = evidence.get("openai") or {}
-            if ai.get("reaction_assessment") == "structural" and float(evidence.get("confidence", 0)) >= .7 and evidence.get("signal") == ("bearish" if trade["side"] == "LONG" else "bullish"):
-                reason = "structural_news_invalidated_thesis"
-        if size_violation:
-            reason = "actual_fill_exceeded_configured_units_or_spend_cap"
+            # News/sizing exits additionally require a conservative profit gate.
+            # Recovery rechecks profit, reason and regular session immediately
+            # before every write; configured SL/TP exits remain independent.
+            advisory = RiskManagerAgent().review_position_invalidation(trade,evidence,latest['created_at'] if latest else None)
+            if size_violation:
+                advisory = 'actual_fill_exceeded_configured_units_or_spend_cap'
+            if advisory and mark and position_policy.profit_exit_evidence(trade,position,rate,recovery.rules)['allowed'] and time.time()-float(policy.get('last_profit_review_check',0))>=900:
+                reason = 'profit_review:' + advisory
+                policy['last_profit_review_check']=time.time()
+                conn=get_connection()
+                try:conn.execute('UPDATE trades SET policy_json=? WHERE id=?',(json.dumps(policy),trade['id']));conn.commit()
+                finally:conn.close()
+            if position_timing.review_due(trade,policy) or (advisory and advisory != policy.get('last_advisory_reason')):
+                await PositionManagerAgent().reassess_position(trade,position,policy,mark,evidence,latest['created_at'] if latest else None,advisory_reason=advisory)
         if reason:
             try:
                 await recovery.request_close(trade,position,adapter,reason)
@@ -535,6 +624,9 @@ def ensure_db() -> None:
         else:
             saved_rules = json.loads(existing["rules_json"])
             merged_rules = {**rules, **saved_rules}
+            if agent_name == 'position_manager':
+                for legacy_key in position_policy.LEGACY_TRAILING_KEYS:
+                    merged_rules.pop(legacy_key, None)
             if agent_name == 'execution':
                 merged_rules = {k:v for k,v in merged_rules.items() if not k.startswith('recovery_')}
             leverage_keys = {
@@ -676,6 +768,8 @@ def get_agent_rules() -> Dict[str, Dict[str, Any]]:
     }
     for row in rows:
         data.setdefault(row["agent_name"], {}).update(json.loads(row["rules_json"]))
+    for key in position_policy.LEGACY_TRAILING_KEYS:
+        data['position_manager'].pop(key, None)
     return data
 
 
@@ -751,7 +845,7 @@ def get_demo_automated_trading_enabled() -> bool:
 @permission('operator')
 def set_demo_automated_trading_enabled(enabled: bool) -> None:
     settings = IntegrationSettings.from_environment()
-    if enabled and settings.broker_provider != "etoro":
+    if enabled and not demo_execution_enabled(settings):
         raise ValueError("Select eToro as the broker provider before enabling demo automation.")
     if enabled and not settings.etoro_demo_trading:
         raise ValueError("Live execution is disabled; ETORO_DEMO_TRADING must remain true.")
@@ -783,7 +877,7 @@ async def _run_daily_trend_strategy_evaluation_retired() -> Dict[str, Any]:
         if not symbols:
             universe_errors["<universe>"] = "The configured symbol allowlist is empty."
         try:
-            adapter = EtoroBrokerAdapter(IntegrationSettings.from_environment())
+            adapter = runtime_broker_adapter(IntegrationSettings.from_environment())
         except Exception as error:
             adapter = None
             universe_errors["<eToro>"] = f"{type(error).__name__}: {error}"
@@ -792,7 +886,7 @@ async def _run_daily_trend_strategy_evaluation_retired() -> Dict[str, Any]:
                 try:
                     instrument = await asyncio.to_thread(adapter.resolve_instrument, symbol)
                     if not instrument.get("tradeable") or not instrument.get("supported_asset"):
-                        raise ValueError("eToro did not confirm a tradeable stock or ETF.")
+                        raise ValueError("eToro did not confirm a tradeable supported stock, ETF or S&P 500 index.")
                     if str(instrument.get("currency") or "").upper() != "USD":
                         raise ValueError("Only USD-denominated instruments are currently supported for risk conversion.")
                     resolved_symbols.append(symbol)
@@ -1365,7 +1459,7 @@ def update_agent_rules(agent_name: str, new_rules: Dict[str, Any]) -> Dict[str, 
                 raise ValueError(f"{key} must be finite.")
             if key in {"max_order_units", "max_order_spend_usd", "analysis_retention_days", "max_research_age_hours", "stop_atr_multiple", "target_reward_risk", "max_target_atr_multiple", "max_open_positions", "risk_per_trade_pct", "max_total_risk_pct", "max_gross_exposure_pct", "max_single_position_exposure_pct", "max_stressed_loss_pct", "max_sector_exposure_pct", "news_max_hold_hours", "mean_reversion_max_hold_hours", "conditional_mean_reversion_min_atr_multiple", "conditional_mean_reversion_confirmation_atr", "conditional_mean_reversion_stop_cushion_atr"} and float(value) <= 0:
                 raise ValueError(f"{key} must be greater than zero.")
-            if key in {"stress_gap_pct", "estimated_roundtrip_cost_bps", "estimated_financing_annual_pct"} and float(value) < 0:
+            if key in {"minimum_reward_risk", "stress_gap_pct", "estimated_roundtrip_cost_bps", "estimated_financing_annual_pct"} and float(value) < 0:
                 raise ValueError(f"{key} cannot be negative.")
             if "confidence" in key and not 0 <= float(value) <= 1:
                 raise ValueError("Confidence thresholds must be between zero and one.")
@@ -1388,10 +1482,17 @@ def update_agent_rules(agent_name: str, new_rules: Dict[str, Any]) -> Dict[str, 
     if agent_name == "risk_manager" and not merged.get("enabled", True):
         raise ValueError("Risk Manager is a required execution gate.")
     if agent_name == 'position_manager':
-        for key,low,high in [('recovery_max_attempts',1,5),('recovery_initial_check_seconds',60,900),('recovery_max_check_seconds',300,7200),('recovery_escalate_hours',.25,72)]:
+        if merged.get('profit_trailing_mode') not in position_policy.TRAILING_MODES:
+            raise ValueError('Profit trailing mode must be scheduled or broker.')
+        if position_policy.LEGACY_TRAILING_KEYS.intersection(new_rules):
+            raise ValueError('Dollar trailing thresholds were replaced by entry-ATR arming and retreat thresholds.')
+        position_policy.trailing_rules(merged)
+        for key,low,high in [('recovery_max_attempts',1,5),('recovery_initial_check_seconds',60,900),('recovery_max_check_seconds',300,7200),('recovery_escalate_hours',.25,72),('profit_exit_min_net_usd',.01,10000),('profit_exit_min_margin_pct',.01,100),('profit_exit_slippage_bps',1,1000),('pending_entry_max_minutes',5,1440)]:
             value=merged.get(key)
             if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or not low<=value<=high:
                 raise ValueError(f'{key} must be between {low} and {high}.')
+        if not isinstance(merged.get('profit_trailing_enabled', False),bool):raise ValueError('Profit trailing enabled must be true or false.')
+        if not isinstance(merged.get('profit_review_exits_enabled'),bool):raise ValueError('Profit review exits must be true or false.')
         if not float(merged['recovery_max_attempts']).is_integer():
             raise ValueError('Recovery attempt limit must be a whole number.')
         if merged['recovery_max_check_seconds']<merged['recovery_initial_check_seconds']:
@@ -1440,6 +1541,8 @@ def get_agent_summary(start_at: Optional[str] = None, end_at: Optional[str] = No
     rules_map = {name: dict(rules) for name, rules in DEFAULT_AGENT_RULES.items()}
     for row in conn.execute("SELECT agent_name, rules_json FROM agent_rules").fetchall():
         rules_map.setdefault(row["agent_name"], {}).update(json.loads(row["rules_json"]))
+    for legacy_key in position_policy.LEGACY_TRAILING_KEYS:
+        rules_map['position_manager'].pop(legacy_key, None)
 
     conditions = []
     parameters: List[str] = []
@@ -2183,7 +2286,7 @@ async def run_demo_test_workflow(symbol: str, amount: float = 10.0) -> Dict[str,
     if not math.isfinite(amount) or not 1 <= amount <= 25:
         raise ValueError("Test stake must be between $1 and $25.")
     settings = IntegrationSettings.from_environment()
-    if settings.broker_provider != "etoro" or not settings.etoro_demo_trading:
+    if not demo_execution_enabled(settings):
         raise ValueError("Test purchases require the eToro demo provider.")
     replay = next((r for r in get_sample_research_inputs() if r["symbol"] == symbol), None)
     if not replay:
@@ -2235,9 +2338,9 @@ async def reconcile_demo_test_workflow(workflow_id: int) -> Dict[str, Any]:
     if not workflow:
         raise ValueError("Test workflow run was not found.")
     settings = IntegrationSettings.from_environment()
-    if settings.broker_provider != "etoro" or not settings.etoro_demo_trading:
+    if not demo_execution_enabled(settings):
         raise ValueError("Test workflow reconciliation requires the eToro demo provider.")
-    adapter = EtoroBrokerAdapter(settings)
+    adapter = runtime_broker_adapter(settings)
     positions = await asyncio.to_thread(adapter.get_positions)
     if not positions.get("available"):
         raise ValueError("eToro demo positions could not be verified.")
@@ -2278,13 +2381,13 @@ async def close_demo_test_workflow(workflow_id: int) -> Dict[str, Any]:
     if not workflow or workflow.get("status") != "OPEN" or not workflow.get("broker_position_id"):
         raise ValueError("Only a reconciled open test position can be closed.")
     settings = IntegrationSettings.from_environment()
-    if settings.broker_provider != "etoro" or not settings.etoro_demo_trading:
+    if not demo_execution_enabled(settings):
         raise ValueError("Test position closes require the eToro demo provider.")
     if workflow["details"].get("trade_id"):
         result = await request_etoro_demo_close.__wrapped__(int(workflow["details"]["trade_id"]))
         sync_linked_test_workflows()
         return {"workflow_id": workflow_id, "status": "EXIT_PENDING", "close": result}
-    adapter = EtoroBrokerAdapter(settings)
+    adapter = runtime_broker_adapter(settings)
     broker_positions = await asyncio.to_thread(adapter.get_positions)
     if not broker_positions.get("available") or not any(
         str(item.get("position_id")) == str(workflow["broker_position_id"])
@@ -2318,14 +2421,14 @@ async def close_demo_test_workflow(workflow_id: int) -> Dict[str, Any]:
 @permission('operator')
 async def request_etoro_demo_close(trade_id: int) -> Dict[str, Any]:
     settings = IntegrationSettings.from_environment()
-    if settings.broker_provider != "etoro" or not settings.etoro_demo_trading:
+    if not demo_execution_enabled(settings):
         raise ValueError("Only an eToro demo position can be closed through this action.")
     conn = get_connection()
     trade = conn.execute("SELECT * FROM trades WHERE id = ? AND status IN ('OPEN','RECONCILIATION_REQUIRED')", (trade_id,)).fetchone()
     conn.close()
     if not trade or not trade["broker_position_id"]:
         raise ValueError("No known eToro demo position ID is stored for this trade.")
-    adapter = EtoroBrokerAdapter(settings)
+    adapter = runtime_broker_adapter(settings)
     snapshot = await asyncio.to_thread(adapter.get_positions)
     if not snapshot.get("available") or not any(str(p.get("position_id")) == str(trade["broker_position_id"]) for p in snapshot.get("positions", [])):
         raise ValueError("The broker did not verify that this position is currently open.")
@@ -2343,7 +2446,7 @@ async def update_etoro_demo_protection(
 ) -> Dict[str, Any]:
     """Submit one user-requested SL/TP update and persist it for reconciliation."""
     settings = IntegrationSettings.from_environment()
-    if settings.broker_provider != "etoro" or not settings.etoro_demo_trading:
+    if not demo_execution_enabled(settings):
         raise ValueError("Protection updates are available only for eToro demo positions.")
     stop = float(stop_loss_price)
     target = float(take_profit_price)
@@ -2358,7 +2461,7 @@ async def update_etoro_demo_protection(
     if not trade or not trade["broker_position_id"]:
         raise ValueError("No verified open eToro demo position is linked to this trade.")
 
-    adapter = EtoroBrokerAdapter(settings)
+    adapter = runtime_broker_adapter(settings)
     snapshot = await asyncio.to_thread(adapter.get_positions)
     matches = [
         position for position in snapshot.get("positions", [])
@@ -2370,7 +2473,7 @@ async def update_etoro_demo_protection(
     instrument_id = position.get("instrument_id")
     mark = float(position.get("current_rate") or 0)
     if mark <= 0 and instrument_id:
-        rate = await asyncio.to_thread(adapter._get_rate, int(instrument_id))
+        rate = await asyncio.to_thread(adapter.get_rate, int(instrument_id))
         mark = float(rate.get("bid" if str(trade["side"]).upper() == "LONG" else "ask") or 0)
     if mark <= 0:
         mark = float(position.get("open_rate") or 0)
@@ -2571,7 +2674,7 @@ async def run_hourly_news_fetch() -> Dict[str, int]:
         
         # The eToro workflow discovers research candidates from article tickers;
         # do not classify its headlines against the retired fixed research feed.
-        if IntegrationSettings.from_environment().broker_provider != "etoro":
+        if not demo_execution_enabled(IntegrationSettings.from_environment()):
             researcher = ResearcherAgent()
             market_data = await researcher.run_data_fetch(max_candidates=100)
             candidates = market_data.get("candidates", [])
@@ -2671,7 +2774,7 @@ def get_dashboard_summary(start_at: Optional[str] = None, end_at: Optional[str] 
     agent_summary = get_agent_summary(start_at, end_at)
     portfolio = get_portfolio_summary(end_at)
     performance = get_broker_performance()
-    if IntegrationSettings.from_environment().broker_provider == "etoro" and performance.get("broker_equity") is not None:
+    if demo_execution_enabled(IntegrationSettings.from_environment()) and performance.get("broker_equity") is not None:
         portfolio.update(starting_capital=performance["first_observed_equity"],
                          account_equity=performance["broker_equity"], cash_available=performance["cash_available"],
                          invested_capital=performance["invested_capital"], gross_exposure=performance["gross_exposure"],
@@ -2713,17 +2816,34 @@ class ResearcherAgent:
                 "signal": "neutral",
                 "confidence": 0.0,
             }
-        try:
-            result = await research_adapter.research({
+        from news_evidence import select_headlines, neutral_fingerprint, cached_neutral, remember_neutral
+        selected, selection = select_headlines(ticker, company_name, headlines)
+        subject = {
                 "ticker": ticker,
                 "company_name": company_name,
                 "sector": sector,
                 "background": "News-discovered candidate. Base the assessment on the supplied dated evidence; identify uncertainty and do not invent facts.",
-                "headlines": headlines,
+                "headlines": selected,
                 "fundamentals": fundamentals,
                 "market_context": market_context,
-            })
-            return {**result, "status": "available"}
+            }
+        fingerprint = neutral_fingerprint(subject, getattr(getattr(research_adapter, "settings", None), "openai_model", "unknown"))
+        conn = get_connection()
+        try:
+            prior = cached_neutral(conn, ticker, fingerprint)
+        finally:
+            conn.close()
+        if prior:
+            return {**prior, "headline_selection": selection}
+        try:
+            result = await research_adapter.research(subject)
+            result = {**result, "status": "available", "headline_selection": selection}
+            conn = get_connection()
+            try:
+                remember_neutral(conn, ticker, fingerprint, result)
+            finally:
+                conn.close()
+            return result
         except Exception as error:
             logger.warning("Researcher OpenAI analysis failed for %s: %s", ticker, type(error).__name__)
             return {
@@ -2950,6 +3070,10 @@ class StrategistAgent:
 
 
 class RiskManagerAgent:
+    def review_position_invalidation(self,trade,evidence,observed_at):
+        return position_timing.invalidation_reason(trade,evidence,observed_at,
+            max_age_hours=get_agent_rules()['execution'].get('max_research_age_hours',24))
+
     def build_shadow_plan(self, risk, policy, instrument_id):
         return shadow_tracking.build_plan(get_agent_rules()["risk_manager"], risk, policy, instrument_id)
 
@@ -2957,7 +3081,7 @@ class RiskManagerAgent:
         """Review a target-only change; existing stop and broker quantity stay fixed."""
         from price_structure import multi_timeframe_structure, structure_target
         result={'id':trade['id'],'symbol':trade['symbol'],'status':'skipped'}
-        if not is_fresh_etoro_quote(quote):
+        if not is_fresh_broker_quote(quote):
             return {**result,'reason':'No fresh eToro quote'}
         policy=json.loads(trade.get('policy_json') or '{}')
         if policy.get('framework') == 'CONDITIONAL_MEAN_REVERSION':
@@ -2989,8 +3113,7 @@ class RiskManagerAgent:
             return {**result,'reason':'Invalid broker or market fields'}
         hours=float(policy.get('holding_hours',48))
         opened=position.get('opened_at') or trade.get('opened_at')
-        if opened and policy.get('holding_hours') and datetime.now(timezone.utc)>=shadow_tracking.timestamp(opened)+timedelta(hours=hours):
-            return {**result,'reason':'Existing thesis holding limit has expired; no target extension'}
+        if opened:hours=max(hours,(datetime.now(timezone.utc)-position_timing.stamp(opened)).total_seconds()/3600)
         cost_per_unit=entry*(float(rules.get('estimated_roundtrip_cost_bps',10))/10000+float(rules.get('estimated_financing_annual_pct',8))/100*hours/8760)+max(0,float(trade.get('broker_fees') or 0))/units
         reward=sign*(target-entry); risk=max(0,sign*(entry-stop))
         result.update(estimated_net_profit=units*(reward-cost_per_unit),net_reward_risk=(reward-cost_per_unit)/risk if risk else None)
@@ -3023,11 +3146,10 @@ class RiskManagerAgent:
         if not account.get("available") or equity is None or float(equity) <= 0:
             execution_reasons.append("Verified positive account equity is required before an order can be sized.")
         if not broker_snapshot.get("available") or not isinstance(positions, list):
-            execution_reasons.append("A complete eToro positions snapshot is required before order execution.")
+            execution_reasons.append("A complete broker positions snapshot is required before order execution.")
         if account.get("pending_order_count", 0) or account.get("unsupported_mirror_positions", 0):
             execution_reasons.append("Broker pending orders or mirrored positions have unverified aggregate stop risk.")
-        if not instrument.get("tradeable") or not instrument.get("supported_asset"):
-            execution_reasons.append("eToro has not confirmed a tradeable supported instrument.")
+        execution_reasons.extend(instrument_blockers(instrument, strategy.get("position")))
         if strategy.get("position") == "SHORT" and instrument.get("short_enabled") is False:
             execution_reasons.append("eToro has disabled short orders for this instrument.")
         if strategy.get("position") == "LONG" and instrument.get("buy_enabled") is False:
@@ -3075,8 +3197,12 @@ class RiskManagerAgent:
         quote = candidate.get("market_quote") or {}
         side = strategy.get("position")
         entry = quote.get("ask" if side == "LONG" else "bid")
-        if not quote.get("available") or quote.get("provider") != "eToro" or not entry:
-            execution_reasons.append("A fresh verified eToro quote is required before order execution.")
+        if not quote.get("available") or not entry:
+            execution_reasons.append("Broker quote unavailable: " + str(quote.get("reason") or "no valid bid/ask prices were obtained"))
+        elif quote.get("executable") is False:
+            execution_reasons.append("Broker quote is not executable: " + str(quote.get("reason") or "quote eligibility or freshness could not be verified"))
+        elif quote.get("fetched_at") and not is_fresh_broker_quote(quote):
+            execution_reasons.append("Broker quote expired; a new executable quote is required.")
         valid_atr = False
         try:
             valid_atr = atr14 is not None and math.isfinite(float(atr14)) and float(atr14) > 0
@@ -3104,10 +3230,10 @@ class RiskManagerAgent:
                     setup=strategy.get("decision_gate", {}).get("conditional_mean_reversion"),
                     structure=daily_trend.get("price_structure") if rules.get("structure_targets_enabled", True) else None,
                 )
+                reasons.extend(sized.pop("rejection_reasons", []))
                 execution_reasons.extend(sized.pop("execution_reasons"))
                 forecast = (candidate.get("ai_analysis") or {}).get("forecast_horizon_hours")
-                if forecast is not None and math.isfinite(float(forecast)) and float(forecast) > 0:
-                    sized["holding_hours"] = min(sized["holding_hours"], float(forecast))
+                sized.update(position_timing.timing_fields(sized["holding_hours"],forecast))
         except (ValueError, TypeError, KeyError) as error:
             execution_reasons.append(f"An executable price, ATR, equity and valid order configuration are required: {error}")
         result = {
@@ -3120,6 +3246,8 @@ class RiskManagerAgent:
             "strategy_notes": strategy.get("notes"), "strategy_framework": strategy.get("decision_gate", {}).get("strategy_framework"),
             "risk_budget_multiplier": risk_budget_multiplier, "leverage": int(approved_leverage) if str(approved_leverage).replace(".", "", 1).isdigit() else None,
             "broker_order_submitted": False,
+            "broker_instrument": instrument,
+            "broker_quote": quote,
         }
         record_agent_event(
             "risk_manager", "completed", "news_candidate_portfolio_risk",
@@ -3206,6 +3334,61 @@ class PositionManagerAgent:
     async def manage(self, settings=None):
         return await _manage_etoro_demo_positions(settings)
 
+    async def reassess_position(self,trade,position,policy,mark,research,research_at,exit_reason=None,advisory_reason=None):
+        """One due review, reusing normal broker observations and saved agent research."""
+        now=datetime.now(timezone.utc)
+        stale = not research_at or (now-position_timing.stamp(research_at)).total_seconds()>float(get_agent_rules()['execution'].get('max_research_age_hours',24))*3600
+        if stale:
+            conn=get_connection()
+            try:
+                position_policy.request_research(conn,trade['symbol'],research_at,now);conn.commit()
+            finally:conn.close()
+            # Keep one review while waiting for the same dependency; Researcher
+            # claims the symbol in its ordinary scheduled cycle with hourly backoff.
+            waiting=policy.get('waiting_for_research')
+            if waiting and waiting.get('source_research_at')==research_at and advisory_reason==policy.get('last_advisory_reason'):
+                policy['next_review_at']=(now+timedelta(hours=1)).isoformat()
+                conn=get_connection()
+                try:conn.execute('UPDATE trades SET policy_json=? WHERE id=?',(json.dumps(policy),trade['id']));conn.commit()
+                finally:conn.close()
+                return {'decision':'waiting_for_research','next_review_at':policy['next_review_at']}
+        policy['waiting_for_research']={'source_research_at':research_at} if stale else None
+        details={'reviewed_at':now.isoformat(),'mark':mark,'research_at':research_at,
+                 'research_signal':research.get('signal'),'research_confidence':research.get('confidence'),
+                 'broker_stop':position.get('stop_loss_price'),'broker_target':position.get('take_profit_price'),
+                 'decision':'close' if exit_reason else 'review_required' if advisory_reason else 'hold','exit_reason':exit_reason,
+                 'time_exit_enabled':False,'advisory_reason':advisory_reason,'automatic_news_exit_enabled':bool(get_agent_rules()['position_manager'].get('profit_review_exits_enabled',True)),'limitations':[]}
+        if not mark:
+            details['decision']='review_required';details['limitations'].append('Fresh executable quote unavailable; no thesis close authorized.')
+        try:
+            bars=await asyncio.to_thread(load_daily_bars,trade['symbol'],'5y')
+            trend=evaluate_latest_signal(trade['symbol'],bars)
+            details['daily_trend']={k:trend.get(k) for k in ('available','trend_state','close','sma50','sma200','atr14','reason')}
+            opposing='bearish' if trade['side']=='LONG' else 'bullish'
+            if not exit_reason and (not trend.get('available') or trend.get('trend_state')==opposing):details['decision']='review_required'
+            if mark:
+                quote=position.get('executable_quote') or {}
+                details['target_review']=RiskManagerAgent().review_open_position_target(trade,position,quote,bars)
+            # Trend/target proposals are supporting evidence, not automatic level changes.
+        except Exception as error:
+            details['limitations'].append('Market context unavailable: '+type(error).__name__)
+        if not research_at or (now-position_timing.stamp(research_at)).total_seconds()>float(get_agent_rules()['execution'].get('max_research_age_hours',24))*3600:
+            details['limitations'].append('Current company research unavailable; next normal Researcher cycle supplies it.')
+        if details['limitations'] and not exit_reason:details['decision']='review_required'
+        interval=float(policy.get('review_interval_hours',policy['review_after_hours']))
+        if details['limitations']:interval=1.0 if stale else min(interval,float(get_agent_rules()['position_manager'].get('recovery_max_check_seconds',900))/3600)
+        policy.update(last_advisory_reason=advisory_reason,last_reassessed_at=now.isoformat(),next_review_at=(now+timedelta(hours=interval)).isoformat())
+        details['next_review_at']=policy['next_review_at']
+        conn=get_connection()
+        try:
+            conn.execute('UPDATE trades SET policy_json=? WHERE id=?',(json.dumps(policy),trade['id']));conn.commit()
+        finally:conn.close()
+        trade['policy_json']=json.dumps(policy)
+        record_trade_event(trade['id'],'reassessment','position_manager','completed',
+            'deferred' if details['decision']=='review_required' else 'observed',
+            'Position reassessed: '+details['decision']+'. Elapsed time alone does not close or change protection.',details)
+        return details
+
     def audit_configuration(self):
         access.require_profile('operator')
         result=TradeConfigurationAuditor().audit_all_trades()
@@ -3237,7 +3420,7 @@ class PositionManagerAgent:
         if instrument_id is None:
             return {'available':False,'reason':'Verified position instrument ID unavailable'}
         try:
-            rate=await asyncio.to_thread(adapter._get_rate,int(instrument_id))
+            rate=await asyncio.to_thread(adapter.get_rate,int(instrument_id))
             bid=float(rate['bid']);ask=float(rate['ask'])
             if not math.isfinite(bid) or not math.isfinite(ask) or not 0<bid<=ask:
                 raise ValueError('Invalid executable bid/ask')
@@ -3258,7 +3441,7 @@ class PositionManagerAgent:
         unavailable = []
         for instrument_id in instruments:
             try:
-                rate = await asyncio.to_thread(adapter._get_rate, int(instrument_id))
+                rate = await asyncio.to_thread(adapter.get_rate, int(instrument_id))
                 if not isinstance(rate, dict):
                     continue
                 conn = get_connection()
@@ -3510,6 +3693,11 @@ def evaluate_strategist_gate(
     fundamental_confirmation = fundamentals_align and company_news_supports_position
 
     daily_trend = candidate.get("daily_trend_context") or {}
+    if fundamentals.get('instrument_family')=='sp500':
+        if (candidate.get('ai_analysis') or {}).get('company_relevance')!='direct':
+            rejection_reasons.append('S&P 500 entries require direct index-wide market evidence, not ticker association or fund-issuer news.')
+        if fundamentals.get('data_status')!='available' or not daily_trend.get('available'):
+            rejection_reasons.append('S&P 500 entries require available instrument metadata and completed daily price context.')
     trend_state = str(daily_trend.get("trend_state") or "unknown").lower()
     current_price = candidate.get("price")
     sma50 = daily_trend.get("sma50")
@@ -3771,7 +3959,16 @@ class TradeConfigurationAuditor:
             "researcher": "approved" if researcher_decision else "unknown",
             "strategist": "approved" if strategist_decision and strategist_decision.get("leverage") else "unknown",
         }
-        
+        conn=get_connection()
+        try:
+            actions=[{k:a.get(k) for k in ('id','kind','state','position_id','attempts','checks','mismatches','next_check_at','last_error')}
+                     for a in broker_recovery.list_actions(conn,trade_id,active_only=True)]
+        finally:conn.close()
+        checks['recovery_actions']=actions
+        if trade['status'] in {'OPEN','RECONCILIATION_REQUIRED','EXIT_PENDING'}:
+            for action in actions:
+                if action['kind']=='protection' or action['state']=='ESCALATED' or not action['position_id']:
+                    checks['issues'].append(f"Unresolved broker recovery action {action['id']}: {action['kind']} / {action['state']}; position ID {action['position_id'] or 'missing'}.")
         return checks
     
     def audit_trade(self, trade_id: int) -> Dict[str, Any]:
@@ -3802,6 +3999,7 @@ class TradeConfigurationAuditor:
             summary["results"].append(result)
             summary["trades_audited"].append(trade["id"])
         summary['trades_with_issues'] = sum(bool(r.get('issues')) for r in summary['results'])
+        summary['active_trades_with_issues'] = sum(bool(r.get('issues')) and r.get('status') not in {'CLOSED','CLOSED_PNL_UNAVAILABLE'} for r in summary['results'])
         
         # Log summary
         with open(self.audit_log_path, "a") as f:
@@ -4026,11 +4224,13 @@ def reconcile_news_demo_positions(positions: List[Dict[str, Any]]) -> Dict[str, 
     return counts
 
 
-def is_fresh_etoro_quote(
+def is_fresh_broker_quote(
     quote: Dict[str, Any], *, checked_at: Optional[datetime] = None, max_age_seconds: int = 60,
 ) -> bool:
-    """Return whether an eToro bid/ask quote is current at the time it is checked."""
-    if not quote.get("available") or quote.get("provider") != "eToro" or not quote.get("fetched_at"):
+    """Return whether a broker bid/ask quote is current at the time it is checked."""
+    if not quote.get("available") or not quote.get("provider") or not quote.get("fetched_at"):
+        return False
+    if quote.get("executable") is False:
         return False
     try:
         quote_time = datetime.fromisoformat(str(quote["fetched_at"]).replace("Z", "+00:00"))
@@ -4041,6 +4241,9 @@ def is_fresh_etoro_quote(
     except (TypeError, ValueError):
         return False
 
+
+# Compatibility for existing callers; execution uses the broker-neutral check.
+is_fresh_etoro_quote = is_fresh_broker_quote
 
 def news_candidate_auto_submit_ready(
     *, automation_enabled: bool, research_decision: str, strategy_result: Dict[str, Any],
@@ -4096,14 +4299,14 @@ def news_candidate_lifecycle_status(
 async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] = None) -> Dict[str, Any]:
     """Discover news, run every agent gate, and submit eligible automated demo orders."""
     settings = settings or IntegrationSettings.from_environment()
-    if settings.broker_provider != "etoro" or not settings.etoro_demo_trading:
+    if not demo_execution_enabled(settings):
         message = "eToro research is available only when the broker is configured for demo mode."
         return {"mode": "blocked", "status": "blocked", "reason": message, "signals": {}, "trades": []}
 
     automation_enabled = get_demo_automated_trading_enabled()
     evaluation = get_strategy_evaluation()  # displayed for research; never gates demo orders
 
-    adapter = EtoroBrokerAdapter(settings)
+    adapter = runtime_broker_adapter(settings)
     try:
         account, broker_snapshot = await asyncio.gather(
             asyncio.to_thread(adapter.get_account_snapshot),
@@ -4131,7 +4334,19 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
     grouped = group_news_candidates(fetched_articles)
 
     max_candidates = max(1, min(20, int(os.getenv("FINBOT_RESEARCH_MAX_CANDIDATES", "8"))))
-    candidates = sorted(grouped.items(), key=lambda pair: newest_known_article_time(pair[1]), reverse=True)[:max_candidates]
+    conn=get_connection()
+    conn.execute("DELETE FROM held_research_requests WHERE symbol NOT IN (SELECT symbol FROM trades WHERE status IN ('OPEN','RECONCILIATION_REQUIRED') AND broker_position_id IS NOT NULL)");conn.commit()
+    refresh_symbols=position_policy.claim_research(conn,max(1,max_candidates//2));conn.close()
+    if refresh_symbols:
+        try:refresh_articles=await asyncio.to_thread(YahooFinanceNewsProvider._fetch_ticker_news,refresh_symbols)
+        except Exception:
+            logger.exception('Held-position news refresh unavailable; queued work retains backoff')
+            refresh_articles=[]
+        if refresh_articles:save_news_articles(refresh_articles)
+        refresh_grouped=group_news_candidates(refresh_articles)
+        for symbol in refresh_symbols:grouped[symbol]=refresh_grouped.get(symbol,grouped.get(symbol,[]))
+    candidates = [(symbol,grouped.get(symbol,[])) for symbol in refresh_symbols]
+    candidates += sorted(((symbol,headlines) for symbol,headlines in grouped.items() if symbol not in refresh_symbols), key=lambda pair:newest_known_article_time(pair[1]), reverse=True)[:max_candidates-len(candidates)]
     signals: Dict[str, Dict[str, Any]] = {}
     research_results: List[Dict[str, Any]] = []
     submitted_this_cycle = 0
@@ -4154,16 +4369,21 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
         quote = quote if isinstance(quote, dict) else {"available": False, "provider": "eToro", "reason": str(quote)}
         trends = trends if isinstance(trends, dict) else {"data_status": "unavailable", "reason": str(trends)}
         company_name = str(fundamentals.get("company_name") or ticker)
+        from news_evidence import select_headlines
+        collected_headlines = headlines
+        headlines, headline_selection = select_headlines(ticker, company_name, collected_headlines)
         instrument: Dict[str, Any] = {}
         instrument_error = None
         try:
             instrument = await asyncio.to_thread(adapter.resolve_instrument, ticker)
-            if not instrument.get("tradeable") or not instrument.get("supported_asset"):
-                raise ValueError("eToro did not confirm a tradeable stock or ETF.")
+            if not instrument.get("supported_asset"):
+                raise ValueError("Broker instrument asset class is unsupported.")
             if str(instrument.get("currency") or "").upper() != "USD":
                 raise ValueError("The current research workflow supports USD-denominated instruments only.")
         except Exception as error:
             instrument_error = f"{type(error).__name__}: {error}"
+            if not instrument:
+                instrument = {"resolved": False, "provider": settings.broker_provider, "reason": instrument_error}
 
         market_session_context = build_market_session_context(
             instrument=instrument,
@@ -4173,7 +4393,7 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
 
         # Compare with the time the quote was checked, not the start of the
         # whole research cycle; network and AI work can take longer than 60s.
-        quote_fresh = is_fresh_etoro_quote(quote)
+        quote_fresh = is_fresh_broker_quote(quote)
 
         reaction = await asyncio.to_thread(load_news_reaction, ticker, headlines)
         trends = {**trends, "news_reaction": reaction, "market_session_context": market_session_context}
@@ -4186,6 +4406,13 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
             market_context=trends,
             research_adapter=ai,
         )
+        if ai_result.get("neutral_reuse") and ticker not in refresh_symbols:
+            record_agent_event("researcher", "completed", "unchanged_neutral_research",
+                f"{ticker}: unchanged neutral evidence reused; no duplicate trade lifecycle created.",
+                "observed", {"ticker": ticker, "neutral_reuse": ai_result["neutral_reuse"],
+                             "neutral_reason": ai_result.get("neutral_reason"), "headline_selection": headline_selection})
+            research_results.append({"ticker": ticker, "decision": "neutral_reused", "neutral_reuse": ai_result["neutral_reuse"]})
+            continue
 
         signal = str(ai_result.get("signal") or "neutral").lower()
         if signal not in {"bullish", "bearish", "neutral"}:
@@ -4238,7 +4465,7 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
             "catalyst": ai_result.get("catalyst") or "news_research",
             "notes": ai_result.get("summary") or ai_result.get("reason") or "OpenAI research did not return a summary.",
             "price": quote_price or (float(bars.iloc[-1]["Close"]) if bars is not None and not bars.empty else None),
-            "market_quote": {**quote, "available": bool(quote.get("available") and quote_fresh)},
+            "market_quote": {**quote, "executable": bool(quote_fresh)},
             "daily_trend_context": daily_trend_context,
             "market_session_context": market_session_context,
             "fundamentals": fundamentals,
@@ -4257,16 +4484,32 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
             "source": "Yahoo Finance headlines + company financials + market context + OpenAI research",
             "signal": signal,
             "confidence": confidence,
-            "headline_count": len(headlines),
+            "headline_count": int(ai_result.get("headline_count_analyzed", min(8,len(headlines)) if ai_result.get("status")=="available" else 0)),
+            "headline_count_collected": len(collected_headlines),
+            "headline_selection": headline_selection,
+            "research_reason": ai_result.get("summary") or ai_result.get("reason"),
             "openai": ai_result,
-            "evidence": {"headlines": headlines[:8], "fundamentals": fundamentals, "market_context": trends},
+            "evidence": {"headlines": headlines, "collected_headlines": collected_headlines, "fundamentals": fundamentals, "market_context": trends},
             "market_session_context": market_session_context,
         }
         record_agent_event(
             "researcher", researcher_result["status"], "dynamic_news_research",
-            f"{ticker}: {signal} research from {len(headlines)} recent Yahoo headlines.",
+            f"{ticker}: {signal} research; {researcher_result['headline_count']} of {len(collected_headlines)} collected headlines analyzed.",
             research_decision, researcher_result,
         )
+
+        if ticker in refresh_symbols:
+            conn=get_connection()
+            held=conn.execute("SELECT id FROM trades WHERE symbol=? AND status IN ('OPEN','RECONCILIATION_REQUIRED') AND broker_position_id IS NOT NULL",(ticker,)).fetchall()
+            if ai_result.get('status')=='available':
+                conn.execute('DELETE FROM held_research_requests WHERE symbol=?',(ticker,));conn.commit()
+            conn.close()
+            if ai_result.get('status')=='available':
+                for held_trade in held:
+                    record_trade_event(held_trade['id'],'research','researcher','completed',research_decision,
+                        'Scheduled held-position research refresh; no new entry requested.',researcher_result)
+            research_results.append({'ticker':ticker,'purpose':'held_position_refresh','decision':research_decision})
+            continue
 
         if research_decision == "rejected":
             strategy_payload = {"position": "HOLD", "leverage": 1, "decision_gate": {
@@ -4424,7 +4667,7 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
         record_trade_event(
             trade_id, "research", "researcher", researcher_result["status"],
             researcher_result["decision"],
-            f"{signal.upper()} research based on {len(headlines)} news items and company evidence.",
+            f"{signal.upper()} research; {researcher_result['headline_count']} of {len(headlines)} collected headlines analyzed. {ai_result.get('summary') or ai_result.get('reason') or ''}",
             researcher_result,
         )
         record_trade_event(
@@ -4552,7 +4795,7 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
     if weekend_reason:raise ValueError(weekend_reason)
 
     settings = IntegrationSettings.from_environment()
-    if settings.broker_provider != "etoro" or not settings.etoro_demo_trading:
+    if not demo_execution_enabled(settings):
         raise ValueError("Manual orders are available only for the configured eToro demo account.")
 
     conn = get_connection()
@@ -4584,7 +4827,7 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
     if not articles:
         raise ValueError("The lifecycle has no news articles to support its research decision.")
 
-    adapter = EtoroBrokerAdapter(settings)
+    adapter = runtime_broker_adapter(settings)
     account, snapshot = await asyncio.gather(
         asyncio.to_thread(adapter.get_account_snapshot),
         asyncio.to_thread(adapter.get_positions),
@@ -4601,13 +4844,15 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
     if blocker:
         raise ValueError(f"Trade #{blocker['id']} ({blocker['symbol']}) has an unresolved submission; verify its order outcome before adding account risk.")
     instrument = await asyncio.to_thread(adapter.resolve_instrument, symbol)
-    if (not instrument.get("tradeable") or not instrument.get("supported_asset")
-            or str(instrument.get("currency") or "").upper() != "USD"):
-        raise ValueError("eToro did not confirm a tradeable USD stock or ETF.")
+    blockers = instrument_blockers(instrument)
+    if str(instrument.get("currency") or "").upper() != "USD":
+        blockers.append("Instrument currency is not supported by the USD execution workflow.")
+    if blockers:
+        raise ValueError("Order not submitted: " + "; ".join(blockers))
     if any(str(pos.get("symbol") or "").upper() == symbol
            or str(pos.get("instrument_id") or "") == str(instrument.get("instrument_id") or "")
            for pos in snapshot.get("positions", [])):
-        raise ValueError("An eToro position already exists for this symbol.")
+        raise ValueError("A broker position already exists for this symbol.")
     bars, fundamentals, reaction = await asyncio.gather(
         asyncio.to_thread(load_daily_bars, symbol, "5y"),
         fetch_company_fundamentals(symbol),
@@ -4618,8 +4863,8 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
     if not account.get("available") or not snapshot.get("available"):
         raise ValueError("Fresh account equity and positions are required at submission.")
     quote = await fetch_market_quote(symbol)
-    if not is_fresh_etoro_quote(quote):
-        raise ValueError("A fresh eToro bid/ask quote is required before submission.")
+    if not is_fresh_broker_quote(quote):
+        raise ValueError("A fresh executable broker bid/ask quote is required before submission.")
     signal = str(candidate.get("signal"))
     trend = daily.get("trend_state")
     side = "LONG" if signal == "bullish" else "SHORT"
@@ -4709,20 +4954,32 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
         risk["estimated_costs"] += opening_cost
         risk["estimated_total_spend"] += opening_cost
         risk["estimated_net_target_profit"] -= opening_cost
-        if risk["estimated_net_target_profit"] <= 0 or (risk.get("protection", {}).get("target_selection", {}).get("adjusted") and risk["estimated_net_target_profit"] / risk["planned_stop_risk"] < float(get_agent_rules()["risk_manager"].get("minimum_reward_risk", 1))):
+        if risk["estimated_net_target_profit"] <= 0 or risk["estimated_net_target_profit"] / risk["planned_stop_risk"] < float(get_agent_rules()["risk_manager"].get("minimum_reward_risk", 0)):
             raise ValueError("Broker costs leave insufficient net target payoff or net reward/risk.")
+    if risk.get("economic_gate"):
+        gate = risk["economic_gate"]
+        gate.update(actual_units=units, estimated_cost_per_unit=risk["estimated_costs"]/units,
+                    net_reward_per_unit=risk["estimated_net_target_profit"]/units,
+                    net_reward_risk=risk["estimated_net_target_profit"]/risk["planned_stop_risk"],
+                    estimated_gross_target_profit=risk["estimated_net_target_profit"]+risk["estimated_costs"],
+                    estimated_net_target_profit=risk["estimated_net_target_profit"],
+                    planned_stop_loss_before_costs=risk["planned_stop_risk"],
+                    estimated_stop_loss_with_costs=risk["planned_stop_risk"]+risk["estimated_costs"],
+                    required_target_distance=(risk["estimated_costs"]+gate["minimum_reward_risk"]*risk["planned_stop_risk"])/units)
+        risk["protection"]["net_reward_risk_ratio"] = gate["net_reward_risk"]
     required_margin = units * float(entry) / leverage
     cash = account.get("cash_available")
     if cash is None or float(cash) < required_margin + risk["estimated_costs"]:
         raise ValueError("Verified demo cash is insufficient for the freshly sized order.")
 
     reference = str(uuid.uuid4())
-    policy = {"sector": (candidate.get("fundamentals") or {}).get("sector"), "research_model": (candidate.get("ai_analysis") or {}).get("model"),
+    policy = {"entry_submitted_at": datetime.now(timezone.utc).isoformat(), "sector": (candidate.get("fundamentals") or {}).get("sector"), "research_model": (candidate.get("ai_analysis") or {}).get("model"),
               "research_provider": (candidate.get("ai_analysis") or {}).get("provider"),
               "research_confidence": candidate.get("confidence"),
-              "research_prompt_version": "news_reaction_v2",
+              "research_prompt_version": (candidate.get("ai_analysis") or {}).get("prompt_version") or "news_reaction_v2",
               "test_workflow_id": candidate.get("test_workflow_id"), "framework": strategy["decision_gate"].get("strategy_framework") or "DIRECTIONAL_NEWS",
-              "holding_hours": risk["holding_hours"], "sizing": risk["sizing"],
+              "holding_hours": risk["holding_hours"],
+              **position_timing.timing_fields(risk["holding_hours"],risk.get("forecast_horizon_hours")), "sizing": risk["sizing"],
               "estimated_costs": risk["estimated_costs"], "cost_assumptions": risk.get("cost_assumptions", {}), "atr14": atr14,
               "broker_cost_evidence": cost_evidence,
               "market_session_context": market_session_context,
@@ -4753,7 +5010,7 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
                        "Fresh account, positions, quote, ATR, sizing, and stop checks passed.", risk)
     attempted_submission = False
     try:
-        if not is_fresh_etoro_quote(quote):
+        if not is_fresh_broker_quote(quote):
             raise ValueError("The execution quote expired; the order was not sent.")
         attempted_submission = True
         order = await submit_broker_order({
@@ -4762,23 +5019,29 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
             "currency": "usd", "reference_id": reference,
         })
     except Exception as error:
+        if getattr(error, "request_sent", None) is False:
+            attempted_submission = False
         response_status = re.search(r"HTTP\s+(\d{3})", str(error), re.IGNORECASE)
-        definitely_rejected = bool(response_status and int(response_status.group(1)) in {400, 401, 403, 404, 422})
+        http_status = getattr(error, "status_code", None) or (int(response_status.group(1)) if response_status else None)
+        definitely_rejected = bool(attempted_submission and http_status in {400, 401, 403, 404, 422})
         failure_status = "REJECTED_EXECUTION" if definitely_rejected else "RECONCILIATION_REQUIRED" if attempted_submission else "ANALYSIS_ONLY"
-        reconciliation_status = "broker_rejected" if definitely_rejected else "submission_outcome_uncertain"
+        reconciliation_status = "broker_rejected" if definitely_rejected else "submission_outcome_uncertain" if attempted_submission else "not_submitted"
+        failure_message = (f"Broker rejected the order: {error}" if definitely_rejected else
+                           f"Order outcome requires broker reconciliation; do not resubmit blindly. {error}" if attempted_submission else
+                           f"Order not submitted: {error}")
         conn = get_connection()
         conn.execute("UPDATE trades SET status = ?, reconciliation_status = ?, notes = ? WHERE id = ?",
                      (failure_status, reconciliation_status,
-                      f"eToro rejected the order. {error}" if definitely_rejected else f"Order outcome requires broker reconciliation; do not resubmit blindly. {error}",
+                      failure_message,
                       int(trade_id)))
         if not attempted_submission or definitely_rejected:
             conn.execute("UPDATE trades SET quantity=0,allocated_capital=0 WHERE id=?", (int(trade_id),))
         conn.commit()
         conn.close()
         record_trade_event(trade_id, "execution", "execution", "completed",
-                           "rejected" if definitely_rejected else "uncertain",
-                           f"eToro order rejected: {error}" if definitely_rejected else f"eToro submission outcome requires reconciliation: {error}",
-                           {"api_logs": getattr(error, "api_logs", []), "symbol": symbol})
+                           "rejected" if definitely_rejected else "uncertain" if attempted_submission else "blocked",
+                           failure_message,
+                           {"api_logs": getattr(error, "api_logs", []), "symbol": symbol, "broker_order_submitted": attempted_submission})
         raise
     conn = get_connection()
     conn.execute(
@@ -4829,7 +5092,10 @@ async def _run_retired_etoro_trend_cycle(settings: Optional[IntegrationSettings]
 async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]:
     ai_enabled = get_ai_research_enabled() if use_openai is None else use_openai
     settings = IntegrationSettings.from_environment()
-    if settings.broker_provider == "etoro":
+    if settings.broker_provider != "dummy" and not demo_execution_enabled(settings):
+        return {"mode": settings.broker_provider, "status": "broker_disabled",
+                "reason": "No validated demo execution adapter is enabled for this provider. No simulated or broker order was created.", "trades": []}
+    if demo_execution_enabled(settings):
         try:
             async with workflow_store.lease(get_connection, "news_research_cycle"):
                 return await run_etoro_news_research_cycle(settings)
@@ -5137,7 +5403,7 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
 
         if not bool(execution_rules.get("enabled", True)):
             execution_readiness_error = "Execution agent is disabled by its rule set."
-        elif not bool(execution_rules.get("paper_trading_only", True)) and settings.broker_provider != "etoro":
+        elif not bool(execution_rules.get("paper_trading_only", True)) and not demo_execution_enabled(settings):
             execution_readiness_error = "Non-eToro live execution is not implemented; trade blocked."
         elif strategy["position"] not in execution_rules.get("allowed_side", ["LONG", "SHORT"]):
             execution_readiness_error = "Execution side is disabled by the current rules."
@@ -5267,7 +5533,7 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
         take_profit_price = item["take_profit_price"]
         broker_order = None
         paper_only = True
-        if settings.broker_provider == "etoro":
+        if demo_execution_enabled(settings):
             try:
                 broker_order = await submit_broker_order(
                     {
@@ -5393,7 +5659,7 @@ async def maintenance_loop() -> None:
                 async with workflow_store.lease(get_connection, "analysis_cleanup"):
                     cleanup_stale_analysis()
                 last_cleanup = time.monotonic()
-            if IntegrationSettings.from_environment().broker_provider == "etoro":
+            if demo_execution_enabled(IntegrationSettings.from_environment()):
                 await manage_etoro_demo_positions()
         except workflow_store.AccountBusy:
             logger.info("Account maintenance will retry after the current operation.")
@@ -5443,8 +5709,14 @@ def get_managed_positions():
     try:
         return [dict(r) for r in conn.execute("""SELECT t.id,t.symbol,t.side,t.status,t.broker_position_id,
             t.stop_loss_price,t.take_profit_price,t.reconciliation_status,t.stop_state,
-            pm.architecture_version,pm.origin,pm.adopted_at
+            pm.architecture_version,pm.origin,pm.adopted_at,
+            pt.entry_atr AS trailing_entry_atr,pt.best_price AS trailing_best_price,
+            datetime(pt.checked_at,'unixepoch') AS trailing_checked_at_utc,
+            json_extract(pt.evidence,'$.tier') AS trailing_tier,
+            json_extract(pt.evidence,'$.retreat_atr') AS trailing_retreat_atr,
+            json_extract(pt.evidence,'$.trigger_price') AS trailing_trigger_price
             FROM position_management pm JOIN trades t ON t.id=pm.trade_id
+            LEFT JOIN price_trailing pt ON pt.trade_id=t.id
             WHERE t.status IN ('OPEN','EXIT_PENDING','RECONCILIATION_REQUIRED','SUBMITTED_PENDING_RECONCILIATION')
             ORDER BY t.id DESC""")]
     finally:conn.close()
@@ -5465,6 +5737,56 @@ def get_historical_path_analyses(limit=50):
         ORDER BY e.id DESC LIMIT ?""",(limit,))]
     finally:conn.close()
 
+
+@permission('viewer')
+def get_closed_trade_report(period='last_week'):
+    from datetime import timedelta
+    now=datetime.now(timezone.utc).astimezone(outcome_notifications.TZ)
+    today=now.replace(hour=0,minute=0,second=0,microsecond=0)
+    monday=today-timedelta(days=today.weekday())
+    if period=='last_week':start,end=monday-timedelta(days=7),monday
+    elif period=='this_week':start,end=monday,now
+    elif period=='last_30_days':start,end=today-timedelta(days=29),now
+    elif period=='all_history':start,end=None,None
+    else:raise ValueError('Unknown report period.')
+    conn=get_connection()
+    try:return outcome_notifications.report(conn,start.astimezone(timezone.utc) if start else None,end.astimezone(timezone.utc) if end else None)
+    finally:conn.close()
+
+
+@permission('operator')
+def get_outcome_notification_status():
+    conn=get_connection()
+    try:
+        return dict(preferences=outcome_notifications.preferences(conn),
+            deliveries=[dict(r) for r in conn.execute("""SELECT d.id,e.kind,e.event_key,d.recipient,d.state,d.attempts,d.last_error,d.accepted_at
+                FROM outcome_notification_deliveries d JOIN outcome_notification_events e ON e.event_key=d.event_key
+                ORDER BY d.id DESC LIMIT 100""")],
+            weekly_reports=[{**dict(r),'payload':json.loads(r['payload'])} for r in conn.execute("SELECT event_key,created_at,payload FROM outcome_notification_events WHERE kind='weekly' ORDER BY created_at DESC LIMIT 12")])
+    finally:conn.close()
+
+
+@permission('operator')
+def set_outcome_notification_preferences(closure_enabled,weekly_enabled):
+    if not isinstance(closure_enabled,bool) or not isinstance(weekly_enabled,bool):raise ValueError('Expected boolean preferences.')
+    conn=get_connection()
+    try:
+        conn.executemany("INSERT INTO app_settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [('closure_email_enabled',str(closure_enabled).lower()),('weekly_closed_report_enabled',str(weekly_enabled).lower())])
+        conn.commit()
+    finally:conn.close()
+
+
+@permission('operator')
+def retry_failed_outcome_notification(delivery_id):
+    conn=get_connection()
+    try:
+        changed=conn.execute("UPDATE outcome_notification_deliveries SET state='PENDING',attempts=0,next_attempt_at=0,last_error=NULL WHERE id=? AND state='FAILED'",(int(delivery_id),)).rowcount
+        if not changed:raise ValueError('Only definitively failed deliveries can be retried. Uncertain sends require investigation.')
+        conn.commit()
+    finally:conn.close()
+
+
 @permission('viewer')
 def get_performance_reviews(limit=30):
     conn=get_connection()
@@ -5481,6 +5803,16 @@ class PerformanceAnalystAgent(performance_analysis.PerformanceAnalystAgent):
         access.require_profile('operator')
         return await _analyze_historical_trade_path(trade_id,max_days)
 
+    def queue_weekly_outcome_report(self,now=None):
+        access.require_profile('operator')
+        if not get_agent_rules()['performance_analyst'].get('enabled',True):return False
+        conn=get_connection()
+        try:
+            queued=outcome_notifications.queue_weekly(conn,now,require_fresh_history=True)
+            conn.commit()
+            return queued
+        finally:conn.close()
+
     def __init__(self):
         super().__init__(get_connection,get_agent_rules()['performance_analyst'])
 
@@ -5493,11 +5825,24 @@ async def performance_review_loop():
                     record_agent_event('performance_analyst','completed',report['cadence']+'_review',
                         f"Advisory review saved: {report['summary']['closed_positions']} confirmed closures; no rules or orders changed.",
                         'observed',report)
+                if get_agent_rules()['performance_analyst'].get('enabled',True):
+                    async with workflow_store.lease(get_connection,account_lease_name(IntegrationSettings.from_environment())):
+                        PerformanceAnalystAgent().queue_weekly_outcome_report()
         except workflow_store.AccountBusy:
             pass
         except Exception:
             logger.exception('Performance review failed; retrying in fifteen minutes')
         await asyncio.sleep(900)
+
+async def outcome_notification_loop():
+    """Notification delivery is independent of broker maintenance and its lease."""
+    while True:
+        try:
+            await asyncio.to_thread(outcome_notifications.process_outbox,get_connection)
+        except Exception as error:
+            logger.warning("Outcome email service will retry: %s",type(error).__name__)
+        await asyncio.sleep(60)
+
 
 async def heartbeat_loop() -> None:
     while True:
@@ -5516,9 +5861,13 @@ async def main() -> None:
     maintenance = asyncio.create_task(maintenance_loop())
     analyst = asyncio.create_task(performance_review_loop())
     heartbeat = asyncio.create_task(heartbeat_loop())
+    notifications = asyncio.create_task(outcome_notification_loop())
+    import sys
+    import telegram_bot
+    telegram = asyncio.create_task(telegram_bot.run(sys.modules[__name__]))
     try:
         while True:
-            if heartbeat.done() or maintenance.done() or analyst.done():
+            if heartbeat.done() or maintenance.done() or analyst.done() or notifications.done() or telegram.done():
                 raise RuntimeError("A required worker task exited; supervisor must restart the worker.")
             now = time.monotonic()
             if claim_due_news_fetch(settings.news_interval_seconds):
@@ -5537,7 +5886,9 @@ async def main() -> None:
         analyst.cancel()
         maintenance.cancel()
         heartbeat.cancel()
-        await asyncio.gather(maintenance, heartbeat, analyst, return_exceptions=True)
+        notifications.cancel()
+        telegram.cancel()
+        await asyncio.gather(maintenance, heartbeat, analyst, notifications, telegram, return_exceptions=True)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,8 @@ class ProfileAccessTests(unittest.TestCase):
         with self.acting('viewer'):
             self.assertEqual(app.get_trade_history()[0]['id'],tid)
             for action in [lambda:app.update_agent_rules('execution',{'enabled':False}),
+                           lambda:app.set_outcome_notification_preferences(False,False),
+                           lambda:app.retry_failed_outcome_notification(1),
                            lambda:app.set_starting_capital(1),lambda:app.add_user('evil',PASSWORD,True),
                            lambda:app.set_user_admin('viewer',True),lambda:app.set_user_suspended('admin',True),
                            lambda:app.cleanup_stale_analysis(),lambda:app.PositionManagerAgent().recovery_manager(),
@@ -227,3 +229,32 @@ class ProfileAccessTests(unittest.TestCase):
         self.assertTrue(any('Draft profile:' in info.value for info in ui.info))
         self.assertFalse(any(b.label=='Run configuration audit' for b in ui.button))
         self.adapter.get_positions.assert_not_called()
+
+
+    def test_viewer_closed_trade_dashboard_has_no_notification_controls(self):
+        ui=self.ui('viewer')
+        ui.session_state['viewer_navigation']='Closed trades'
+        ui.run()
+        self.assertFalse(ui.exception,[e.message for e in ui.exception])
+        self.assertTrue(any(s.value=='Closed trades · realized results' for s in ui.subheader))
+        self.assertFalse(any(e.label=='Closure emails and weekly reports' for e in ui.expander))
+
+
+    def test_operator_closed_trade_dashboard_renders_results_and_uncertain_mail(self):
+        from datetime import datetime,timedelta,timezone
+        import outcome_notifications as notifications
+        now=datetime.now(timezone.utc).astimezone(notifications.TZ)
+        monday=now.replace(hour=0,minute=0,second=0,microsecond=0)-timedelta(days=now.weekday())
+        closed=(monday-timedelta(days=1)).isoformat()
+        c=app.get_connection()
+        c.execute("INSERT INTO broker_closed_positions VALUES ('p',?,12.5,1,'{}')",(closed,))
+        notifications.queue_closure(c,'p')
+        c.execute("INSERT INTO outcome_notification_deliveries(event_key,recipient,state,message_id) VALUES ('closure:p','recipient@example.test','UNCERTAIN','<id@test>')")
+        c.commit();c.close()
+        ui=self.ui('operator');ui.session_state['main_navigation']='Closed trades'
+        ui.session_state['closed_trade_period']='last_week'  # This fixture deliberately closes on the prior Sunday.
+        ui.run()
+        self.assertFalse(ui.exception,[e.message for e in ui.exception])
+        self.assertTrue(any(m.label=='Winning-trade gains' and m.value=='USD 12.50' for m in ui.metric))
+        self.assertTrue(any(e.label=='Closure emails and weekly reports' for e in ui.expander))
+        self.assertTrue(any('uncertain outcome' in w.value for w in ui.warning))

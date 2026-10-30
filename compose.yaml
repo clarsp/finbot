@@ -1,6 +1,8 @@
 services:
   finbot:
     build: .
+    image: finbot:research-20261022
+    pull_policy: never
     restart: unless-stopped
     init: true
     stop_grace_period: 120s
@@ -11,7 +13,8 @@ services:
         max-file: "3"
     env_file:
       - path: .env.config
-        required: false
+        required: true
+        format: raw
     environment:
       FINBOT_DB_PATH: /data/finbot.db
       FINBOT_SKIP_INSTALL: "true"
@@ -36,3 +39,5 @@ services:
 
 volumes:
   finbot_data:
+    external: true
+    name: finbot_migrated_20261022

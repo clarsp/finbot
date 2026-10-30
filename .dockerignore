@@ -13,3 +13,12 @@ logs
 data
 .DS_Store
 finbot.tar
+
+.aws
+.codex
+.agents
+
+# Documentation archives and generated operational output.
+audit_logs/
+*.log
+*.tar.gz

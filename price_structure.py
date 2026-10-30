@@ -125,6 +125,10 @@ def range_boundary_target(side, entry, baseline, atr, structure, months=1, weeks
         crossed_obstacles=obstacles, requires_nearby_breakout=bool(obstacles),
         breakout_assumption='Existing directional strategy approval; closer levels may fail to break.',
         formula='ATR target capped at the outer recent monthly range (weekly fallback); nearer levels recorded as obstacles.')
+    if sign*(edge(boundary)-entry)<=0:
+        direction='above' if side=='LONG' else 'below'
+        level='resistance' if side=='LONG' else 'support'
+        evidence.update(entry_blocked=True,entry_block_reason=f'Not executed: price already {direction} the configured {evidence["boundary_timeframe"]} {level} range; breakout confirmation required.')
     return target, evidence
 
 

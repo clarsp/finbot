@@ -14,7 +14,7 @@ class StructureTests(unittest.TestCase):
     def test_small_profit_cannot_bypass_net_reward_risk_using_leverage(self):
         for leverage in (1,2,3):
             result=size_order(side='LONG',entry=100,atr=2,equity=10000,cash=10000,
-                leverage=leverage,positions=[],risk_rules={},execution_rules={},
+                leverage=leverage,positions=[],risk_rules={'minimum_reward_risk':1},execution_rules={},
                 structure={'available':True,'resistance':[{'low':102,'high':102.2}]})
             self.assertTrue(result['execution_reasons'])
             self.assertEqual(result['proposed_stop'],96)
@@ -106,3 +106,39 @@ class RangeBoundaryTests(unittest.TestCase):
 
     def test_default_function_stays_nearest_for_historical_and_shadow_consumers(self):
         self.assertAlmostEqual(structure_target('LONG',37,68,2,self.structure())[0],39.8)
+
+class RangeEntryRuleTests(unittest.TestCase):
+    def test_breakout_is_terminal_for_both_directions(self):
+        from trading_workflow import size_order
+        for side,entry,edge in [('LONG',166.4,159.98),('SHORT',40,45)]:
+            key='resistance' if side=='LONG' else 'support'
+            structure={'available':True,'as_of':'2026-10-21T00:00:00Z',key:[{'low':edge,'high':edge,'timeframe':'monthly','source_through':'2026-10-21T00:00:00Z'}]}
+            result=size_order(side=side,entry=entry,atr=2.54,equity=10000,cash=5000,leverage=2,positions=[],risk_rules={'structure_target_mode':'range_boundary'},execution_rules={},structure=structure)
+            self.assertTrue(result['rejection_reasons']);self.assertIn('breakout confirmation required',result['rejection_reasons'][0])
+            self.assertTrue(result['protection']['target_selection']['entry_blocked'])
+    def test_risk_agent_rejects_range_breakout_before_execution(self):
+        import copy
+        from unittest.mock import patch
+        import makemoney
+        rules=copy.deepcopy(makemoney.DEFAULT_AGENT_RULES)
+        structure={'available':True,'as_of':'2026-10-21T00:00:00Z','resistance':[{'low':159.98,'high':159.98,'timeframe':'monthly','source_through':'2026-10-21T00:00:00Z'}]}
+        candidate={'ticker':'PG','confidence':.9,'market_quote':{'available':True,'provider':'eToro','ask':166.4,'bid':166.34},'daily_trend_context':{'available':True,'trend_state':'bullish','price_structure':structure}}
+        with patch.object(makemoney,'get_agent_rules',return_value=rules),patch.object(makemoney,'record_agent_event'):
+            risk=makemoney.RiskManagerAgent().review_news_demo_candidate(candidate=candidate,strategy={'position':'LONG','leverage':2},account={'available':True,'equity':10000,'cash_available':5000},broker_snapshot={'available':True,'positions':[]},instrument={'tradeable':True,'supported_asset':True},atr14=2.54)
+        self.assertEqual(risk['decision'],'rejected');self.assertFalse(risk['execution_ready']);self.assertIn('Not executed:',risk['reasons'][0])
+
+class PositivePayoffTests(unittest.TestCase):
+    def test_positive_net_payoff_can_pass_below_one_without_changing_stop(self):
+        for side,zone in [('LONG',{'resistance':[{'low':102,'high':102.2}]}),('SHORT',{'support':[{'low':97.8,'high':98}]})]:
+            result=size_order(side=side,entry=100,atr=2,equity=10000,cash=10000,
+                leverage=2,positions=[],risk_rules={'minimum_reward_risk':0},execution_rules={},
+                structure={'available':True,**zone})
+            self.assertTrue(result['economic_gate']['passed'])
+            self.assertLess(result['economic_gate']['net_reward_risk'],1)
+            self.assertEqual(abs(result['proposed_stop']-100),4)
+
+    def test_zero_threshold_still_blocks_negative_net_payoff(self):
+        result=size_order(side='LONG',entry=100,atr=2,equity=10000,cash=10000,
+            leverage=2,positions=[],risk_rules={'minimum_reward_risk':0},execution_rules={},
+            structure={'available':True,'resistance':[{'low':100.1,'high':100.2}]})
+        self.assertFalse(result['economic_gate']['passed'])

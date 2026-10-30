@@ -50,6 +50,8 @@ def migrate(conn, provider='etoro'):
     # Other operational tables inherit the single active runtime for now. Their
     # account/profile scoping must precede activation of any additional runtime.
     conn.commit()
+    import tenant_runtime
+    tenant_runtime.migrate(conn)
 
 
 class AccessControl:
@@ -76,10 +78,26 @@ class AccessControl:
         _request.set({'token':token,'profile_id':int(profile_id)})
         return self.identity()
 
+    @contextmanager
+    def service_request(self, username, profile_id=1):
+        """Bind an already authenticated service sender to normal user permissions.
+
+        Only trusted in-process integrations call this after checking their sender
+        identity. Suspension and membership are checked by the ordinary guards.
+        """
+        if not username:
+            raise PermissionError('A linked Finbot user is required.')
+        marker = _request.set({'service_username': username, 'profile_id': profile_id})
+        try:
+            self.identity()
+            yield
+        finally:
+            _request.reset(marker)
+
     def identity(self):
         context=_request.get()
         if context is None:return None # Trusted in-process worker, never an HTTP request.
-        username=self.validate_token(context.get('token')) if context.get('token') else None
+        username=context.get('service_username') or (self.validate_token(context.get('token')) if context.get('token') else None)
         if not username:raise PermissionError('Your session has expired or the account is suspended. Sign in again.')
         conn=self.connect()
         try:row=conn.execute('SELECT id,username,is_admin,is_active FROM users WHERE username=?',(username,)).fetchone()
@@ -142,6 +160,59 @@ class AccessControl:
             pid=conn.execute("INSERT INTO trading_profiles(name,broker_account_id,status) VALUES (?,?,'draft')",(name.strip(),account)).lastrowid
             conn.execute("INSERT INTO profile_memberships VALUES (?,?,'owner')",(pid,user['id']))
             self.audit(conn,'create_draft_profile',{'profile_id':pid,'provider':provider});conn.commit();return pid
+        finally:conn.close()
+
+    def validate_reference_configuration(self,updates):
+        self.require_admin()
+        conn=self.connect()
+        try:
+            role=conn.execute("SELECT c.provider,c.environment FROM platform_broker_roles r JOIN broker_accounts a ON a.id=r.broker_account_id JOIN broker_connections c ON c.id=a.connection_id WHERE r.role='admin_reference'").fetchone()
+            if role and 'FINBOT_BROKER_PROVIDER' in updates and str(updates['FINBOT_BROKER_PROVIDER']).lower()!=role['provider']:
+                raise ValueError('This configuration belongs to the fixed admin/reference broker. Plan another new-entry destination under Trading profiles and access.')
+            if role and 'ETORO_DEMO_TRADING' in updates and str(updates['ETORO_DEMO_TRADING']).lower() not in {'true','1','yes','on'}:
+                raise ValueError('The admin/reference account remains demo-only. Live account activation is not supported.')
+        finally:conn.close()
+
+    def execution_readiness(self,profile_id):
+        self.require_profile('viewer',profile_id,runtime=False)
+        import tenant_runtime
+        conn=self.connect()
+        try:return tenant_runtime.readiness(conn,profile_id)
+        finally:conn.close()
+
+    def destination_accounts(self,profile_id):
+        self.require_profile('owner',profile_id,runtime=False)
+        user=self.identity();conn=self.connect()
+        try:
+            query='SELECT a.id FROM broker_accounts a JOIN broker_connections c ON c.id=a.connection_id'
+            params=()
+            if user is not None and not user['is_admin']:
+                query+=' WHERE c.owner_user_id=?';params=(user['id'],)
+            import tenant_runtime
+            return [tenant_runtime.account(conn,r[0]) for r in conn.execute(query,params)]
+        finally:conn.close()
+
+    def plan_entry_destination(self,profile_id,account_id):
+        self.require_profile('owner',profile_id,runtime=False)
+        allowed={a['broker_account_id'] for a in self.destination_accounts(profile_id)}
+        if account_id is not None and account_id not in allowed:
+            raise PermissionError('You may plan only an account connection you own or administer.')
+        conn=self.connect()
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            changed=conn.execute('UPDATE profile_execution_routes SET planned_account_id=?,updated_at=CURRENT_TIMESTAMP WHERE profile_id=?',(account_id,profile_id)).rowcount
+            if not changed:raise ValueError('Trading profile was not found')
+            self.audit(conn,'plan_entry_destination',{'profile_id':profile_id,'account_id':account_id,'activated':False})
+            conn.commit()
+        finally:conn.close()
+
+    def trade_broker_owner(self,trade_id):
+        import tenant_runtime
+        conn=self.connect()
+        try:
+            owner=tenant_runtime.trade_owner(conn,trade_id)
+            self.require_profile('viewer',owner['profile_id'],runtime=False)
+            return owner
         finally:conn.close()
 
     def members(self,profile_id):

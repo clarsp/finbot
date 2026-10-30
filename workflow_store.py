@@ -10,6 +10,9 @@ import zlib
 
 
 def ensure_schema(conn):
+    import position_policy
+    position_policy.ensure_schema(conn)
+    position_policy.ensure_price_trailing_schema(conn)
     import performance_analysis
     performance_analysis.ensure_schema(conn)
     import broker_recovery
@@ -24,7 +27,11 @@ def ensure_schema(conn):
     CREATE TABLE IF NOT EXISTS article_companies (article_key TEXT NOT NULL, ticker TEXT NOT NULL, evidence TEXT NOT NULL, PRIMARY KEY(article_key,ticker));
     CREATE TABLE IF NOT EXISTS analysis_restores (trade_id INTEGER PRIMARY KEY, restored_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS maintenance_runs (id INTEGER PRIMARY KEY, created_at TEXT DEFAULT CURRENT_TIMESTAMP, action TEXT, details TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS neutral_research_cache (symbol TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result_json TEXT NOT NULL, analyzed_at REAL NOT NULL, reuse_count INTEGER NOT NULL DEFAULT 0);
     """)
+
+    import outcome_notifications
+    outcome_notifications.ensure_schema(conn)
 
 
 class AccountBusy(ValueError):

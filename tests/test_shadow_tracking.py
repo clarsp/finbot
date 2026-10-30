@@ -18,6 +18,7 @@ class ShadowTests(unittest.TestCase):
         shadow.ensure_schema(self.conn)
         self.now=datetime(2026,10,17,10,tzinfo=timezone.utc)
         self.rules=copy.deepcopy(app.DEFAULT_AGENT_RULES['risk_manager'])
+        self.rules['minimum_reward_risk']=1.0  # Freeze the historical 1R policy in this fixture.
         self.policy=dict(framework='DIRECTIONAL_NEWS',atr14=2,stop_offset=-4,target_offset=6,
             target_selection={},holding_hours=48,requested_entry=100,
             cost_assumptions=dict(spread_per_unit=.1,roundtrip_bps=10,financing_annual_pct=8,holding_hours=48))
@@ -117,7 +118,7 @@ class WorkflowTests(unittest.TestCase):
         app.reconcile_news_demo_positions([p]);app.reconcile_news_demo_positions([p])
         self.assertEqual(len(app.get_shadow_exits(tid)),15)
         self.update(tid,status='CLOSED')
-        self.adapter._get_rate.return_value={'bid':102,'ask':102.1}
+        self.adapter.get_rate.return_value={'bid':102,'ask':102.1}
         asyncio.run(app.PositionManagerAgent().observe_shadow_exits(self.adapter))
         self.assertTrue(any(r['status']=='TARGET_OBSERVED' for r in app.get_shadow_exits(tid)))
         self.assertEqual(self.submit.await_count,1)

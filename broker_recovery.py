@@ -9,8 +9,12 @@ import hashlib
 import json
 import math
 import re
+import sqlite3
 import time
 import uuid
+import position_policy
+import position_timing
+from market_sessions import build_market_session_context
 
 TERMINAL = ('APPLIED', 'CLOSED', 'SUPERSEDED', 'RESOLVED')
 
@@ -93,7 +97,7 @@ def close_order_id(evidence):
 
 def named_status(data):
     value=data.get('status') or data.get('statusName') or data.get('orderStatus')
-    if isinstance(value,dict): value=value.get('name')
+    if isinstance(value,dict): value=value.get('name') or {1:'received',2:'placed',3:'filled',4:'rejected',5:'partiallyfilled',6:'pendingcancel',7:'canceled',8:'expired',9:'canceledpartiallyfilled',10:'rejectedpartiallyfilled',11:'waitingformarket',12:'pendingtriggeredrate'}.get(value.get('id'),'')
     return str(value or '').lower().replace(' ','').replace('_','')
 
 
@@ -155,6 +159,8 @@ class RecoveryManager:
     def import_legacy(self, trade, position=None):
         """Import acknowledged historical operations; never re-send on migration."""
         now=self.clock();policy=json.loads(trade.get('policy_json') or '{}')
+        cancellation=self.get(trade['id'],'entry_cancel')
+        if position is not None and cancellation:self.finish(cancellation,'RESOLVED','Verified portfolio fill wins cancellation race; position retained and protected.')
         if trade['status']=='EXIT_PENDING' and not self.get(trade['id'],'close'):
             c=self.connect()
             try: events=c.execute("SELECT created_at,details,message FROM trade_events WHERE trade_id=? AND stage='exit' ORDER BY id DESC",(trade['id'],)).fetchall()
@@ -175,12 +181,74 @@ class RecoveryManager:
 
     @staticmethod
     def protection_matches(payload, position):
+        native=payload.get('stop_loss_type')=='trailing'
+        if native and position.get('stop_loss_type')!='trailing':return False
         for key in ('stop_loss_price','take_profit_price'):
             wanted=payload.get(key);actual=position.get(key)
-            # target None means unchanged for this API, not an unsupported clear.
             if wanted is None:continue
-            if actual is None or abs(float(wanted)-float(actual))>max(.01,abs(float(wanted))*.0001):return False
+            if actual is None:return False
+            wanted=float(wanted);actual=float(actual)
+            if not all(math.isfinite(v) and v>0 for v in (wanted,actual)):return False
+            tolerance=max(.01,abs(wanted)*.0001)
+            if native and key=='stop_loss_price':
+                if position.get('side') not in {'LONG','SHORT'}:return False
+                if (actual<wanted-tolerance if position['side']=='LONG' else actual>wanted+tolerance):return False
+            elif abs(wanted-actual)>tolerance:return False
         return True
+
+    def bind_position(self, action, trade, position):
+        """Repair only a missing identity proven by the linked trade + fresh portfolio."""
+        observed=str(position.get('position_id') or '').removesuffix('.0')
+        linked=str(trade.get('broker_position_id') or '').removesuffix('.0')
+        if action['trade_id']!=trade['id'] or not observed or linked!=observed or (action.get('position_id') and action['position_id']!=observed):
+            if action['state']=='ESCALATED' and action['next_check_at']>self.clock():return False
+            self.update(action,state='ESCALATED')
+            self.attention(action,'Recovery position identity is inconsistent; broker writes are blocked.')
+            self.schedule(action)
+            return False
+        if not action.get('position_id'):
+            try:self.update(action,position_id=observed)
+            except sqlite3.IntegrityError:
+                self.update(action,state='ESCALATED')
+                self.attention(action,'Another active action owns this position; duplicate recovery is blocked.')
+                self.schedule(action)
+                return False
+            self.event(trade['id'],'recovery','position_manager','completed','accepted',
+                'Missing recovery position ID repaired from the linked trade and broker portfolio.',
+                {'action_id':action['id'],'position_id':observed})
+        return True
+
+    def adopt_tighter_protection(self, action, trade, position):
+        if action['payload'].get('stop_loss_type')=='trailing':return False
+        # A never-submitted intent cannot race an outstanding correction request.
+        if action['attempts'] or action['state'] not in {'READY','RETRY_READY','ESCALATED'}:
+            return False
+        actual=position.get('stop_loss_price');wanted=action['payload'].get('stop_loss_price')
+        if trade['side'] not in {'LONG','SHORT'} or actual is None or wanted is None or position.get('side',trade['side'])!=trade['side']:
+            return False
+        actual=float(actual);wanted=float(wanted)
+        tighter=actual>wanted+.01 if trade['side']=='LONG' else actual<wanted-.01
+        if not math.isfinite(actual) or actual<=0 or not tighter:
+            return False
+        payload={**action['payload'],'stop_loss_price':actual}
+        if position.get('stop_loss_type')=='trailing':payload['stop_loss_type']='trailing'
+        target_matches=self.protection_matches(payload,position)
+        previous=action['payload']
+        c=self.connect()
+        try:
+            c.execute('UPDATE trades SET stop_loss_price=? WHERE id=?',(actual,trade['id']))
+            c.commit()
+        finally:c.close()
+        trade['stop_loss_price']=actual
+        self.update(action,payload=payload)
+        if target_matches:
+            self.finish(action,'APPLIED','Tighter broker protection retained; no widening request was sent.')
+        else:
+            self.update(action,state='RETRY_READY',next_check_at=self.clock(),alert_at=None,last_error=None,evidence={'tighter_stop_adopted':True})
+        self.event(trade['id'],'protection','position_manager','completed','accepted',
+            'Adopted verified tighter broker stop; target reconciliation remains independent; no stop widening.',
+            {'action_id':action['id'],'previous_intent':previous,'broker_stop':actual})
+        return target_matches
 
     async def send(self, action, trade, position, adapter):
         now=self.clock();maximum=int(self.rules.get('recovery_max_attempts',3))
@@ -191,7 +259,29 @@ class RecoveryManager:
         if action['attempts']>=maximum:
             self.update(action,state='ESCALATED');self.attention(action,'Broker action reached its write-attempt limit; verification continues without resubmission.')
             return {'deduplicated':True,'action_id':action['id'],'state':action['state']}
-        if str(position.get('position_id')).removesuffix('.0')!=action['position_id']:raise ValueError('Recovery position identity mismatch')
+        if not self.bind_position(action,trade,position):raise ValueError('Recovery position identity mismatch')
+        if action['kind']=='protection' and action['payload'].get('native_atr'):
+            if not await self.authorize_native_protection(action,trade,adapter):
+                self.finish(action,'SUPERSEDED','Native trailing update withheld by fresh identity, mode or price check.')
+                return {'withheld':True,'recovery_state':'SUPERSEDED'}
+        if action['kind']=='close' and action['payload'].get('reason','').startswith('profit_trailing:'):
+            if not await self.authorize_trailing_close(action, trade, adapter):
+                self.finish(action, 'SUPERSEDED', 'Profit trailing close withheld: fresh position no longer meets the drawdown trigger.')
+                c = self.connect()
+                try:
+                    c.execute("UPDATE trades SET status='OPEN' WHERE id=? AND status='EXIT_PENDING'", (trade['id'],))
+                    c.commit()
+                finally:
+                    c.close()
+                return {'withheld': True, 'recovery_state': 'SUPERSEDED'}
+        if action['kind']=='close' and action['payload'].get('reason','').startswith('profit_review:'):
+            if not await self.authorize_profit_close(action,trade,position,adapter):
+                self.finish(action,'SUPERSEDED','Discretionary close withheld: fresh net-profit, session or review guard did not pass.')
+                c=self.connect()
+                try:
+                    c.execute("UPDATE trades SET status=CASE WHEN status='EXIT_PENDING' THEN 'OPEN' ELSE status END,reconciliation_status=CASE WHEN status='EXIT_PENDING' THEN 'profit_close_withheld' ELSE reconciliation_status END WHERE id=?",(trade['id'],));c.commit()
+                finally:c.close()
+                return {'withheld':True,'recovery_state':'SUPERSEDED'}
         request_id=str(uuid.uuid4())
         self.update(action,state='SUBMITTING',attempts=action['attempts']+1,order_id=None,request_id=request_id,last_attempt_at=now)
         # Persist intent before transport. A crash after this commit is UNKNOWN,
@@ -209,7 +299,8 @@ class RecoveryManager:
             if action['kind']=='close':
                 response=await asyncio.to_thread(adapter.close_position,action['position_id'],position.get('instrument_id'),request_id=request_id)
             else:
-                response=await asyncio.to_thread(adapter.modify_position,action['position_id'],action['payload']['stop_loss_price'],action['payload'].get('take_profit_price'),request_id=request_id)
+                extra={'stop_type':'trailing'} if action['payload'].get('stop_loss_type')=='trailing' else {}
+                response=await asyncio.to_thread(adapter.modify_position,action['position_id'],action['payload']['stop_loss_price'],action['payload'].get('take_profit_price'),request_id=request_id,**extra)
             if not isinstance(response,dict):raise ValueError('Broker acknowledgment unavailable')
             self.update(action,state='ACKNOWLEDGED',order_id=close_order_id(response) if action['kind']=='close' else None,
                 evidence=response,last_error=None,mismatches=0,next_check_at=now+self.delay(action))
@@ -233,14 +324,128 @@ class RecoveryManager:
                 'Broker action was not confirmed; outcome is tracked before any recovery attempt.',{'action_id':action['id'],'state':state,'http_status':code})
             raise
 
+    async def authorize_native_protection(self,action,trade,adapter):
+        """Native stop changes use a fresh broker position and frozen entry basis."""
+        if not self.rules.get('profit_trailing_enabled') or self.rules.get('profit_trailing_mode','scheduled')!='broker':return False
+        if getattr(adapter,'supports_native_trailing',False) is not True:return False
+        try:
+            snapshot=await asyncio.to_thread(adapter.get_positions)
+            matches=[p for p in snapshot.get('positions',[]) if str(p.get('position_id')).removesuffix('.0')==action['position_id']]
+            if not snapshot.get('available') or len(matches)!=1:return False
+            position=matches[0]
+            c=self.connect()
+            try:row=c.execute('SELECT position_id,side,entry_price,entry_atr,best_price,evidence FROM price_trailing WHERE trade_id=?',(trade['id'],)).fetchone()
+            finally:c.close()
+            if not row or row[0]!=action['position_id'] or row[1]!=trade['side']:return False
+            rate=await asyncio.to_thread(adapter.get_rate,int(position['instrument_id']))
+            evidence=position_policy.trailing_evidence(trade,position,rate,row[4],self.rules,
+                entry_price=row[2],entry_atr=row[3],now=datetime.fromtimestamp(self.clock(),timezone.utc),previous_evidence=json.loads(row[5]))
+            intent=position_policy.native_trailing_intent(evidence,position)
+            if not intent:return False
+            target=action['payload'].get('take_profit_price')
+            if target is not None:
+                mark=evidence['current_price'];target=float(target)
+                if not math.isfinite(target) or (target<=mark if trade['side']=='LONG' else target>=mark):return False
+            # Re-enabling/retuning an already-native stop must actually tighten it.
+            actual=position.get('stop_loss_price')
+            if position.get('stop_loss_type')=='trailing' and actual is not None:
+                improved=intent['stop_loss_price']>float(actual)+.01 if trade['side']=='LONG' else intent['stop_loss_price']<float(actual)-.01
+                if not improved:return False
+            c=self.connect()
+            try:
+                c.execute('UPDATE price_trailing SET best_price=?,evidence=? WHERE trade_id=?',
+                    (evidence['best_price'],json.dumps(evidence),trade['id']));c.commit()
+            finally:c.close()
+            self.update(action,payload={**action['payload'],**intent},evidence={'native_guard':evidence})
+            return True
+        except Exception as error:
+            self.update(action,evidence={'native_guard_unavailable':type(error).__name__})
+            return False
+
+    async def authorize_trailing_close(self, action, trade, adapter):
+        """Revalidate identity and entry-ATR price retreat before every close attempt."""
+        if not self.rules.get('profit_trailing_enabled', False):
+            return False
+        try:
+            snapshot = await asyncio.to_thread(adapter.get_positions)
+            matches = [p for p in snapshot.get('positions', [])
+                       if str(p.get('position_id')).removesuffix('.0') == action['position_id']]
+            if not snapshot.get('available') or len(matches) != 1:
+                return False
+            c = self.connect()
+            try:
+                row = c.execute('SELECT position_id,side,entry_price,entry_atr,best_price,evidence FROM price_trailing WHERE trade_id=?', (trade['id'],)).fetchone()
+            finally:
+                c.close()
+            if not row or row[0] != action['position_id'] or row[1] != trade.get('side'):
+                return False
+            rate = await asyncio.to_thread(adapter.get_rate, int(matches[0]['instrument_id']))
+            evidence = position_policy.trailing_evidence(trade, matches[0], rate, row[4], self.rules, entry_price=row[2], entry_atr=row[3], now=datetime.fromtimestamp(self.clock(),timezone.utc), previous_evidence=json.loads(row[5]))
+            if self.rules.get('profit_trailing_mode','scheduled')=='broker':
+                import native_trailing
+                if native_trailing.confirmed_protection(evidence,matches[0]):
+                    self.update(action,evidence={'native_broker_owns_exit':True,'profit_trailing':evidence})
+                    return False
+            c = self.connect()
+            try:
+                c.execute('UPDATE price_trailing SET best_price=?,evidence=? WHERE trade_id=? AND position_id=?',
+                    (evidence['best_price'], json.dumps(evidence), trade['id'], action['position_id']))
+                c.commit()
+            finally:
+                c.close()
+            self.update(action, payload={**action['payload'], 'profit_trailing': evidence}, evidence=evidence)
+            return evidence['close_due']
+        except Exception as error:
+            self.update(action, evidence={'trailing_guard_unavailable': type(error).__name__})
+            return False
+
+    async def authorize_profit_close(self,action,trade,position,adapter):
+        """Recheck every attempted write, including retries after confirmed rejection."""
+        try:
+            from integrations import fetch_company_fundamentals
+            snapshot=await asyncio.to_thread(adapter.get_positions)
+            matches=[p for p in snapshot.get('positions',[]) if str(p.get('position_id')).removesuffix('.0')==action['position_id']]
+            if not snapshot.get('available') or len(matches)!=1:return False
+            current=matches[0]
+            fundamentals=await fetch_company_fundamentals(trade['symbol'])
+            rate=await asyncio.to_thread(adapter.get_rate,int(current['instrument_id']))
+            now=datetime.fromtimestamp(self.clock(),timezone.utc)
+            session=build_market_session_context(fundamentals=fundamentals,quote={'available':True},observed_at=now)
+            evidence=position_policy.profit_exit_evidence(trade,current,rate,self.rules,now)
+            evidence['market_session']=session
+            reason=action['payload']['reason']
+            if reason.endswith('structural_news_invalidated_thesis'):
+                c=self.connect()
+                try:r=c.execute("SELECT created_at,decision,details FROM trade_events WHERE trade_id IN (SELECT id FROM trades WHERE symbol=?) AND stage='research' ORDER BY id DESC LIMIT 1",(trade['symbol'],)).fetchone()
+                finally:c.close()
+                if not r or r['decision']!='accepted':return False
+                research=json.loads(r['details']);ai=research.get('openai') or {}
+                if ai.get('status')!='available' or ai.get('company_relevance')!='direct':return False
+                max_age=min(24,float(json.loads(trade.get('config_json') or '{}').get('execution',{}).get('max_research_age_hours',24)))
+                if not position_timing.invalidation_reason(trade,research,r['created_at'],now,max_age_hours=max_age):return False
+            elif reason.endswith('actual_fill_exceeded_configured_units_or_spend_cap'):
+                caps=json.loads(trade.get('config_json') or '{}').get('execution',{})
+                if not (abs(float(current['units']))>float(caps.get('max_order_units',5))+.000001 or float(current['amount'])+max(0,float(current['fees']))>float(caps.get('max_order_spend_usd',200))+.01):return False
+            else:return False
+            self.update(action,evidence=evidence,payload={**action['payload'],'profit_guard':evidence})
+            return evidence['allowed'] and session['calendar_status']=='provider_session_confirmed' and session['is_regular_session'] and (session.get('minutes_to_close') or 0)>10
+        except Exception as error:
+            self.update(action,evidence={'profit_guard_unavailable':type(error).__name__})
+            return False
+
     async def request_close(self, trade, position, adapter, reason):
         action=self.get(trade['id'],'close') or self.create(trade,'close',{'reason':reason,'instrument_id':position.get('instrument_id')})
         return await self.send(action,trade,position,adapter)
 
-    async def request_protection(self, trade, position, adapter, stop, target, *, explicit=False):
+    async def request_protection(self, trade, position, adapter, stop, target, *, explicit=False, stop_type=None, native_evidence=None):
         self.import_legacy(trade,position)
         action=self.get(trade['id'],'protection')
         payload={'stop_loss_price':float(stop),'take_profit_price':float(target) if target is not None else None}
+        if stop_type not in (None,'fixed','trailing'):raise ValueError('Unsupported stop-loss type')
+        if stop_type=='trailing' or stop_type is None and position.get('stop_loss_type')=='trailing':
+            payload['stop_loss_type']='trailing'
+        if native_evidence is not None:
+            payload.update(native_atr=True,profit_trailing=native_evidence)
         if action and action['payload']!=payload:
             # Do not race a different intent against an unconfirmed async update.
             if action['state']=='ESCALATED' and action.get('evidence',{}).get('definitively_rejected'):
@@ -274,6 +479,7 @@ class RecoveryManager:
         if not action:return
         if position is None:
             self.finish(action,'CLOSED','A complete broker snapshot no longer contains the closing position; realized P/L awaits history.');return
+        if not self.bind_position(action,trade,position):return
         if action['state']=='SUBMITTING':self.update(action,state='UNKNOWN')
         if action['next_check_at']>self.clock():return
         if action['state']=='RETRY_READY':
@@ -327,10 +533,26 @@ class RecoveryManager:
         action=self.get(trade['id'],'protection')
         if not action:return
         if position is None:self.finish(action,'CLOSED','Protection tracking resolved because the position is absent from a complete broker snapshot.');return
+        if not self.bind_position(action,trade,position):return
+        if self.adopt_tighter_protection(action,trade,position):return
         if self.protection_matches(action['payload'],position):
-            self.finish(action,'APPLIED','Broker-reported stop/target match the tracked protection intent.');return
+            if action['payload'].get('stop_loss_type')=='trailing':
+                import native_trailing
+                native_trailing.adopt_verified_stop(self.connect,trade,position)
+                c=self.connect()
+                try:
+                    c.execute("UPDATE trades SET status=CASE WHEN status='RECONCILIATION_REQUIRED' THEN 'OPEN' ELSE status END,stop_state='broker_verified',reconciliation_status=CASE WHEN status='EXIT_PENDING' THEN reconciliation_status ELSE 'native_trailing_verified' END WHERE id=?",(trade['id'],));c.commit()
+                finally:c.close()
+            self.finish(action,'APPLIED','Broker-reported stop/target and requested stop type match the tracked protection intent.');return
         if action['state']=='SUBMITTING':self.update(action,state='UNKNOWN')
         if action['next_check_at']>self.clock():return
+        if action['payload'].get('stop_loss_type')=='trailing':
+            # Reapplying an uncertain native TSL can reset its trailing distance.
+            # Continue reads and escalate; never infer rejection from a mismatch.
+            self.schedule(action)
+            if business_age(action['created_at'],self.clock())>=float(self.rules.get('recovery_escalate_hours',2))*3600:
+                self.attention(action,'Native trailing protection remains unconfirmed; verification continues without resetting the stop.')
+            return
         self.update(action,mismatches=action['mismatches']+1)
         if action['state']=='ESCALATED':self.schedule(action);return
         if action['attempts']>=int(self.rules.get('recovery_max_attempts',3)):
@@ -339,7 +561,7 @@ class RecoveryManager:
         if action['mismatches']<2 or elapsed<300:
             self.schedule(action);return
         try:
-            rate=await asyncio.to_thread(adapter._get_rate,int(position['instrument_id']))
+            rate=await asyncio.to_thread(adapter.get_rate,int(position['instrument_id']))
             side=trade['side'];bid=float(rate['bid']);ask=float(rate['ask'])
             if side not in {'LONG','SHORT'} or not math.isfinite(bid) or not math.isfinite(ask) or not 0<bid<=ask:
                 raise ValueError('Fresh executable bid/ask is invalid')
@@ -355,7 +577,45 @@ class RecoveryManager:
             # identical intent after spaced mismatches, never move levels to chase price.
             await self.send(action,trade,position,adapter)
         except Exception as error:
-            if action['state'] not in {'UNKNOWN','ESCALATED','RETRY_READY'}:self.schedule(action,error=str(error))
+            # Pre-transport failures must advance backoff even in RETRY_READY.
+            # send() already schedules ambiguous transport outcomes.
+            if action['next_check_at']<=self.clock():self.schedule(action,error=str(error))
+
+    async def expire_pending_entry(self,trade,data,adapter):
+        cancellation=self.get(trade['id'],'entry_cancel')
+        executions=data.get('positionExecutions') or []
+        state=named_status(data)
+        if executions or state in {'filled','partiallyfilled','canceledpartiallyfilled','rejectedpartiallyfilled'}:
+            if cancellation:self.finish(cancellation,'RESOLVED','Broker fill wins cancellation race; retain and protect the actual position.')
+            return
+        if state in {'rejected','cancelled','canceled','expired'}:
+            if cancellation:self.finish(cancellation,'RESOLVED','Broker lookup confirms terminal entry outcome after cancellation request.')
+            return
+        submitted_at=json.loads(trade.get('policy_json') or '{}').get('entry_submitted_at')
+        if not submitted_at:
+            c=self.connect()
+            try:r=c.execute("SELECT created_at FROM trade_events WHERE trade_id=? AND stage='execution' AND decision='submitted' ORDER BY id DESC LIMIT 1",(trade['id'],)).fetchone()
+            finally:c.close()
+            submitted_at=r['created_at'] if r else trade.get('created_at')
+        age=self.clock()-epoch(submitted_at,self.clock())
+        if age<float(self.rules.get('pending_entry_max_minutes',60))*60:return
+        reported=str(data.get('orderId') or data.get('orderID') or '').removesuffix('.0')
+        expected=str(trade.get('broker_order_id') or '').removesuffix('.0')
+        if not expected or reported!=expected or not expected.isdigit():return
+        if cancellation:return  # Never repeat an acknowledged or ambiguous cancel.
+        if state not in {'received','placed','waitingformarket','pendingtriggeredrate'}:return
+        cancel_request_id=str(uuid.uuid4())
+        cancellation=self.create(trade,'entry_cancel',{'reason':'pending_entry_validity_expired','order_id':expected},state='SUBMITTING',order_id=expected,attempts=1,request_id=cancel_request_id)
+        if cancellation.get('request_id')!=cancel_request_id:return
+        # Persist before transport; a crash is not permission to send again.
+        try:
+            response=await asyncio.to_thread(adapter.cancel_pending_order,expected,request_id=cancellation['request_id'])
+            self.update(cancellation,state='ACKNOWLEDGED',evidence=response)
+            self.event(trade['id'],'entry_validity','position_manager','waiting','pending',
+                'Expired pending entry: cancellation requested; broker confirmation or fill still required.',{'action_id':cancellation['id'],'order_id':expected})
+        except Exception as error:
+            self.update(cancellation,state='UNKNOWN',last_error=type(error).__name__)
+            self.attention(cancellation,'Pending-entry cancellation unconfirmed; continue lookup without resubmission.')
 
     async def lookup_entry(self, trade, adapter):
         action=self.get(trade['id'],'entry') or self.create(trade,'entry',{'reference_id':trade.get('order_reference')},state='UNKNOWN',created_at=epoch(trade.get('created_at'),self.clock()),
@@ -365,6 +625,7 @@ class RecoveryManager:
             data=await asyncio.to_thread(adapter.lookup_order,order_id=trade.get('broker_order_id'),reference_id=trade.get('order_reference'))
             if not isinstance(data,dict):raise ValueError('Entry status unavailable')
             self.update(action,evidence=data)
+            await self.expire_pending_entry(trade,data,adapter)
             if named_status(data) in {'rejected','cancelled','canceled','expired'}:
                 self.finish(action,'RESOLVED','Broker lookup resolved the uncertain entry-order status.')
             elif len(data.get('positionExecutions') or [])==1:

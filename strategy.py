@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, Optional
 import pandas as pd
 import yfinance as yf
 from price_structure import multi_timeframe_structure
+from market_instruments import reference_symbol
 
 
 STRATEGY_VERSION = "news_reaction_v2"
@@ -24,7 +25,7 @@ def configured_symbols() -> list[str]:
 
 def load_daily_bars(symbol: str, period: str = "5y", now=None) -> pd.DataFrame:
     """Load adjusted daily bars; remove today's possibly incomplete candle."""
-    ticker = yf.Ticker(symbol)
+    ticker = yf.Ticker(reference_symbol(symbol))
     history = ticker.history(period=period, interval="1d", auto_adjust=True, actions=False)
     if history is None or history.empty:
         return pd.DataFrame()

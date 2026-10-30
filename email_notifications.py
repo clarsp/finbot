@@ -314,7 +314,13 @@ def send_trade_execution_email(
         return {"status": "disabled"}
     evidence = load_trade_evidence(database_path, trade_id)
     message = build_trade_message(settings, evidence, test_mode=test_mode)
-    message["Message-ID"] = make_msgid()
+    return deliver_message(settings, message, test_mode=test_mode)
+
+
+def deliver_message(settings, message, *, test_mode=False, before_data=None):
+    """Shared SMTP transport. before_data durably marks an outbox send attempt."""
+    if not message.get("Message-ID"):
+        message["Message-ID"] = make_msgid()
     context = ssl.create_default_context()
     if settings.security == "tls":
         smtp: smtplib.SMTP = smtplib.SMTP_SSL(
@@ -335,6 +341,8 @@ def send_trade_execution_email(
         # time than connection setup; never retry an ambiguous DATA timeout.
         if smtp.sock is not None:
             smtp.sock.settimeout(max(60, settings.timeout_seconds))
+        if before_data is not None:
+            before_data()
         refused = smtp.send_message(message)
         accepted = True
     finally:

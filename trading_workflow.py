@@ -152,6 +152,10 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
     limits["cash"] = cash / (entry/leverage + cost_per_unit)
     units = math.floor(max(0, min(limits.values())) * 1_000_000) / 1_000_000
     errors = []
+    terminal_reasons=[]
+    if target_evidence.get("entry_blocked"):
+        terminal_reasons.append(target_evidence["entry_block_reason"])
+        errors.extend(terminal_reasons)
     if risk_rules.get("sector_exposure_enabled", False):
         if not sector or sector == "Unknown" or any(not p.get("sector") or p.get("sector") == "Unknown" for p in positions):
             errors.append("Sector concentration cannot be verified for the candidate and all broker holdings.")
@@ -163,8 +167,34 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
         errors.append("Risk on existing broker positions cannot be verified because stop, direction, fill, or quantity is missing.")
     if not units:
         errors.append("No risk budget remains for a new position." if risk_budget <= 0 else "No cash or portfolio exposure capacity remains for a new position.")
-    if reward <= cost_per_unit or reward/distance < float(risk_rules.get("minimum_reward_risk", 1)) or (target_evidence["adjusted"] and (reward-cost_per_unit)/distance < float(risk_rules.get("minimum_reward_risk", 1))):
-        errors.append("The proposed target does not cover estimated costs and the minimum reward/risk ratio.")
+    net_reward = reward - cost_per_unit
+    minimum_rr = float(risk_rules.get("minimum_reward_risk", 0))
+    economic_failures = []
+    if net_reward <= 0:
+        economic_failures.append("non_positive_net_reward")
+    if net_reward / distance < minimum_rr:
+        economic_failures.append("below_minimum_reward_risk")
+    if economic_failures:
+        reason = (
+            f"Target does not cover estimated costs: gross reward ${reward:.4f}/unit, costs ${cost_per_unit:.4f}/unit."
+            if net_reward <= 0 else
+            f"Target is profitable (${units*net_reward:.2f} estimated net), but net reward/risk {net_reward/distance:.3f} is below the {minimum_rr:.3f} minimum."
+        )
+        if not terminal_reasons:terminal_reasons.append(reason)
+        errors.append(reason)
+    economics = {
+        "passed": not economic_failures, "failure_codes": economic_failures,
+        "gross_reward_per_unit": reward, "estimated_cost_per_unit": cost_per_unit,
+        "net_reward_per_unit": net_reward, "stop_risk_per_unit": distance,
+        "gross_reward_risk": reward/distance, "net_reward_risk": net_reward/distance,
+        "minimum_reward_risk": minimum_rr, "actual_units": units,
+        "estimated_gross_target_profit": units*reward, "estimated_net_target_profit": units*net_reward,
+        "planned_stop_loss_before_costs": units*distance,
+        "estimated_stop_loss_with_costs": units*(distance+cost_per_unit),
+        "required_target_distance": cost_per_unit + minimum_rr*distance,
+        "target_constrained_by_structure": bool(target_evidence.get("adjusted")),
+        "formula": "net reward/risk = (directional target distance - estimated cost per unit) / stop distance; leverage is already included in actual units",
+    }
     protection = {
         "target_selection": target_evidence,
         "framework": "CONDITIONAL_MEAN_REVERSION" if setup.get("approved") else "DIRECTIONAL_NEWS",
@@ -177,6 +207,7 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
         "stop_atr_multiple": distance / atr,
         "target_atr_multiple": reward / atr,
         "reward_risk_ratio": reward / distance,
+        "net_reward_risk_ratio": net_reward / distance,
         "formula": (
             target_evidence.get("formula", "Baseline target capped before daily/weekly/monthly support/resistance; stop preserved.")
             if target_evidence["adjusted"] else
@@ -197,7 +228,8 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
                                  "holding_hours": holding_hours, "currency": "USD",
                                  "source": "entry-time configured forecast; broker opening fees reserved separately"},
             "estimated_net_target_profit": units*(reward-cost_per_unit),
-            "unverifiable_positions": unknown, "execution_reasons": errors, "holding_hours": holding_hours,
+            "economic_gate": economics,
+            "unverifiable_positions": unknown, "rejection_reasons": terminal_reasons, "execution_reasons": errors, "holding_hours": holding_hours,
             "protection": protection,
             "sizing": {"formula": "min(risk budget / stop distance, unit cap, spend × leverage / price, cash × leverage / price, remaining gross exposure / price, single-position exposure, stress-loss capacity, sector capacity when enabled)",
                        "limits_units": limits, "binding_limit": min(limits, key=limits.get),
@@ -212,10 +244,5 @@ def exit_reason(trade: dict, mark: float, now: datetime | None = None) -> str | 
         return "stop_level_observed"
     if trade.get("take_profit_price") and sign*(mark-float(trade["take_profit_price"])) >= 0:
         return "take_profit_level_observed"
-    policy = trade.get("policy") or {}
-    opened = datetime.fromisoformat(str(trade.get("opened_at") or trade["created_at"]).replace("Z", "+00:00"))
-    if opened.tzinfo is None:
-        opened = opened.replace(tzinfo=timezone.utc)
-    if now >= opened + timedelta(hours=float(policy.get("holding_hours", 48))):
-        return "thesis_time_expired"
+    # Holding age is a reassessment trigger, never an exit condition.
     return None

@@ -11,3 +11,12 @@ certs/
 data/
 # Local Docker image export; build/deploy images instead of committing archives.
 /finbot.tar
+
+# Local caches and desktop metadata.
+.pytest_cache/
+.DS_Store
+
+# Private historical evidence and generated operational output.
+audit_logs/
+*.log
+*.tar.gz

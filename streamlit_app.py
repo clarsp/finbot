@@ -110,74 +110,7 @@ st.set_page_config(page_title="Finbot Local MVP", layout="wide")
 ENABLE_HTTPS = os.getenv("ENABLE_HTTPS", "false").lower() in {"1", "true", "yes", "on"}
 PUBLIC_HTTPS = ENABLE_HTTPS or os.getenv("FINBOT_PUBLIC_HTTPS", "false").lower() in {"1", "true", "yes", "on"}
 
-AGENT_RULE_HELP = {
-    "recovery_max_attempts": "Maximum writes for one broker action, including the initial request. Uncertain closes are never blindly resent. Default 3; range 1–5.",
-    "recovery_initial_check_seconds": "Initial per-action read interval, with exponential backoff and deterministic jitter. Minimum 60 seconds.",
-    "recovery_max_check_seconds": "Maximum normal backoff before jitter; stock weekend queues use at least 15 minutes. Broker Retry-After may require longer.",
-    "recovery_escalate_hours": "Unresolved business-day age before one persisted attention event. Weekend time is excluded from age-only alerts; broker errors can alert immediately.",
-    "structure_target_mode": "range_boundary: aim within the outer recent monthly range while recording nearer obstacles. nearest: cap at the closest opposing level. Both preserve the ATR ceiling and existing risk gates.",
-    "structure_range_months": "Number of preceding calendar months, plus the current evolving month, used for the monthly high/low boundary. Only completed daily bars are used. Default 1.",
-    "structure_range_weeks": "Weekly fallback lookback in calendar weeks when monthly boundary data is unavailable. Default 4.",
-    "max_target_atr_multiple": "Maximum initial directional target distance in ATR14. Initial target = min(stop ATR × target reward/risk, this ceiling); daily/weekly/monthly structure may shorten it. Mean-reversion targets retain their measured news anchor. Default 3 preserves the existing default.",
-    "target_reward_risk": "Initial directional target distance relative to the stop. With a 2 ATR stop and 1.5R this is 3 ATR, subject to the maximum target ATR and support/resistance caps.",
-    "shadow_tracking_enabled": "Track prospective alternatives after an approved directional order fills. Sends no extra orders and changes no actual exits. Existing positions are not retroactively enrolled.",
-    "shadow_stop_atr_multiples": "Counterfactual stop distances; wider stops reduce simulated units to preserve original planned stop risk.",
-    "shadow_target_atr_multiples": "Counterfactual target distances, preserving the earlier nearest daily/weekly/monthly support/resistance rule even when production uses range_boundary.",
-    "shadow_horizons_hours": "Additional comparison holding limits; production holding limit is always included. 168h = 7 calendar days; 336h = 14 calendar days.",
-    "risk_per_trade_pct": "Maximum planned entry-to-stop risk for one new position as a fraction of verified account equity.",
-    "max_total_risk_pct": "Maximum aggregate planned stop risk across verified open positions and the proposed order.",
-    "max_gross_exposure_pct": "Maximum total gross notional exposure as a fraction of verified account equity.",
-    "max_open_positions": "Maximum number of verified broker positions allowed before another order is deferred.",
-    "max_single_position_exposure_pct": "Maximum gross notional for one position as a fraction of account equity.",
-    "stress_gap_pct": "Additional adverse gap assumption, as a fraction of price, added to nominal stop risk. This is a scenario, not a loss guarantee.",
-    "max_stressed_loss_pct": "Maximum portfolio loss under the configured stop-plus-gap stress scenario, as a fraction of equity.",
-    "stop_atr_multiple": "Distance from entry to stop loss in ATR14 units. The current default is 2× ATR14.",
-    "sector_exposure_enabled": "Optional sector concentration gate. Requires verified sector labels for every broker holding; unknown sectors block new orders when enabled.",
-    "max_sector_exposure_pct": "Maximum gross notional per sector as a fraction of equity when the sector gate is enabled.",
-    "max_order_units": "Hard quantity ceiling per new order. Fractional units are allowed. Default: 5 units.",
-    "max_order_spend_usd": "Maximum estimated account capital per order, including a reserve for costs. At 2× leverage, $200 margin can provide up to $400 exposure. The units cap also applies.",
-    "analysis_retention_days": "Archive never-submitted analysis after this many days. Broker orders, fills, uncertain submissions and open positions are preserved. Default: 3 days.",
-    "conditional_mean_reversion_confirmation_atr": "Required completed-bar recovery from the post-news extreme before entering the reversal.",
-    "conditional_mean_reversion_min_confidence": "Research confidence required for a temporary news reaction; technical distance never overrides it.",
-    "conditional_mean_reversion_stop_cushion_atr": "Place the protective stop this many ATR units beyond the measured news-reaction extreme.",
-    "max_research_age_hours": "A manual candidate older than this needs fresh research before submission.",
-    "news_max_hold_hours": "Automatically request a broker close when a new directional news trade exceeds this holding time.",
-    "mean_reversion_max_hold_hours": "Maximum holding time for a new conditional mean reversion trade.",
-    "estimated_roundtrip_cost_bps": "Fallback round-trip trading cost estimate in basis points when broker cost evidence is unavailable.",
-    "estimated_financing_annual_pct": "Fallback annual financing-rate estimate used over the planned holding period.",
-    "enabled": "Whether this agent participates in analysis cycles.",
-    "min_confidence": "Minimum confidence, from 0.0 to 1.0, needed to pass this decision gate.",
-    "allowed_sectors": "Research candidates outside these sectors are rejected.",
-    "max_fetch_per_cycle": "Maximum number of unique feed candidates analyzed per cycle. The pool rotates across cycles; with OpenAI enabled, each candidate may use a research call and a separate risk trend-review call.",
-    "include_market_fundamentals": "Fetch Yahoo Finance company statements for strategist checks and include them in OpenAI research when enabled.",
-    "fundamental_confirmation_min_confidence": "Minimum confidence when at least three company metrics and a directly matched headline support the proposed direction.",
-    "countertrend_short_min_confidence": "Minimum confidence for a short that conflicts with strong fundamentals or company-specific bullish news.",
-    "countertrend_long_min_confidence": "Minimum confidence for a long that conflicts with weak fundamentals or company-specific bearish news.",
-    "conditional_mean_reversion_min_atr_multiple": "Minimum measured post-news excursion from the pre-news price, in ATR14 multiples. A temporary news assessment and completed-bar reversal confirmation are also required.",
-    "strong_fundamentals_min_revenue_growth_pct": "Revenue growth threshold for one of the metrics used to identify strong company fundamentals.",
-    "strong_fundamentals_min_net_profit_margin_pct": "Net margin threshold for one of the metrics used to identify strong company fundamentals.",
-    "strong_fundamentals_max_debt_to_equity": "Maximum debt/equity ratio for one of the metrics used to identify strong company fundamentals.",
-    "weak_fundamentals_max_revenue_growth_pct": "Revenue growth at or below this value counts as one of five weak-company indicators; at least three are required.",
-    "weak_fundamentals_max_net_profit_margin_pct": "Net margin at or below this value counts as one of five weak-company indicators; EPS and cash flow are also considered.",
-    "weak_fundamentals_min_debt_to_equity": "Debt/equity at or above this value counts as one of five weak-company indicators.",
-    "require_company_specific_news_for_fundamental_confirmation": "Require a company-specific headline in the same direction before lowering the confidence threshold for a fundamentals-aligned trade.",
-    "require_company_specific_news_for_countertrend_short": "Require a directly company-linked bearish headline before shorting against strong fundamentals or bullish news.",
-    "require_company_specific_news_for_countertrend_long": "Require a directly company-linked bullish headline before going long against weak fundamentals or bearish news.",
-    "require_current_market_quote": "Execution requires a fresh eToro quote. Missing quotes do not block news or company analysis.",
-    "default_leverage": "Starting leverage for a candidate; the Strategist's final leverage is persisted with its exits.",
-    "max_leverage": "Upper leverage limit for the strategist's proposed position.",
-    "position_limit": "Maximum fraction of starting capital allocated to one trade.",
-    "max_drawdown": "Risk rejection threshold for modeled account drawdown.",
-    "max_volatility": "Risk rejection threshold for modeled volatility.",
-    "stop_loss_pct": "Default stop-loss distance from entry price as a fraction.",
-    "exit_on_risk_breach": "Reject/exit if a configured risk threshold is breached. This safety gate is required.",
-    "openai_trend_review_enabled": "After strategy approval, request an independent OpenAI review of Yahoo price trends over 1 hour, 24 hours, this week, this year, and 5 years. This uses additional API tokens.",
-    "trend_opposition_min_confidence": "Reject a proposed position when the OpenAI trend review strongly opposes it at or above this confidence.",
-    "paper_trading_only": "Controls the local simulator. When eToro is the selected broker, approved trades are sent to the configured eToro demo or live endpoint.",
-    "max_trade_value": "Maximum paper capital allocation for one trade.",
-    "max_trades_per_cycle": "Maximum number of eligible eToro demo orders submitted during one research cycle.",
-    "allowed_side": "LONG and/or SHORT directions permitted at the execution boundary.",
-}
+from agent_rule_metadata import AGENT_RULE_HELP, AGENT_RULE_LABELS
 
 ENV_CONFIG_PATH = Path(os.getenv("FINBOT_ENV_CONFIG_PATH", str(Path(__file__).resolve().parent / ".env.config")))
 PORTFOLIO_ACCOUNT_OPTIONS = {
@@ -221,6 +154,7 @@ def load_env_config() -> Dict[str, str]:
 
 def save_env_config(updates: Dict[str, str]) -> None:
     backend_module.access.require_admin()
+    backend_module.access.validate_reference_configuration(updates)
     existing_lines: list[str] = []
     if ENV_CONFIG_PATH.exists():
         existing_lines = ENV_CONFIG_PATH.read_text(encoding="utf-8").splitlines()
@@ -838,7 +772,7 @@ def render_position_management():
         cols[1].metric('Pending closure',(frame['status']=='EXIT_PENDING').sum())
         cols[2].metric('Reconciliation required',(frame['status']=='RECONCILIATION_REQUIRED').sum())
         st.dataframe(frame,hide_index=True,width='stretch')
-        st.caption('Open the corresponding trade in Trade lifecycles for the full event history and normal protection/close controls.')
+        st.caption('ATR tracking columns show the frozen entry ATR, best executable price, tier, retreat, trigger price and last check (UTC). LONG follows the highest bid; SHORT follows the lowest ask. Blank tracking values mean no valid scheduled quote has been recorded yet. Open Trade lifecycles for full evidence and protection/close controls.')
     else:st.info('No active broker-linked positions have been adopted yet.')
     render_broker_recovery()
     st.divider()
@@ -954,6 +888,75 @@ def render_historical_path_tools():
         selected=st.selectbox('Saved historical analysis',range(len(saved)),format_func=lambda i:f"#{saved[i]['trade_id']} · {saved[i]['symbol']} · {format_local_timestamp(saved[i]['created_at'])}",key='analyst_saved_path')
         render_event_evidence(saved[selected])
     else:st.caption('No historical path analyses saved yet.')
+
+def render_closed_trade_dashboard():
+    st.subheader('Closed trades · realized results')
+    if st.button('Show latest closures', key='closed_show_latest'):
+        st.session_state['closed_trade_period']='all_history'
+    st.button('Refresh closed trades', key='closed_refresh')
+    period=st.selectbox('Period',['this_week','last_week','last_30_days','all_history'],
+        format_func=lambda value:{'last_week':'Last completed week','this_week':'This week','last_30_days':'Last 30 days','all_history':'All recorded history'}[value],
+        key='closed_trade_period')
+    report=backend_module.get_closed_trade_report(period)
+    if period=='last_week':
+        st.info('Last completed week excludes this week’s closures. Select This week or Show latest closures to see recent exits.')
+    sync=report.get('broker_history_sync') or {}
+    st.caption('Recorded broker history last synced: '+format_local_timestamp(sync.get('closed_history_synced_at')))
+    totals=report['summary']
+    cols=st.columns(4)
+    cols[0].metric('Winning-trade gains',f"USD {totals['winning_gains']:,.2f}")
+    cols[1].metric('Losing-trade losses',f"USD {totals['losing_losses']:,.2f}")
+    cols[2].metric('Net realized P/L',f"USD {totals['net_profit']:+,.2f}")
+    cols[3].metric('Closed trades',totals['closed_trades'])
+    st.caption(f"Wins {totals['wins']} · Losses {totals['losses']} · Break-even {totals['break_even']} · Missing net P/L {totals['missing_net_outcomes']}")
+    st.caption(report['note']+' '+report['scope'])
+    if totals['missing_net_outcomes']:
+        st.warning('Trades without broker-reported net P/L are excluded from gains, losses and net totals; they are not treated as break-even.')
+    if report['window_start']:
+        st.caption('Europe/Stockholm window: '+format_local_timestamp(report['window_start'])+' → '+format_local_timestamp(report['window_end'])+' (end excluded).')
+    if report['undated_history_excluded']:
+        st.warning(f"{report['undated_history_excluded']} recorded closures have no valid broker closure date and cannot be assigned to a period.")
+    rows=report['outcomes']
+    if rows:
+        frame=pd.DataFrame(rows)
+        frame['Closed (Stockholm)']=pd.to_datetime(frame['closed_at'],utc=True).dt.tz_convert(DISPLAY_TIMEZONE)
+        known=frame.dropna(subset=['net_profit']).copy()
+        if not known.empty:
+            known['Date']=known['Closed (Stockholm)'].dt.date
+            st.bar_chart(known.groupby('Date')['net_profit'].sum(),y_label='Net realized P/L (USD)')
+        st.dataframe(frame[['trade_id','position_id','symbol','side','Closed (Stockholm)','units','entry_price','close_price','net_profit','reported_fees','closure_reason','closure_reason_basis']],hide_index=True,width='stretch')
+    else:st.info('No broker-confirmed closed trades in this period.')
+    from outcome_notifications import csv_report
+    st.download_button('Download closed trades CSV',csv_report(rows),'finbot-closed-trades.csv','text/csv',key='closed_trade_csv')
+    if account_controls_allowed():
+        status=backend_module.get_outcome_notification_status()
+        with st.expander('Closure emails and weekly reports'):
+            st.caption('Uses the existing configured SMTP recipients. Weekly email: Monday 09:00 Europe/Stockholm, covering the previous Monday–Sunday. No additional trading agent or broker calls are introduced.')
+            with st.form('outcome_email_preferences'):
+                closure=st.checkbox('Email broker-confirmed trade closures',value=status['preferences']['closure_email_enabled'])
+                weekly=st.checkbox('Email weekly closed-trade report',value=status['preferences']['weekly_closed_report_enabled'])
+                if st.form_submit_button('Save outcome email preferences'):
+                    backend_module.set_outcome_notification_preferences(closure,weekly)
+                    st.success('Saved. The existing SMTP master switch must also be enabled.')
+                    st.rerun()
+            deliveries=status['deliveries']
+            if deliveries:
+                st.dataframe(pd.DataFrame(deliveries),hide_index=True,width='stretch')
+                if any(row['state']=='UNCERTAIN' for row in deliveries):
+                    st.warning('An SMTP send has an uncertain outcome. It will not be resent automatically; check delivery before taking further action.')
+                failed=[row for row in deliveries if row['state']=='FAILED']
+                if failed:
+                    selected=st.selectbox('Definitively failed delivery',failed,format_func=lambda row:f"#{row['id']} · {row['kind']} · {row['recipient']}",key='failed_outcome_delivery')
+                    if st.button('Retry selected failed delivery',key='retry_failed_outcome_delivery'):
+                        backend_module.retry_failed_outcome_notification(selected['id'])
+                        st.rerun()
+            else:st.caption('No new outcome emails queued yet. Pre-existing closures were baselined without sending historical alerts.')
+            if status['weekly_reports']:
+                saved=st.selectbox('Saved weekly email report',status['weekly_reports'],format_func=lambda row:row['event_key'],key='weekly_email_report')
+                st.json(saved['payload']['summary'])
+                st.download_button('Download saved weekly report CSV',csv_report(saved['payload']['outcomes']),'finbot-weekly-closed-trades.csv','text/csv',key='weekly_saved_csv')
+            st.caption('SENT means SMTP accepted the message, not confirmed inbox delivery. Retries are tracked per recipient; interrupted DATA sends are held for review.')
+
 
 def render_performance_reviews(compact=False):
     reports=backend_module.get_performance_reviews()
@@ -2041,6 +2044,9 @@ def lifecycle_terminal_event(trade: Dict[str, Any]) -> Dict[str, Any]:
     return latest.get("execution") or last_accepted
 
 
+from lifecycle_presentation import group_shadow_events, lifecycle_status_label, research_is_expired
+
+
 def lifecycle_event_labels(events: list[Dict[str, Any]]) -> list[str]:
     """Name repeated gates by purpose instead of showing duplicate agent names."""
     totals: Dict[str, int] = {}
@@ -2065,6 +2071,10 @@ def lifecycle_event_labels(events: list[Dict[str, Any]]) -> list[str]:
             label = "Broker reconciliation"
         elif stage == "protection":
             label = "Protection update"
+        elif stage == "reassessment" and event.get("reassessments"):
+            label = f"Position reassessments ({len(event['reassessments'])})"
+        elif stage == "shadow" and event.get("shadow_observations"):
+            label = f"Shadow tracking ({len(event['shadow_observations'])})"
         else:
             label = stage.replace("_", " ").title()
         labels.append(label)
@@ -2172,7 +2182,7 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
             duplicate = f" · REPEATED {repeat_count} runs · first {first_seen} · latest"
         else:
             duplicate = ""
-        label = f"#{trade['id']} · {timestamp}{duplicate} · {company_name} ({trade['symbol']}) · {trade['side']} · {trade['status']}"
+        label = f"#{trade['id']} · {timestamp}{duplicate} · {company_name} ({trade['symbol']}) · {trade['side']} · {lifecycle_status_label(trade)}"
         panel=st.expander(label,expanded=False,key=f"lifecycle_panel_{trade['id']}",on_change="rerun")
         if not panel.open:
             continue
@@ -2183,6 +2193,8 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                     st.info("This lifecycle is no longer in active history. Refresh the page.")
                     continue
                 trade=full_trade
+            owner=backend_module.access.trade_broker_owner(int(trade['id']))
+            st.caption(f"Origin broker: {owner['provider']} · {owner['environment']} · account #{owner['broker_account_id']}. This ownership remains attached to the lifecycle.")
             with st.expander("Broker action recovery"):
                 if trade.get('management_architecture'):
                     st.caption(f"Position Manager · {trade['management_architecture']} · {trade.get('management_origin','verified fill')}. Saved trade policy remains in force.")
@@ -2340,7 +2352,9 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                         + str(selection.get("formula") or protection.get("formula") or "Distances are calculated from the recorded entry using the ATR14 saved by the Risk Manager.")
                     )
             if trade.get("strategy_version"):
-                st.caption(f"Strategy {trade['strategy_version']} · {policy.get('framework', 'unknown')} · maximum hold {policy.get('holding_hours', 'unknown')} hours")
+                st.caption(f"Strategy {trade['strategy_version']} · {policy.get('framework', 'unknown')} · reassess after {policy.get('review_after_hours', policy.get('holding_hours', 'unknown'))} hours · elapsed time does not trigger closure")
+                if policy.get("next_review_at"):
+                    st.caption("Next reassessment: " + format_local_timestamp(policy["next_review_at"]))
 
             events = trade["events"]
             # Older automated lifecycles saved the readiness gate as pending
@@ -2365,6 +2379,7 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                     else event
                     for event in events
                 ]
+            events = group_shadow_events(events)
             if events:
                 event_labels = lifecycle_event_labels(events)
                 flow = ""
@@ -2391,7 +2406,32 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                         continue
                     with tab:
                         st.caption(format_local_timestamp(event["created_at"]))
-                        render_event_evidence(event)
+                        observations = event.get("shadow_observations")
+                        reviews = event.get("reassessments")
+                        if reviews:
+                            st.dataframe(pd.DataFrame([
+                                {"Reviewed at":format_local_timestamp(item.get("created_at")),
+                                 "Decision":(item.get("details") or {}).get("decision"),
+                                 "Evidence":item.get("message"),
+                                 "Next review":format_local_timestamp((item.get("details") or {}).get("next_review_at"))}
+                                for item in reviews]),hide_index=True,width="stretch")
+                            with st.expander("Reassessment evidence trail"):
+                                st.json(reviews)
+                        elif observations:
+                            st.write(f"{len(observations)} shadow experiment outcomes recorded. These observations do not submit broker orders.")
+                            st.caption("Recorded outcomes across alternative stops, targets and holding periods; not separate Position Manager executions. Latest evidence: " + format_local_timestamp(event["created_at"]))
+                            st.dataframe(pd.DataFrame([
+                                {"Observed at": format_local_timestamp(item.get("created_at")),
+                                 "Alternative": (item.get("details") or {}).get("variant"),
+                                 "Horizon (hours)": (item.get("details") or {}).get("horizon_hours"),
+                                 "Result": (item.get("details") or {}).get("status") or item.get("decision"),
+                                 "Evidence": item.get("message")}
+                                for item in observations
+                            ]), hide_index=True, width="stretch")
+                            with st.expander("Full shadow evidence trail"):
+                                st.json(observations)
+                        else:
+                            render_event_evidence(event)
             else:
                 st.caption("Trade has no recorded lifecycle events.")
 
@@ -2408,15 +2448,20 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                     st.caption("Automated demo orders are enabled; eligible candidates pass the agent workflow without your confirmation." if backend_module.get_demo_automated_trading_enabled() else "Automated demo orders are currently disabled.")
                     latest_gate = lifecycle_terminal_event(trade)
                     st.info("Latest recorded outcome: " + str(latest_gate.get('message') or trade['status']))
-                    with st.expander("Optional manual retry with fresh agent checks"):
+                    max_age_hours = backend_module.get_agent_rules()["execution"].get("max_research_age_hours", 24)
+                    expired = research_is_expired(trade, max_age_hours, datetime.now(timezone.utc))
+                    with st.expander("Manual recheck and submit"):
+                        st.caption("For a temporary quote, capacity or account-lock blocker that has cleared while the original research remains valid. This rechecks execution eligibility and can submit a demo order; it does not refresh the news or rerun research.")
+                        if expired:
+                            st.warning(f"Research expired (maximum {max_age_hours:g} hours). This candidate cannot be retried. Run fresh analysis from Research Actions to create a new candidate; it will pass the normal trading gates.")
                         confirmed = st.checkbox(
                             "I confirm: submit this candidate to my eToro demo account",
                             key=f"confirm_manual_demo_{trade['id']}",
                         )
                         if st.button(
-                            "Submit manual eToro demo order",
+                            "Recheck and submit demo order",
                             key=f"submit_manual_demo_{trade['id']}",
-                            disabled=not confirmed,
+                            disabled=not confirmed or expired,
                         ):
                             try:
                                 with st.spinner("Rechecking account, quote, research, and risk before demo submission..."):
@@ -2508,11 +2553,11 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
 
 def render_dashboard_lifecycle_panel(trades: list[Dict[str, Any]]) -> None:
     st.subheader("Trade lifecycles")
-    st.caption("Pending/deferred analysis is not a queued broker order. Fresh scheduled analysis can produce a new executable opportunity when its constraints clear.")
+    st.caption("Not submitted means no broker order was sent. Broker pending means a submitted request is awaiting fill or confirmation. Blocked candidates are not automatically retried; fresh research can create a new opportunity.")
     search_col, status_col, count_col = st.columns([3, 2, 1])
     search_text = search_col.text_input("Search ticker or company", key="dashboard_lifecycle_search")
     statuses = ["All"] + sorted({trade["status"] for trade in trades})
-    selected_status = status_col.selectbox("Lifecycle status", statuses, key="dashboard_lifecycle_status")
+    selected_status = status_col.selectbox("Lifecycle status", statuses, key="dashboard_lifecycle_status", format_func=lambda value: "All" if value == "All" else lifecycle_status_label({"status": value}))
     page_size = count_col.selectbox("Rows", [10, 25, 50], index=0, key="dashboard_lifecycle_rows")
     query = search_text.strip().casefold()
     filtered = [
@@ -2543,7 +2588,7 @@ def render_dashboard_lifecycle_panel(trades: list[Dict[str, Any]]) -> None:
     )
     analysis_focus = st.selectbox(
         "Analysis focus",
-        ["Reached execution", "All stages", "Stopped at risk", "Stopped at strategy", "Stopped at research"],
+        ["All stages", "Reached execution", "Stopped at risk", "Stopped at strategy", "Stopped at research"],
         key="dashboard_analysis_focus",
     )
     analysis = filter_analysis_stage(analysis, analysis_focus)
@@ -3009,6 +3054,28 @@ def render_trading_profile_memberships():
                     backend_module.access.create_draft(name,provider)
                     st.rerun()
                 except (ValueError,PermissionError) as error:st.error(str(error))
+    if profiles:
+        with st.expander('Broker roles and destination readiness'):
+            selected_route=st.selectbox('Profile routing plan',profiles,format_func=lambda p:p['name'],key='profile_route_plan')
+            readiness=backend_module.access.execution_readiness(selected_route['id'])
+            reference=readiness['admin_reference']
+            if reference:
+                st.info(f"Admin/reference broker: {reference['provider']} · {reference['environment']} · account #{reference['broker_account_id']}. Existing monitoring and positions remain on this account.")
+            active=readiness['active_destination'];planned=readiness['planned_destination']
+            st.write(f"Current entry destination: {active['provider']} · account #{active['broker_account_id']}")
+            if planned:st.write(f"Planned destination: {planned['provider']} · account #{planned['broker_account_id']} · not activated")
+            st.caption('Destination planning changes metadata only. It does not switch workers, move trades, change credentials or start another runtime.')
+            if selected_route['effective_role']=='owner':
+                choices=backend_module.access.destination_accounts(selected_route['id'])
+                labels={a['broker_account_id']:f"{a['provider']} · {a['account_name']} · #{a['broker_account_id']}" for a in choices}
+                with st.form('plan_broker_destination'):
+                    target=st.selectbox('Planned new-entry account',[None,*labels],format_func=lambda aid:labels.get(aid,'No pending change'))
+                    if st.form_submit_button('Save routing plan'):
+                        try:
+                            backend_module.access.plan_entry_destination(selected_route['id'],target);st.rerun()
+                        except (ValueError,PermissionError) as error:st.error(str(error))
+            st.write('Before an additional account runtime can be activated:')
+            for blocker in readiness['blockers']:st.caption('• '+blocker)
     owned=[p for p in profiles if p['effective_role']=='owner']
     if owned:
         with st.expander('Manage shared profile access'):
@@ -3151,11 +3218,12 @@ def render_profile_page(username: str) -> None:
 
 
 def render_time_range() -> tuple[str, str]:
+    st.session_state.setdefault("dashboard_live", True)
     now = datetime.now(DISPLAY_TIMEZONE).replace(microsecond=0, tzinfo=None)
     now = now.replace(second=now.second-now.second%5)
     default_start = now - timedelta(days=30)
     selected_start = st.session_state.get("dashboard_range_start", default_start)
-    selected_end = st.session_state.get("dashboard_range_end", now)
+    selected_end = now if st.session_state.get("dashboard_live", True) else st.session_state.get("dashboard_range_end", now)
     if selected_start.tzinfo is not None:
         selected_start = selected_start.astimezone(DISPLAY_TIMEZONE).replace(tzinfo=None)
     if selected_end.tzinfo is not None:
@@ -3166,6 +3234,7 @@ def render_time_range() -> tuple[str, str]:
         "Change dashboard date and time range."
     )
     with st.popover(range_label, icon=":material/calendar_month:", help=range_help):
+        st.toggle("Live data · refresh every minute", key="dashboard_live")
         with st.form("dashboard_time_range"):
             start_date_col, start_time_col, end_date_col, end_time_col, apply_col = st.columns([1.6, 1, 1.6, 1, 0.8])
             with start_date_col:
@@ -3177,7 +3246,7 @@ def render_time_range() -> tuple[str, str]:
             with end_time_col:
                 end_time = st.time_input("Time", value=selected_end.time(), key="range_end_time")
             with apply_col:
-                apply_range = st.form_submit_button("Apply", type="primary")
+                apply_range = st.form_submit_button("Apply", type="primary", on_click=lambda: st.session_state.update(dashboard_live=False))
 
         if "start_date" in locals():
             candidate_start = datetime.combine(start_date, start_time)
@@ -3196,6 +3265,7 @@ def render_time_range() -> tuple[str, str]:
 
 
 def refresh_dashboard_end_time() -> None:
+    st.session_state["dashboard_live"] = True
     st.session_state["dashboard_range_end"] = datetime.now(DISPLAY_TIMEZONE).replace(tzinfo=None)
 
 
@@ -3223,6 +3293,13 @@ def render_trade_monitor_clock() -> None:
         def live_clock() -> None:
             render_clock_value()
         live_clock()
+        @fragment(run_every="60s")
+        def refresh_live_data() -> None:
+            now = datetime.now(timezone.utc)
+            last = st.session_state.get("dashboard_last_rendered_at", now)
+            if st.session_state.get("dashboard_live", True) and (now-last).total_seconds() >= 55:
+                st.rerun(scope="app")
+        refresh_live_data()
     else:
         render_clock_value()
 
@@ -3234,7 +3311,7 @@ def render_trade_search(trades: list[Dict[str, Any]]) -> None:
         search_text = st.text_input("Search company, ticker, or decision", key="trade_search")
     with status_col:
         statuses = ["All"] + sorted({trade["status"] for trade in trades})
-        selected_status = st.selectbox("Status", statuses, key="trade_lifecycle_status")
+        selected_status = st.selectbox("Status", statuses, key="trade_lifecycle_status", format_func=lambda value: "All" if value == "All" else lifecycle_status_label({"status": value}))
 
     query = search_text.strip().casefold()
     filtered = [
@@ -3319,7 +3396,7 @@ def render_trade_search(trades: list[Dict[str, Any]]) -> None:
         if analysis_tab.open:
             focus = st.selectbox(
                 "Analysis focus",
-                ["Reached execution", "All stages", "Stopped at risk", "Stopped at strategy", "Stopped at research"],
+                ["All stages", "Reached execution", "Stopped at risk", "Stopped at strategy", "Stopped at research"],
                 key="trade_analysis_focus",
             )
             show_repeated = st.toggle(
@@ -3425,12 +3502,66 @@ def run_agent_cycle_for_ui() -> Dict[str, Any] | None:
         return None
 
 
+def render_telegram_setup():
+    import telegram_bot
+    backend_module.access.require_admin()
+    settings = telegram_bot.Settings.load()
+    st.caption('Private Telegram chat using outbound polling. No VPN or public endpoint. '
+               'Create a bot with @BotFather and /newbot. Enter its token here, never in this chat.')
+    with st.form('telegram_setup'):
+        enabled = st.checkbox('Enable Telegram bot', value=settings.enabled)
+        token = st.text_input('BotFather token (leave blank to keep saved token)', type='password')
+        user_id = st.text_input('Telegram user ID', value=str(settings.user_id) if settings.user_id else '')
+        chat_id = st.text_input('Private chat ID', value=str(settings.chat_id) if settings.chat_id else '')
+        st.caption('First save the token with the bot enabled and IDs blank. Send /whoami '
+                   'in a private chat with your bot, then save the returned IDs here. '
+                   'Only /whoami works until linked. Saving links the bot to your signed-in Finbot account. '
+                   'Use /help in Telegram for commands; plain-language chat uses the existing OpenAI configuration.')
+        if st.form_submit_button('Save Telegram configuration'):
+            try:
+                saved_token = telegram_bot.normalize_token(token.strip() or settings.token)
+                uid = int(user_id.strip() or 0); cid = int(chat_id.strip() or 0)
+                if uid < 0 or cid < 0 or uid != cid:
+                    raise ValueError('Use matching positive user and private-chat IDs, or leave both blank for setup.')
+                if enabled and not saved_token:
+                    raise ValueError('Enter the BotFather token before enabling Telegram.')
+                updates = {'FINBOT_TELEGRAM_ENABLED':str(enabled).lower(),
+                           'FINBOT_TELEGRAM_USER_ID':str(uid), 'FINBOT_TELEGRAM_CHAT_ID':str(cid),
+                           'FINBOT_TELEGRAM_USERNAME':st.session_state.username}
+                if token.strip():updates['FINBOT_TELEGRAM_BOT_TOKEN']=saved_token
+                save_env_config(updates)
+                st.success('Saved. The existing worker reloads Telegram configuration automatically within about 30 seconds.')
+            except ValueError as error:
+                st.error(str(error))
+    st.caption('Linked Finbot user: '+(settings.username or 'not linked')+
+               (' · sender IDs configured' if settings.user_id and settings.chat_id else ' · waiting for sender IDs'))
+    c=backend_module.get_connection()
+    try:
+        status=c.execute("SELECT value FROM app_settings WHERE key='telegram_service_status'").fetchone()
+    finally:c.close()
+    if status:
+        details=json.loads(status[0]);st.caption('Worker: '+details['status']+' · '+details['observed_at'])
+    if st.button('Check saved Telegram bot token'):
+        if not settings.token:
+            st.info('Save a token first.')
+        else:
+            try:
+                bot = telegram_bot.call(settings.token, 'getMe', {})
+                st.success('Connected to @'+str(bot.get('username','bot')))
+                webhook=telegram_bot.call(settings.token, 'getWebhookInfo', {})
+                if webhook.get('url'):
+                    st.warning('This bot has an existing webhook. Use a dedicated bot or remove that webhook before outbound polling can receive messages.')
+            except telegram_bot.TelegramError as error:
+                st.error(str(error))
+
+
 def main() -> None:
     with backend_module.access.web_request():
         _main_authenticated()
 
 
 def _main_authenticated() -> None:
+    st.session_state["dashboard_last_rendered_at"] = datetime.now(timezone.utc)
     refresh_stale_backend_import()
     db_path=str(backend_module.DB_PATH)
     if st.session_state.get("initialized_db_path") != db_path:
@@ -3470,11 +3601,12 @@ def _main_authenticated() -> None:
     backend_module.access.require_profile('viewer')
     if not account_controls_allowed():
         st.caption('Viewer access: shared research, positions and reports are read-only.')
-        choice=st.segmented_control('View',['Dashboard','Trade lifecycles','Position management','Performance reviews','Research','Companies','Shadow comparison','Profile','How it works'],default='Dashboard',key='viewer_navigation')
+        choice=st.segmented_control('View',['Dashboard','Trade lifecycles','Position management','Closed trades','Performance reviews','Research','Companies','Shadow comparison','Profile','How it works'],default='Dashboard',key='viewer_navigation')
         if choice=='Profile':render_profile_page(username);return
         summary=get_ui_dashboard_summary(str(backend_module.DB_PATH))
         if choice=='Trade lifecycles':render_trade_search(summary['trades'])
         elif choice=='Position management':render_position_management()
+        elif choice=='Closed trades':render_closed_trade_dashboard()
         elif choice=='Performance reviews':render_performance_reviews()
         elif choice=='Research':render_research_headlines(summary)
         elif choice=='Companies':render_companies_dashboard()
@@ -3484,6 +3616,8 @@ def _main_authenticated() -> None:
         return
     st.sidebar.title("Navigation")
     if platform_controls_allowed():
+        with st.sidebar.expander('Telegram bot', key='telegram_configuration'):
+            render_telegram_setup()
         with st.sidebar.expander('Database backup',key='storage_backup_settings',on_change='rerun') as storage_panel:
             if storage_panel.open:render_storage_backup()
         with st.sidebar.expander('Analysis cleanup and restore', key='lazy_main_1', on_change="rerun") as lazy_panel:
@@ -3577,6 +3711,7 @@ def _main_authenticated() -> None:
 
         with st.sidebar.expander('Broker settings', expanded=False, key='lazy_main_3', on_change="rerun") as lazy_panel:
             if lazy_panel.open:
+                reference_broker=backend_module.access.execution_readiness(1)["admin_reference"]
                 with st.form("broker_settings"):
                     broker_provider = st.selectbox(
                         "Broker provider",
@@ -3584,9 +3719,10 @@ def _main_authenticated() -> None:
                         index=["dummy", "etoro"].index(os.getenv("FINBOT_BROKER_PROVIDER", "dummy").lower())
                         if os.getenv("FINBOT_BROKER_PROVIDER", "dummy").lower() in {"dummy", "etoro"}
                         else 0,
-                        help="dummy is local simulation; eToro is demo-only. Live order execution is blocked.",
+                        help="This is the admin/reference connection. Other destinations are planned per trading profile.",
+                        disabled=bool(reference_broker),
                     )
-                    st.caption("Changing the provider updates the live environment and persists to .env.config.")
+                    st.caption("These settings belong to the admin/reference connection. Use Trading profiles and access to plan another destination; existing eToro monitoring remains separate.")
                     st.markdown("**eToro**")
                     st.caption("eToro API access requires both the public API key and the user key; demo balance checks can also use an optional demo account ID.")
                     etoro_base_url = st.text_input(
@@ -3964,7 +4100,7 @@ def _main_authenticated() -> None:
     with navigation_col:
         selected_view = st.segmented_control(
             "Main navigation",
-            ["Dashboard", "Trade lifecycles", "Shadow comparison", "Position management", "Performance reviews", "Research", "Companies", "Profile", "How it works"],
+            ["Dashboard", "Trade lifecycles", "Shadow comparison", "Position management", "Closed trades", "Performance reviews", "Research", "Companies", "Profile", "How it works"],
             default="Dashboard",
             label_visibility="collapsed",
             key="main_navigation",
@@ -3972,10 +4108,11 @@ def _main_authenticated() -> None:
     with range_col:
         start_at, end_at = render_time_range()
     with refresh_col:
-        if st.button("🔄", help="Refresh page", key="page_refresh_button", use_container_width=True):
+        if st.button("🔄", help="Refresh data through now", key="page_refresh_button", use_container_width=True, on_click=refresh_dashboard_end_time):
             clear_dashboard_caches()
             st.rerun()
 
+    st.caption(f"Data through {format_local_timestamp(end_at)} · {'Live · refreshes every minute' if st.session_state.get('dashboard_live', True) else 'Fixed historical range · use refresh to return to live data'}")
     st.session_state["lifecycle_end_at"]=end_at
     if st.session_state.get("manual_research_result"):
         clear_dashboard_caches()
@@ -4076,6 +4213,8 @@ def _main_authenticated() -> None:
         agent_rules = next((agent["rules"] for agent in summary.get("agents", []) if agent["agent_name"] == agent_name), default_rules)
         with st.sidebar.expander(agent_name.replace('_',' ').title(), key=f"agent_settings_{agent_name}", on_change="rerun") as lazy_panel:
             if lazy_panel.open:
+                if agent_name == 'position_manager':
+                    st.caption('Choose Profit amount or Entry ATR for arming. Amount is the default: prime above $10, major above $20 of broker-reported profit. ATR arming uses the alternative 0.5 / 1 entry ATR thresholds. Retreat distances remain 0.15 / 0.25 entry ATR in either mode. Only the selected arming thresholds apply. Broker trailing is an optional mechanism; scheduled reconfirmation continues in both modes. New price peaks start at activation; old dollar history is retained.')
                 with st.form(f"edit_rules_{agent_name}"):
                     updated = {}
                     for key, value in agent_rules.items():
@@ -4087,7 +4226,7 @@ def _main_authenticated() -> None:
                         }
                         if key == "status" or (agent_name == 'position_manager' and key == 'enabled') or os.getenv("FINBOT_BROKER_PROVIDER", "dummy").lower() == "etoro" and key in inactive.get(agent_name, set()):
                             continue
-                        label = key.replace("_", " ").title()
+                        label = AGENT_RULE_LABELS.get(key,key.replace("_", " ").title())
                         help_text = AGENT_RULE_HELP.get(key, "Rule applied by this agent.")
                         if key in {"default_leverage", "max_leverage"} and agent_name in {"researcher", "strategist"}:
                             try:
@@ -4102,6 +4241,15 @@ def _main_authenticated() -> None:
                                 label, min_value=0.1, max_value=10.0, value=float(value), step=0.05,
                                 format="%.2f", help=help_text,
                             )
+                        elif key == 'profit_trailing_arming_basis':
+                            updated[key] = st.selectbox(label, options=['amount','atr'],
+                                index=0 if value=='amount' else 1,
+                                format_func=lambda basis:'Profit amount (USD)' if basis=='amount' else 'Entry ATR movement',help=help_text)
+                        elif key == 'profit_trailing_mode':
+                            updated[key] = st.selectbox(label, options=['scheduled','broker'],
+                                index=0 if value=='scheduled' else 1,
+                                format_func=lambda mode:'Scheduled ATR exits' if mode=='scheduled' else 'Broker trailing stop (demo validation required)',
+                                help=help_text)
                         elif key == 'structure_target_mode':
                             updated[key] = st.selectbox(label, options=['range_boundary','nearest'], index=0 if value=='range_boundary' else 1, help=help_text)
                         elif isinstance(value, bool):
@@ -4151,6 +4299,8 @@ def _main_authenticated() -> None:
         render_shadow_dashboard()
     elif selected_view == "Position management":
         render_position_management()
+    elif selected_view == "Closed trades":
+        render_closed_trade_dashboard()
     elif selected_view == "Performance reviews":
         render_performance_reviews()
     elif selected_view == "Companies":

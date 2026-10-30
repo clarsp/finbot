@@ -1,0 +1,17 @@
+# Exclude generated/private material from routine ripgrep searches.
+data/
+audit_logs/
+logs/
+certs/
+.venv/
+.git/
+__pycache__/
+.pytest_cache/
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.tar.gz
+*.log

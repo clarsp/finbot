@@ -26,7 +26,7 @@ class RecoveryTests(unittest.TestCase):
             policy_json=json.dumps({'fill_adjusted':True,'holding_hours':48}),opened_at=datetime.now(timezone.utc).isoformat())
         self.t=self.row(self.tid)
         self.p=dict(position_id='p',instrument_id='1',side='LONG',units=1,amount=50,open_rate=100,current_rate=100,stop_loss_price=95,take_profit_price=106)
-        self.adapter._get_rate.return_value={'bid':100,'ask':100.1}
+        self.adapter.get_rate.return_value={'bid':100,'ask':100.1}
         self.adapter.lookup_close_order.return_value={'orderID':'close-1','statusID':1,'positions':[],'errorCode':0}
 
     def advance(self,seconds=2000):self.now+=seconds
@@ -37,6 +37,59 @@ class RecoveryTests(unittest.TestCase):
     def action(self,kind):return self.manager.get(self.tid,kind)
     def attention_count(self):
         c=app.get_connection();n=c.execute("SELECT COUNT(*) FROM trade_events WHERE trade_id=? AND stage='recovery' AND decision='attention'",(self.tid,)).fetchone()[0];c.close();return n
+
+    def test_missing_position_id_repairs_before_one_bounded_correction(self):
+        action=self.manager.create({**self.t,'broker_position_id':None},'protection',{'stop_loss_price':96,'take_profit_price':106},state='RETRY_READY')
+        self.manager.update(action,mismatches=2000,checks=2,next_check_at=self.now-1,created_at=self.now-1000)
+        self.observe_protect()
+        current=self.action('protection')
+        self.assertEqual(current['position_id'],'p')
+        self.assertEqual(current['attempts'],1)
+        self.adapter.modify_position.assert_called_once()
+        self.assertGreater(current['next_check_at'],self.now)
+        for _ in range(5):self.observe_protect()
+        self.adapter.modify_position.assert_called_once()
+
+    def test_conflicting_identity_blocks_writes_and_backs_off(self):
+        a=self.manager.create(self.t,'protection',{'stop_loss_price':96,'take_profit_price':106},state='RETRY_READY')
+        self.manager.update(a,position_id='other')
+        self.observe_protect()
+        self.assertEqual(self.action('protection')['state'],'ESCALATED')
+        self.assertGreater(self.action('protection')['next_check_at'],self.now)
+        self.adapter.modify_position.assert_not_called()
+        self.adapter.get_rate.assert_not_called()
+
+    def test_pretransport_failure_advances_retry_ready_backoff(self):
+        a=self.manager.create(self.t,'protection',{'stop_loss_price':96,'take_profit_price':106},state='RETRY_READY')
+        self.manager.update(a,created_at=self.now-1000,mismatches=2)
+        with patch.object(self.manager,'send',side_effect=ValueError('pretransport failure')):
+            self.observe_protect()
+        self.assertGreater(self.action('protection')['next_check_at'],self.now)
+        self.assertEqual(self.action('protection')['failures'],1)
+        self.adapter.get_rate.reset_mock()
+        self.observe_protect();self.adapter.get_rate.assert_not_called()
+
+    def test_tighter_broker_stop_is_adopted_without_widening(self):
+        a=self.manager.create({**self.t,'broker_position_id':None},'protection',{'stop_loss_price':96,'take_profit_price':106},state='ESCALATED')
+        self.p['stop_loss_price']=97
+        self.observe_protect()
+        self.assertIsNone(self.action('protection'))
+        self.assertEqual(self.row(self.tid)['stop_loss_price'],97)
+        self.adapter.modify_position.assert_not_called()
+
+    def test_short_tighter_stop_adoption_preserves_broker_protection(self):
+        self.update(self.tid,side='SHORT',stop_loss_price=104,take_profit_price=94)
+        self.t=self.row(self.tid);self.p.update(side='SHORT',stop_loss_price=103,take_profit_price=94)
+        self.manager.create(self.t,'protection',{'stop_loss_price':104,'take_profit_price':94},state='ESCALATED')
+        self.observe_protect()
+        self.assertEqual(self.row(self.tid)['stop_loss_price'],103)
+        self.assertIsNone(self.action('protection'))
+        self.adapter.modify_position.assert_not_called()
+
+    def test_configuration_audit_includes_active_recovery_discrepancy(self):
+        self.manager.create({**self.t,'broker_position_id':None},'protection',{'stop_loss_price':96,'take_profit_price':106},state='RETRY_READY')
+        result=app.TradeConfigurationAuditor().validate_trade_configuration(self.tid)
+        self.assertTrue(any('Unresolved broker recovery' in reason for reason in result['issues']))
 
     def test_close_is_deduplicated_and_correlation_survives_restart(self):
         self.close();a=self.action('close')
@@ -164,7 +217,7 @@ class RecoveryTests(unittest.TestCase):
         self.adapter.modify_position.assert_not_called()
 
     def test_recovery_stops_if_price_clearance_is_lost(self):
-        self.protect();self.adapter._get_rate.return_value={'bid':95,'ask':95.1}
+        self.protect();self.adapter.get_rate.return_value={'bid':95,'ask':95.1}
         for _ in range(2):self.advance();self.observe_protect()
         self.assertEqual(self.action('protection')['state'],'ESCALATED')
         self.adapter.modify_position.assert_called_once()
@@ -263,6 +316,82 @@ class RecoveryTests(unittest.TestCase):
             with self.subTest(key=key),self.assertRaises(ValueError):app.update_agent_rules('execution',{key:value})
             self.rules['execution']=original
 
+    def test_tighter_stop_and_different_target_are_reconciled_without_widening(self):
+        self.p.update(stop_loss_price=97,take_profit_price=105)
+        a=self.manager.create(self.t,'protection',{'stop_loss_price':96,'take_profit_price':106},state='ESCALATED')
+        self.manager.update(a,created_at=self.now-1000,mismatches=20)
+        self.observe_protect()
+        self.adapter.modify_position.assert_called_once()
+        args=self.adapter.modify_position.call_args.args
+        self.assertEqual(args,('p',97,106))
+        self.assertEqual(self.action('protection')['payload']['stop_loss_price'],97)
+
+    def test_pending_expiry_cancellation_is_durable_and_fill_wins_race(self):
+        self.t.update(created_at=datetime.fromtimestamp(self.now-7200,timezone.utc).isoformat(),broker_order_id='123')
+        data={'orderId':123,'status':{'id':11},'positionExecutions':[]}
+        self.adapter.cancel_pending_order.return_value={'accepted':True}
+        asyncio.run(self.manager.expire_pending_entry(self.t,data,self.adapter))
+        asyncio.run(self.manager.expire_pending_entry(self.t,data,self.adapter))
+        self.adapter.cancel_pending_order.assert_called_once()
+        self.assertEqual(self.action('entry_cancel')['state'],'ACKNOWLEDGED')
+        asyncio.run(self.manager.expire_pending_entry(self.t,{**data,'status':{'id':9},'positionExecutions':[{'positionId':'p'}]},self.adapter))
+        self.assertIsNone(self.action('entry_cancel'))
+        self.adapter.close_position.assert_not_called()
+
+    def test_cancel_unknown_status_or_wrong_order_never_sends(self):
+        self.t.update(created_at=datetime.fromtimestamp(self.now-7200,timezone.utc).isoformat(),broker_order_id='123')
+        for d in [{'orderId':124,'status':{'id':11}},{'orderId':123,'status':{'id':99}},{'orderId':123,'status':{'id':3}}]:
+            asyncio.run(self.manager.expire_pending_entry(self.t,d,self.adapter))
+        self.adapter.cancel_pending_order.assert_not_called()
+
+    def test_profit_close_rechecks_each_attempt_and_withholds_after_price_reversal(self):
+        from unittest.mock import AsyncMock
+        self.now=datetime(2026,10,20,17,tzinfo=timezone.utc).timestamp()
+        self.update(self.tid,opened_at='2026-10-20T14:00:00Z',config_json=json.dumps(self.rules))
+        self.t=self.row(self.tid)
+        self.p.update(opened_at='2026-10-20T14:00:00Z',units=6,amount=300,fees=0,unrealized_pnl=120)
+        self.adapter.get_positions.return_value={'available':True,'positions':[self.p]}
+        self.adapter.get_rate.return_value={'bid':120,'ask':120.1}
+        fundamentals={'exchange':'NMS','exchange_timezone':'America/New_York','exchange_session_start_epoch':datetime(2026,10,20,13,30,tzinfo=timezone.utc).timestamp(),'exchange_session_end_epoch':datetime(2026,10,20,20,tzinfo=timezone.utc).timestamp()}
+        with patch('integrations.fetch_company_fundamentals',AsyncMock(return_value=fundamentals)):
+            asyncio.run(self.manager.request_close(self.t,self.p,self.adapter,'profit_review:actual_fill_exceeded_configured_units_or_spend_cap'))
+            self.adapter.close_position.assert_called_once()
+            a=self.action('close');self.manager.update(a,state='RETRY_READY',next_check_at=0)
+            self.p['unrealized_pnl']=-1;self.adapter.get_rate.return_value={'bid':99,'ask':99.1}
+            asyncio.run(self.manager.send(a,self.row(self.tid),self.p,self.adapter))
+        self.adapter.close_position.assert_called_once()
+        self.assertIsNone(self.action('close'))
+        self.assertEqual(self.row(self.tid)['status'],'OPEN')
+
+    def test_profitable_short_news_exit_requires_direct_research_and_regular_session(self):
+        from unittest.mock import AsyncMock
+        self.now=datetime(2026,10,20,17,tzinfo=timezone.utc).timestamp()
+        self.update(self.tid,side='SHORT',opened_at='2026-10-20T14:00:00Z',config_json=json.dumps(self.rules))
+        self.t=self.row(self.tid)
+        self.p.update(side='SHORT',opened_at='2026-10-20T14:00:00Z',units=2,amount=100,fees=0,unrealized_pnl=20)
+        self.adapter.get_positions.return_value={'available':True,'positions':[self.p]}
+        self.adapter.get_rate.return_value={'bid':89.9,'ask':90}
+        app.record_trade_event(self.tid,'research','researcher','completed','accepted','New company evidence',
+            {'signal':'bullish','confidence':.9,'openai':{'status':'available','company_relevance':'direct','reaction_assessment':'structural'}})
+        c=app.get_connection();c.execute("UPDATE trade_events SET created_at=? WHERE trade_id=? AND stage='research'",('2026-10-20 16:59:00',self.tid));c.commit();c.close()
+        fundamentals={'exchange':'NMS','exchange_timezone':'America/New_York','exchange_session_start_epoch':datetime(2026,10,20,13,30,tzinfo=timezone.utc).timestamp(),'exchange_session_end_epoch':datetime(2026,10,20,20,tzinfo=timezone.utc).timestamp()}
+        with patch('integrations.fetch_company_fundamentals',AsyncMock(return_value=fundamentals)):
+            asyncio.run(self.manager.request_close(self.t,self.p,self.adapter,'profit_review:structural_news_invalidated_thesis'))
+            self.adapter.close_position.assert_called_once()
+            self.assertTrue(self.action('close')['payload']['profit_guard']['allowed'])
+            a=self.action('close');self.manager.update(a,state='RETRY_READY',next_check_at=0)
+            self.now=datetime(2026,10,20,21,tzinfo=timezone.utc).timestamp()
+            asyncio.run(self.manager.send(a,self.row(self.tid),self.p,self.adapter))
+        self.adapter.close_position.assert_called_once()
+        self.assertIsNone(self.action('close'))
+
+    def test_pending_validity_starts_at_submission_not_old_analysis(self):
+        self.t.update(created_at=datetime.fromtimestamp(self.now-86400,timezone.utc).isoformat(),broker_order_id='123',
+            policy_json=json.dumps({'entry_submitted_at':datetime.fromtimestamp(self.now-60,timezone.utc).isoformat()}))
+        asyncio.run(self.manager.expire_pending_entry(self.t,{'orderId':123,'status':{'id':11}},self.adapter))
+        self.adapter.cancel_pending_order.assert_not_called()
+
+
 class AdapterRecoveryTests(unittest.TestCase):
     def test_close_lookup_uses_dedicated_read_endpoint(self):
         adapter=EtoroBrokerAdapter.__new__(EtoroBrokerAdapter)
@@ -279,7 +408,80 @@ class AdapterRecoveryTests(unittest.TestCase):
         adapter.settings=SimpleNamespace(etoro_api_base_url='https://broker.invalid',etoro_api_debug_logging=False)
         adapter.api_logs=[]
         error=HTTPError('https://broker.invalid',429,'Too Many Requests',{'Retry-After':'120'},io.BytesIO(b'{}'))
-        with patch.object(adapter,'_headers',return_value={'x-request-id':'ref'}),patch.object(integrations,'urlopen',side_effect=error):
+        with patch.object(adapter,'_headers',return_value={'x-request-id':'ref'}),patch('brokers.etoro.urlopen',side_effect=error):
             with self.assertRaises(EtoroAPIError) as captured:adapter._request_json('GET','/status')
         self.assertEqual(captured.exception.status_code,429)
         self.assertEqual(captured.exception.retry_after_seconds,120)
+
+    def test_pending_cancel_is_demo_only_and_uses_documented_endpoint(self):
+        from types import SimpleNamespace
+        adapter=EtoroBrokerAdapter.__new__(EtoroBrokerAdapter)
+        adapter.settings=SimpleNamespace(etoro_demo_trading=True)
+        with patch.object(adapter,'_request_json',return_value={}) as request:
+            adapter.cancel_pending_order('123.0',request_id='cancel-ref')
+        request.assert_called_once_with('DELETE','/api/v2/trading/execution/demo/orders/123',request_id='cancel-ref')
+        adapter.settings.etoro_demo_trading=False
+        with self.assertRaises(ValueError):adapter.cancel_pending_order('123')
+
+class TrailingCloseTests(unittest.TestCase):
+    setUp=RecoveryTests.setUp
+    trade=RecoveryTests.trade
+    row=RecoveryTests.row
+    update=RecoveryTests.update
+
+    def prime(self):
+        import position_policy
+        self.manager.rules={**self.manager.rules,'profit_trailing_enabled':True,'profit_trailing_arming_basis':'atr'}
+        self.t['policy_json']=json.dumps({'atr14':4})
+        self.update(self.tid,policy_json=self.t['policy_json'])
+        c=app.get_connection()
+        position_policy.observe_trailing_profit(c,self.t,self.p,{'bid':108,'ask':108.1},self.now,self.manager.rules)
+        self.adapter.get_rate.return_value={'bid':107,'ask':107.1}
+        c.close()
+
+    def test_fresh_drawdown_submits_once_and_unknown_does_not_duplicate(self):
+        self.prime()
+        self.adapter.get_positions.return_value={'available':True,'positions':[{**self.p,'unrealized_pnl':32}]}
+        asyncio.run(self.manager.request_close(self.t,self.p,self.adapter,'profit_trailing:drawdown'))
+        asyncio.run(self.manager.request_close(self.t,self.p,self.adapter,'profit_trailing:drawdown'))
+        self.adapter.close_position.assert_called_once()
+        self.adapter.modify_position.assert_not_called()
+
+    def test_short_close_uses_fresh_ask_and_upward_retreat(self):
+        self.t['side']='SHORT';self.p['side']='SHORT';self.t['policy_json']=json.dumps({'atr14':4})
+        self.update(self.tid,side='SHORT',policy_json=self.t['policy_json'])
+        self.manager.rules={**self.manager.rules,'profit_trailing_enabled':True,'profit_trailing_arming_basis':'atr'}
+        import position_policy
+        c=app.get_connection()
+        position_policy.observe_trailing_profit(c,self.t,self.p,{'bid':91.9,'ask':92},self.now,self.manager.rules);c.close()
+        self.adapter.get_positions.return_value={'available':True,'positions':[self.p]}
+        self.adapter.get_rate.return_value={'bid':92.9,'ask':93}
+        asyncio.run(self.manager.request_close(self.t,self.p,self.adapter,'profit_trailing:drawdown'))
+        self.adapter.close_position.assert_called_once()
+
+    def test_rebound_or_missing_snapshot_withholds_close(self):
+        self.prime()
+        for snapshot,rate in [({'available':True,'positions':[self.p]},{'bid':107.5,'ask':107.6}),
+                              ({'available':False,'positions':[]},{'bid':107,'ask':107.1}),
+                              ({'available':True,'positions':[self.p]},{'available':False})]:
+            self.adapter.get_positions.return_value=snapshot
+            self.adapter.get_rate.return_value=rate
+            result=asyncio.run(self.manager.request_close(self.t,self.p,self.adapter,'profit_trailing:drawdown'))
+            self.assertTrue(result['withheld'])
+        self.adapter.close_position.assert_not_called()
+
+    def test_retry_revalidates_after_confirmed_failure(self):
+        self.prime()
+        self.adapter.get_positions.return_value={'available':True,'positions':[{**self.p,'unrealized_pnl':32}]}
+        asyncio.run(self.manager.request_close(self.t,self.p,self.adapter,'profit_trailing:drawdown'))
+        action=self.manager.get(self.tid,'close')
+        self.manager.update(action,state='RETRY_READY',next_check_at=self.now)
+        self.adapter.get_positions.return_value={'available':True,'positions':[self.p]}
+        self.adapter.get_rate.return_value={'bid':109,'ask':109.1}
+        result=asyncio.run(self.manager.send(action,self.t,self.p,self.adapter))
+        self.assertTrue(result['withheld'])
+        self.adapter.close_position.assert_called_once()
+        self.assertEqual(self.row(self.tid)['status'],'OPEN')
+        c=app.get_connection()
+        self.assertEqual(c.execute('SELECT best_price FROM price_trailing WHERE trade_id=?',(self.tid,)).fetchone()[0],109)
+        c.close()

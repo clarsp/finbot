@@ -71,11 +71,11 @@ class RangeWorkflowTests(unittest.TestCase):
 
     def test_existing_position_quote_uses_verified_id_and_rejects_crossed_market(self):
         import asyncio
-        self.adapter._get_rate.return_value={'bid':37.9,'ask':38}
+        self.adapter.get_rate.return_value={'bid':37.9,'ask':38}
         quote=asyncio.run(app.PositionManagerAgent().get_position_quote(self.adapter,{'instrument_id':'42'}))
         self.assertTrue(app.is_fresh_etoro_quote(quote))
-        self.adapter._get_rate.assert_called_once_with(42)
+        self.adapter.get_rate.assert_called_once_with(42)
         self.adapter.resolve_instrument.assert_not_called()
-        self.adapter._get_rate.return_value={'bid':38,'ask':37}
+        self.adapter.get_rate.return_value={'bid':38,'ask':37}
         quote=asyncio.run(app.PositionManagerAgent().get_position_quote(self.adapter,{'instrument_id':'42'}))
         self.assertFalse(quote['available'])

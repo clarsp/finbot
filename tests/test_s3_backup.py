@@ -28,6 +28,16 @@ class Storage:
         data,metadata=self.objects[Key]
         return {'Body':io.BytesIO(data),'Metadata':metadata}
 
+    def copy_object(self,Bucket,Key,CopySource,**kwargs):
+        if self.fail:raise RuntimeError('copy failed')
+        self.objects[Key]=self.objects[CopySource['Key']]
+    def get_paginator(self,name):return self
+    def paginate(self,Bucket,Prefix):
+        yield {'Contents':[{'Key':k} for k in self.objects if k.startswith(Prefix)]}
+    def delete_objects(self,Bucket,Delete):
+        for item in Delete['Objects']:self.objects.pop(item['Key'],None)
+        return {}
+
 
 class BackupTests(unittest.TestCase):
     def setUp(self):
@@ -61,6 +71,7 @@ class BackupTests(unittest.TestCase):
         conn=self.database();self.backup.create_snapshot()
         conn.execute('PRAGMA journal_mode=WAL');conn.execute('INSERT INTO items VALUES (2)');conn.commit()
         self.backup.settings=replace(self.settings,restore_mode='if_newer')
+        self.storage.gets=0
         self.assertFalse(self.backup.restore_latest())
         self.assertEqual(self.storage.gets,0)
         self.assertEqual(conn.execute('SELECT count(*) FROM items').fetchone()[0],2);conn.close()
@@ -123,9 +134,56 @@ class BackupTests(unittest.TestCase):
         self.assertNotEqual(self.settings.versioned_key(now),self.settings.versioned_key(now))
 
 
+    def test_rotation_keeps_two_recoverable_generations_and_unrelated_objects(self):
+        conn=self.database()
+        self.storage.objects['finbot/test/other/file.db']=(b'unrelated',{})
+        self.storage.objects['another/snapshots/old.db']=(b'unrelated',{})
+        first=self.backup.create_snapshot()
+        self.assertLess(first['compressed_bytes'],first['bytes'])
+        conn.execute('INSERT INTO items VALUES (2)');conn.commit()
+        self.backup.create_snapshot()
+        for key,count in [(self.settings.latest_key,2),(self.settings.previous_key,1)]:
+            path=self.path.parent/(str(count)+'.db')
+            self.backup._download_validated(path,key)
+            with sqlite3.connect(path) as check:
+                self.assertEqual(check.execute('SELECT count(*) FROM items').fetchone()[0],count)
+        self.assertEqual(len(self.storage.objects),4)
+        conn.close()
+
+    def test_corrupt_uploaded_object_does_not_rotate_or_prune_good_copies(self):
+        conn=self.database();conn.close();self.backup.create_snapshot()
+        latest=self.storage.objects[self.settings.latest_key]
+        previous=self.storage.objects[self.settings.previous_key]
+        upload=self.storage.upload_file
+        def corrupt(path,bucket,key,ExtraArgs):
+            upload(path,bucket,key,ExtraArgs)
+            self.storage.objects[key]=(b'broken',ExtraArgs['Metadata'])
+        with patch.object(self.storage,'upload_file',side_effect=corrupt):
+            with self.assertRaises(Exception):self.backup.create_snapshot()
+        self.assertEqual(self.storage.objects[self.settings.latest_key],latest)
+        self.assertEqual(self.storage.objects[self.settings.previous_key],previous)
+
+    def test_retention_refuses_to_delete_without_two_valid_copies(self):
+        conn=self.database();conn.close();self.backup.create_snapshot()
+        del self.storage.objects[self.settings.previous_key]
+        key=self.settings.versioned_key(datetime.now(timezone.utc))
+        self.storage.objects[key]=(b'old',{})
+        with self.assertRaises(Missing):self.backup.prune_snapshots()
+        self.assertIn(key,self.storage.objects)
+
+    def test_legacy_uncompressed_backup_still_restores(self):
+        conn=self.database();conn.close();data=self.path.read_bytes()
+        self.storage.objects[self.settings.latest_key]=(data,{'sha256':hashlib.sha256(data).hexdigest()})
+        self.assertEqual(self.backup.verify_latest()['bytes'],len(data))
+
     def test_wrapped_service_errors_expose_code_only(self):
         try:
             try:raise Missing('credential-bearing message')
             except Missing as error:raise RuntimeError('secret') from error
         except RuntimeError as error:
             self.assertEqual(safe_error(error),'RuntimeError: NoSuchKey')
+
+class TimeoutErrorSanitizationTests(unittest.TestCase):
+    def test_timeout_with_none_response_does_not_mask_original_error(self):
+        error=RuntimeError('Private endpoint must not leak');error.response=None
+        self.assertEqual(safe_error(error),'RuntimeError')
