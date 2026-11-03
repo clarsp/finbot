@@ -101,6 +101,8 @@ def ensure_price_trailing_schema(conn):
 
 def trailing_evidence(trade, position, rate, best_price=None, rules=None, *, entry_atr=None, entry_price=None, now=None, previous_evidence=None):
     """Selectable cash/ATR arming with ATR retreats on executable bid/ask."""
+    if rate.get('quote_validation') and rate['quote_validation'].get('code') != 'fresh':
+        raise ValueError(rate['quote_validation'].get('reason') or 'Broker quote is not fresh.')
     side = trade.get('side')
     if not trade.get('broker_position_id') or side not in ('LONG', 'SHORT') or str(position.get('position_id')).removesuffix('.0') != str(trade['broker_position_id']).removesuffix('.0') or position.get('side') != side:
         raise ValueError('Trailing position identity mismatch')

@@ -156,8 +156,10 @@ class NativeTrailingTests(unittest.TestCase):
             policy_json=json.dumps({'atr14':4,'fill_adjusted':True}))
         self.adapter.get_positions.return_value={'available':True,'positions':[self.p]}
         self.adapter.get_rate.return_value={'bid':102.3,'ask':102.4}
-        with patch.object(app.PositionManagerAgent,'recovery_manager',return_value=self.manager):
-            asyncio.run(app.manage_etoro_demo_positions(self.settings))
+        for version in ['news_reaction_v2', app.WORKFLOW_VERSION]:
+            self.update(self.tid, strategy_version=version)
+            with patch.object(app.PositionManagerAgent,'recovery_manager',return_value=self.manager):
+                asyncio.run(app.manage_etoro_demo_positions(self.settings))
         self.adapter.close_position.assert_not_called()
         c=app.get_connection()
         e=json.loads(c.execute("SELECT details FROM trade_events WHERE trade_id=? AND stage='profit_trailing' ORDER BY id DESC LIMIT 1",(self.tid,)).fetchone()[0]);c.close()

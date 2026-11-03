@@ -33,8 +33,15 @@ def instrument_blockers(instrument, side=None):
         reasons.append('Broker reports the instrument is delisted.')
     if instrument.get('platform_active') is False:
         reasons.append('Broker reports the instrument is inactive on its platform; eligibility requires verification.')
-    if instrument.get('exchange_open') is False:
-        reasons.append('Broker reports the exchange is closed.')
+    availability = instrument.get('execution_availability') or {}
+    reconciled = (availability.get('source') == 'etoro_demo_eligibility_and_quote'
+                  and availability.get('verified') is True)
+    if instrument.get('exchange_open') is False and not reconciled:
+        session = availability.get('session') or {}
+        if session.get('is_regular_session') and availability.get('reason'):
+            reasons.append('Broker execution availability unverified: ' + availability['reason'])
+        else:
+            reasons.append('Broker reports the exchange is closed.')
     if instrument.get('currently_tradeable') is not True:
         reasons.append('Broker reports the instrument is not currently tradable.' if instrument.get('currently_tradeable') is False else 'Current broker tradability is unknown.')
     if side == 'LONG' and instrument.get('buy_enabled') is False:

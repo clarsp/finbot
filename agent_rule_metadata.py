@@ -71,6 +71,8 @@ AGENT_RULE_HELP = {'profit_review_exits_enabled': 'Allow a news or sizing review
                             'uncertain submissions and open positions are preserved. Default: 3 days.',
  'conditional_mean_reversion_confirmation_atr': 'Required completed-bar recovery from the post-news extreme '
                                                 'before entering the reversal.',
+ 'allow_mixed_trend_reversals': 'Allow measured temporary dips/rallies to reverse in a mixed daily trend, using half the normal risk budget. Reversal confirmation remains required.',
+ 'fresh_boundary_entries_enabled': 'Allow directional continuation beyond an observed monthly/weekly boundary only after two completed post-event closes hold beyond it with follow-through. ATR protection and positive net payoff still apply.',
  'conditional_mean_reversion_min_confidence': 'Research confidence required for a temporary news reaction; '
                                               'technical distance never overrides it.',
  'conditional_mean_reversion_stop_cushion_atr': 'Place the protective stop this many ATR units beyond the '
@@ -183,3 +185,10 @@ AGENT_RULE_LABELS = {'profit_trailing_arming_basis':'Arming basis','profit_trail
 
 def rule_metadata(rules):
     return {agent: {key: {"label": AGENT_RULE_LABELS.get(key, key.replace("_", " ").title()), "help": AGENT_RULE_HELP.get(key, ""), "unit": "USD" if key in {"profit_trailing_prime_arm_usd","profit_trailing_major_arm_usd"} else "ATR" if key.startswith("profit_trailing_") and key.endswith("_atr") else "minutes" if key == "profit_trailing_interval_minutes" else ""} for key in values if key != "status"} for agent, values in rules.items() if isinstance(values, dict)}
+
+AGENT_RULE_HELP.update({
+    'volume_confirmation_enabled': 'Allow fresh direction-aligned RVOL/VWAP evidence to reduce directional confidence thresholds. Reversal measurements and all capital risk limits remain unchanged.',
+    'volume_min_rvol': 'Minimum cumulative regular-session volume relative to the same elapsed slots across 10–20 prior complete sessions. Default 1.5.',
+    'volume_max_vwap_distance_atr': 'Maximum distance on the proposed side of session VWAP in daily ATR units. Default 0.75. Requires completed-bar directional follow-through.',
+    'volume_confidence_relaxation': 'Directional confidence reduction, maximum 0.05 (five percentage points); countertrend capped at 0.025. Effective threshold never below 0.60 or above its original value. No sizing increase.',
+})

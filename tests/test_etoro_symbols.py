@@ -1,6 +1,7 @@
 """Broker identity translation never changes researched symbols or asset identity."""
 import copy
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 from brokers.etoro import EtoroBrokerAdapter
@@ -31,7 +32,7 @@ class SymbolMappingTests(unittest.TestCase):
             self.assertEqual(rows,before)
 
     def test_quote_and_order_use_the_same_mapping_and_preserve_research_symbol(self):
-        a=self.adapter([equity()]);a.get_rate=Mock(return_value={'bid':150,'ask':150.1})
+        a=self.adapter([equity()]);a.get_rate=Mock(return_value={'bid':150,'ask':150.1,'date':datetime.now(timezone.utc).isoformat(),'quoteType':'realtime'})
         q=a.get_quote('CVX');self.assertTrue(q['executable'])
         self.assertEqual(q['ticker'],'CVX');self.assertEqual(q['quote_symbol'],'CVX.US');self.assertEqual(q['instrument']['broker_symbol'],'CVX.US')
         a.get_rate.assert_called_once_with(1014)
@@ -83,4 +84,4 @@ class SymbolMappingTests(unittest.TestCase):
         a=self.adapter([{**equity(),'isExchangeOpen':False,'isBuyEnabled':False}])
         i=a.resolve_instrument('CVX');self.assertFalse(i['exchange_open']);self.assertFalse(i['buy_enabled'])
         with self.assertRaises(BrokerPreflightError):a.submit_order({'symbol':'CVX','units':1,'leverage':1})
-        self.assertTrue(all(call.args[0]=='GET' for call in a._request_json.call_args_list))
+        self.assertTrue(all('/trading/execution/' not in call.args[1] for call in a._request_json.call_args_list))

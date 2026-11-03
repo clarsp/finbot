@@ -6,3 +6,4 @@ openai==3.24.0
 plotly==7.1.0
 pandas==3.0.6
 boto3==1.40.76
+exchange_calendars==4.13.2

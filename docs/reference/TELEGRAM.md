@@ -36,7 +36,8 @@ can be tested until the user supplies the BotFather token.
 - `/positions`: recorded linked positions and profit-trailing observations.
 - `/closed` (or `/closed 5`): latest broker-confirmed linked closures across all
   dates, with realized net P/L and Stockholm timestamps.
-- `/today`: today's lifecycle counts and recent recorded decisions, Stockholm time.
+- `/today`: today's lifecycle counts and recent recorded decisions, with each
+  record's trade creation date/time (`YYYY-MM-DD HH:MM`) in Europe/Stockholm.
 - `/trade 123`: recorded stages for a specific lifecycle.
 - `/settings position_manager`: show one agent's settings. `/settings` lists agents.
 - `/set position_manager profit_trailing_interval_minutes 30`: update an allowed rule.

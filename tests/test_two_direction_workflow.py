@@ -168,6 +168,7 @@ class DatabaseTests(unittest.TestCase):
         self.adapter.get_closed_positions.return_value={'available':True,'positions':[]}
         self.stack.enter_context(patch.object(app,'create_broker_adapter',return_value=self.adapter))
         self.stack.enter_context(patch.object(app,'load_daily_bars',return_value=pd.DataFrame([{'Close':100,'sma50':95,'sma200':90,'atr14':2}],index=pd.to_datetime(['2026-10-13'],utc=True))))
+        self.stack.enter_context(patch.object(app,'load_volume_context',return_value={'available':False}))
         self.stack.enter_context(patch.object(app,'load_news_reaction',return_value={'available':False}))
         self.stack.enter_context(patch.object(app,'fetch_company_fundamentals',AsyncMock(return_value={'company_name':'Acme','data_status':'available'})))
         self.stack.enter_context(patch.object(app,'fetch_market_quote',AsyncMock(side_effect=lambda _:dict(available=True,provider='eToro',bid=99.9,ask=100,fetched_at=datetime.now(timezone.utc).isoformat()))))

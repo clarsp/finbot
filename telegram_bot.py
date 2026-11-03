@@ -28,6 +28,8 @@ EDITABLE = {
         'max_gross_exposure_pct', 'max_single_position_exposure_pct', 'max_stressed_loss_pct',
         'minimum_reward_risk', 'stop_atr_multiple', 'target_reward_risk', 'max_target_atr_multiple'},
     'strategist': {'min_confidence', 'fundamental_confirmation_min_confidence',
+        'allow_mixed_trend_reversals', 'fresh_boundary_entries_enabled',
+        'volume_confirmation_enabled', 'volume_min_rvol', 'volume_max_vwap_distance_atr', 'volume_confidence_relaxation',
         'countertrend_long_min_confidence', 'countertrend_short_min_confidence',
         'weak_fundamentals_max_net_profit_margin_pct', 'weak_fundamentals_max_revenue_growth_pct',
         'weak_fundamentals_min_debt_to_equity', 'strong_fundamentals_min_net_profit_margin_pct',
@@ -175,9 +177,17 @@ def request_context(app, plan, now=None):
         else:
             where += ' AND datetime(t.created_at)>=? AND datetime(t.created_at)<?'; params.extend(bounds)
         context['recent_decisions'] = [dict(r) for r in c.execute(
-            'SELECT t.id,t.symbol,t.side,t.status,e.stage,e.decision,e.message,e.created_at FROM trades t JOIN trade_events e ON e.trade_id=t.id WHERE '+where+
+            'SELECT t.id,t.symbol,t.side,t.status,t.created_at AS trade_created_at,e.stage,e.decision,e.message,e.created_at FROM trades t JOIN trade_events e ON e.trade_id=t.id WHERE '+where+
             " AND e.stage IN ('research','strategy','risk','execution','profit_trailing','exit') ORDER BY e.id DESC LIMIT 80", params)]
         context['decision_limit'] = 80
+        for record in context['recent_decisions']:
+            try:
+                created = datetime.fromisoformat(str(record['trade_created_at']).replace('Z', '+00:00'))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                record['trade_created_stockholm'] = created.astimezone(TZ).strftime('%Y-%m-%d %H:%M')
+            except (TypeError, ValueError):
+                record['trade_created_stockholm'] = 'time unavailable'
         context['research_gate_notes']='A neutral research signal blocks advancement to Strategist, Risk Manager and Execution. Financial commentary in a research summary is not proof that company metrics are mandatory for every instrument.'
         context['rejected_research_facts']=[dict(r) for r in c.execute(
             "SELECT t.id,t.symbol,json_extract(e.details,'$.signal') AS signal,json_extract(e.details,'$.confidence') AS confidence FROM trades t JOIN trade_events e ON e.trade_id=t.id WHERE t.trading_profile_id=1 AND datetime(t.created_at)>=? AND datetime(t.created_at)<? AND e.stage='research' AND e.decision='rejected' ORDER BY e.id DESC LIMIT 80", bounds)]
@@ -318,8 +328,8 @@ async def answer(app, text, history=None, authorize=None):
                 observed=datetime.fromtimestamp(t['checked_at'],TZ).isoformat() if t else 'not observed'
                 lines.append(f"#{p['id']} {p['symbol']} {p['side']} {p['status']}: profit {e.get('profit_usd','unknown')}, {e.get('tier','untracked')}; arming {e.get('arming_basis','atr')}, peak USD {e.get('peak_profit_usd','not applicable')}; progress {e.get('current_movement_atr','unknown')} ATR, best price {e.get('best_price','unknown')}, trigger price {e.get('trigger_price','not armed')}; observed {observed}")
             return '\n'.join(lines)[:3500]
-        lines=[context['date']+' Stockholm: '+json.dumps(context['status_counts']), 'Latest recorded decisions (up to 80):']
-        lines.extend(f"#{r['id']} {r['symbol']} {r['stage']} {r['decision']}: {r['message']}" for r in context['recent_decisions'])
+        lines=[context['date']+' Stockholm: '+json.dumps(context['status_counts']), 'Latest recorded decisions (up to 80; creation times in Stockholm):']
+        lines.extend(f"#{r['id']} {r['symbol']} · {r['trade_created_stockholm']} · {r['stage']} {r['decision']}: {r['message']}" for r in context['recent_decisions'])
         return '\n'.join(lines)[:3500]
     result=await model_json(app,
         'Answer the Finbot question concisely using only the supplied recorded evidence. Return JSON with '

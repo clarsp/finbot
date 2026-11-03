@@ -214,3 +214,114 @@ ATR rules and accessible tooltips, identifying older snapshots explicitly.
   broker mode and 15 minutes; frontend/worker health passed after recovery.
   Existing open NVDA #996, BMY #1285, META #2052 retained. Arming observations
   migrate on first fresh executable quote; frozen entry ATR remains intact.
+- Post-deployment SQLite PRAGMA quick_check returned ok; configuration change
+  recorded in access_events. Fresh 04:51 UTC observations for all three open
+  positions use arming_basis=amount, cash peak 0 (currently negative), retaining
+  their frozen entry ATRs. Worker heartbeat current, sole container healthy.
+  Final full Python suite again passed 438 tests after making the ATR-mode
+  retreat<arming validation conditional on ATR arming (amount retreats need
+  not be constrained by inactive ATR arm values).
+- Existing user-approved curated reporting sync completed: imported generation
+  20261030T044402Z-bc8e7ffc8929, 214 partitions, 70,124,977 compressed bytes;
+  configuration=1, trades=2631. Dashboard data now carries amount mode/10/20.
+  Export was much slower than prior runs; did not change transport or launch
+  another trading worker. Temporary browser preview server stopped.
+
+- 30 October 06:53 CET exchange-flag correction deployed at user request.
+  Search isExchangeOpen=false remains raw evidence, but no longer permanently
+  vetoes an otherwise active/currently tradable supported demo instrument when
+  an explicitly mapped exchange calendar is open (holiday/early-close/break
+  aware), matching demo eligibility explicitly allows opening and a dated
+  realtime broker bid/ask is <=60s old (future tolerance 5s). Preflight repeats
+  verification and requires non-potential direction/leverage permission.
+  Eligibility is account configuration, not a real-time market clock; calendars
+  do not establish unscheduled halts. Broker acceptance remains authoritative.
+  Unknown/unavailable evidence retains the block. No candidate replay/order
+  was manually triggered. Fixed v2 rate date normalization/freshness checks.
+  Added pinned exchange_calendars 4.13.2; full suite 450 tests passed, plus 26
+  eToro tests inside deployed image. Sole container healthy, image 22139d62e5a5,
+  migrated volume preserved; rollback finbot:before-exchange-availability-20261030.
+  Read-only deployed MSFT quote correctly remains indicative outside the session.
+  Actual market-open operation has not yet been observed. NVDA/BMY/META remain
+  reconciled/protected; amount arming 10/20, broker mode and 15m unchanged.
+  No unresolved broker actions. Details in LOCAL_MVP.md, brokers/etoro_sessions.py
+  and tests/test_etoro_exchange_availability.py.
+
+- 30 October automatic exchange discovery implemented at user request.
+  Unknown supported-asset exchange names now trigger eToro directory verification
+  by exact name and ID (or unique exact name when ID is unavailable). Installed
+  calendar names/MICs/aliases and explicit venue synonyms can register mappings
+  dynamically; there is no fuzzy matching, generated code or invented schedule.
+  Discovery runs even for inactive instruments without enabling them. Results and
+  unresolved reasons persist in /data/exchange_calendar_registry.json; positive
+  records refresh daily, unresolved hourly, and calendar-version changes force
+  revalidation. Directory reads are shared/throttled. Derived records survive
+  recreation and rebuild automatically after SQLite-only restore if missing.
+  All 462 tests passed, plus 12 registry tests inside the deployed image.
+  Sole service replaced successfully, image 28218a3b1650, healthy; rollback
+  finbot:before-dynamic-exchanges-20261030. Actual broker NESN.ZU/SIX ID12,
+  DNB.OL/Oslo ID14 and SAN.MC/Madrid ID10 automatically registered SIX/XOSL/XMAD.
+  All remained untradable while inactive/outside session. No order was submitted.
+
+- 30 October 19:24 CET approved fresh-move/quote-retry plan deployed.
+  `news_reaction_v3` centralizes side selection. Measured temporary reversals
+  now allow mixed trends at half risk; established opposing trends retain higher
+  confidence. Two completed closes beyond a monthly/weekly boundary plus 0.1 ATR,
+  current-price clearance and directional follow-through can qualify continuation
+  with existing ATR stop/target and positive net gates. Valid opposing levels
+  ahead still cap targets. Rejected proposals no longer expose losing-side TP.
+  Enabled effective Strategist keys allow_mixed_trend_reversals and
+  fresh_boundary_entries_enabled; GUI metadata and Telegram allowlist included.
+  Catalyst anchors persist by symbol/topic in reaction_anchors using first dated
+  report (actual release time explicitly unverified). Commentary cannot reset
+  active anchors; expired anchors need a distinct explicit event report. Two
+  completed post-event bars and <=15m last-bar freshness remain required.
+  Broker rates get one initial read plus two stale-only retries after 2s/5s,
+  shared with availability checks; diagnostic codes distinguish missing/invalid,
+  undated/future/delayed, stale, transport and rate-limit failures. No order retry.
+  Final execution checks broker and retrieval age; cost-review expiry permits one
+  bounded full recalculation under the same lease before SUBMITTING. v2/v3
+  positions both retain original management/fill policies; native trailing unchanged.
+  Full suite: 482 tests pass. Deployed image 92bc4ad4843a; 20 focused tests pass
+  inside image; sole container healthy, volume preserved. Rollback image:
+  finbot:before-fresh-moves-20261030. META #2052 retains v2, SL590.5428700474331,
+  TP716.9606949288504, reconciled protection; PM amount10/20, broker mode, 15m.
+  Offline saved AMZN #2786 now evaluates LONG but rejects absent measured reversal;
+  historical record was not replayed/changed. Live read-only AMZN quotes remained
+  stale (71.2/73.5/78.7s) across all three reads, clearly recorded stale_quote
+  rather than exchange-closed; execution withheld. No manual order submitted.
+
+- 2 November Telegram /today now includes each listed trade's creation date/time
+  in Europe/Stockholm (YYYY-MM-DD HH:MM), separate from its agent-event time.
+  UTC-naive SQLite times are converted explicitly; context retains both timestamps.
+  Existing reply cap/permissions preserved. Full suite 482 tests pass, including
+  midnight UTC-to-Stockholm conversion and rendered /today output. Deployed sole
+  container healthy, image ce77baea09cb; rollback
+  finbot:before-telegram-created-time-20261102. No test Telegram message sent.
+
+- 3 November volume implementation (source only): `news_reaction_v4` adds optional
+  same-elapsed-session RVOL and approximate session VWAP, symmetric LONG/SHORT
+  confirmation, bounded 0.05 directional / 0.025 countertrend confidence relief
+  (0.60 floor), shared Strategy/Risk thresholds and fresh submission revalidation.
+  Half-risk and all capital/quote/cost/protection limits remain unchanged; measured
+  reversal rules retain baseline requirements. Half of new research slots preserve
+  recency; volume prioritizes the remainder, with at most 40 symbols/four concurrent
+  Yahoo reads. GUI metadata and Telegram allowlist include controls. Unsupported
+  exchanges or incomplete/stale volume retain baseline eligibility. OBV deferred.
+  No runtime deployment, persisted setting mutation or manual order performed.
+  Validation: full unittest suite passed 491 tests; git diff whitespace check passed.
+  Nine new offline regressions cover calculation/DST/incomplete bars, LONG/SHORT
+  thresholds and fallbacks, preserved half allocation, recency reservation and
+  actual final-submission refresh with mocked provider/broker boundaries.
+
+- 3 November volume deployment completed at user request. Decision messages in
+  Strategy, Risk Manager and fresh-submission lifecycle events explicitly state
+  LONG/SHORT, measured RVOL/VWAP distance, baseline/effective confidence thresholds,
+  whether relaxation enabled approval, and unchanged risk allocation/limits.
+  Full suite 491 tests passed; nine focused mocked tests passed inside deployed
+  image 46360d4867ae. Sole Compose service healthy; frontend and worker heartbeat
+  passed. External volume finbot_migrated_20261022 preserved; pre-deployment
+  SQLite quick_check ok. Effective v4 controls enabled/1.5 RVOL/0.75 ATR/0.05
+  relaxation verified. Risk/execution limits and PM broker mode, amount10/20 and
+  15-minute reconfirmation match the pre-deployment snapshot. No manual order or
+  candidate replay triggered. Rollback: finbot:before-volume-confirmation-20261103.

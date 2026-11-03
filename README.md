@@ -8,6 +8,12 @@ The active eToro workflow discovers companies from Yahoo news/screens, enriches 
 
 After submission, **Position Manager** owns fill confirmation, protection, reconciliation, recovery, exits and shadow observations. Existing positions are adopted without changing their saved policies. **Performance Analyst** produces advisory daily/weekly outcome reviews from local broker evidence; it does not change trading settings. Use Position management and Performance reviews in the dashboard; expand the lifecycle chart to inspect Position Manager steps.
 
+Fresh temporary dips/rallies can qualify for measured reversals in mixed daily
+trends at half risk. Confirmed two-bar range breakouts have a separate
+continuation path with ATR protection. Stale broker quotes get two data retries;
+missing quotes and request failures are reported separately. See the
+[fresh-move and quote rules](docs/reference/LOCAL_MVP.md#fresh-dips-rallies-and-quote-retries--30-october-2026).
+
 Market timing is calculated in each instrument's primary-exchange timezone rather than a global ET clock. Research and lifecycle evidence distinguish the underlying regular session from eToro quote availability, retain local weekday/session context through every agent, and recalculate it before submission. These fields are observational until strategy evaluation shows that a specific session interaction improves net results.
 
 - **Local simulation:** `FINBOT_BROKER_PROVIDER=dummy`; local simulated records, no broker orders.
@@ -160,3 +166,8 @@ user activation on 28 October. Scheduled ATR exits remains the default for new
 installations. Broker mode still performs scheduled
 reconfirmation, retains take profit and tighter existing stops, and uses durable
 broker-update verification. See [native broker trailing](docs/reference/POSITION_MANAGEMENT.md#optional-native-broker-trailing--28-october-2026).
+
+Optional RVOL/VWAP evidence now prioritizes part of the news research queue and
+provides bounded direction-aware confidence relaxation for LONG and SHORT.
+Capital risk limits and measured reversal requirements remain unchanged; missing
+volume retains baseline rules. See [volume qualification](docs/reference/LOCAL_MVP.md#volume-supported-directional-qualification--3-november-2026).

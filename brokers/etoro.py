@@ -11,6 +11,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from market_instruments import sp500_index_supported
+from .etoro_sessions import execution_session, CALENDARS
+from .exchange_registry import discover_calendar, normalized_name
+from .quotes import assess_rate, read_rate_with_retries, MissingQuote
 from .contracts import instrument_blockers
 from .etoro_symbols import search_symbol, select_instrument
 from .errors import BrokerAPIError as EtoroAPIError, BrokerPreflightError
@@ -151,14 +154,77 @@ class EtoroBrokerAdapter:
         payload = self._request_json(
             "GET",
             "/api/v1/market-data/search",
-            params={"internalSymbolFull": search_symbol(symbol), "fields": "instrumentId,internalInstrumentId,internalSymbolFull,internalAssetClassName,internalExchangeName,currency,internalInstrumentCurrency,isCurrentlyTradable,isExchangeOpen,isActiveInPlatform,isDelisted,isBuyEnabled,isSellEnabled,isShortEnabled"},
+            params={"internalSymbolFull": search_symbol(symbol), "fields": "instrumentId,internalInstrumentId,internalSymbolFull,internalAssetClassName,internalExchangeName,internalExchangeId,exchangeID,currency,internalInstrumentCurrency,isCurrentlyTradable,isExchangeOpen,isActiveInPlatform,isDelisted,isBuyEnabled,isSellEnabled,isShortEnabled"},
         )
         items = payload.get("items") or payload.get("results") or payload.get("data") or []
         return select_instrument(symbol,items)
 
-    def resolve_instrument(self, symbol: str) -> Dict[str, Any]:
+    def resolve_instrument(self, symbol: str, *, verify_availability=True) -> Dict[str, Any]:
         instrument = self._find_instrument(symbol)
-        return self._normalize_instrument(symbol, instrument)
+        normalized = self._normalize_instrument(symbol, instrument)
+        if (normalized.get('supported_asset')
+                and normalized_name(normalized.get('exchange_name')) not in CALENDARS):
+            normalized['exchange_calendar_resolution'] = discover_calendar(normalized, self._request_json)
+        if verify_availability:
+            self._reconcile_exchange_flag(normalized)
+        return normalized
+
+    def _reconcile_exchange_flag(self, instrument, rate=None, *, raise_quote_errors=False):
+        """Retain search metadata; reconcile conflicts using independent evidence.
+
+        Eligibility describes account configuration, not the market clock. It
+        must never authorize an out-of-session or undated/stale quote by itself.
+        """
+        if (instrument.get('exchange_open') is not False
+                or instrument.get('currently_tradeable') is not True
+                or instrument.get('platform_active') is not True
+                or instrument.get('delisted') is True
+                or not instrument.get('supported_asset')
+                or not self.settings.etoro_demo_trading):
+            return
+        session = execution_session(instrument)
+        evidence = {'source': 'etoro_demo_eligibility_and_quote',
+                    'checked_at': datetime.now(timezone.utc).isoformat(),
+                    'session': session, 'verified': False}
+        instrument['execution_availability'] = evidence
+        if not session.get('is_regular_session'):
+            evidence['reason'] = session.get('reason') or 'Outside the primary exchange regular session.'
+            return
+        rate_requested = False
+        try:
+            result = self._request_json('POST', '/api/v2/trading/info/demo/eligibility',
+                payload={'instrumentIds': [instrument['instrument_id']], 'currency': 'USD'})
+            matches = [row for row in result.get('eligibilities', [])
+                       if row.get('instrumentId') == instrument['instrument_id']
+                       and str(row.get('symbol', '')).upper() == instrument['broker_symbol']]
+            if len(matches) != 1 or instrument['instrument_id'] in result.get('notFoundInstrumentIds', []):
+                raise ValueError('Broker eligibility identity is missing or ambiguous.')
+            eligibility = matches[0]
+            evidence['eligibility'] = eligibility
+            if eligibility.get('allowOpenPosition') is not True:
+                raise ValueError('Broker account does not explicitly permit opening this instrument.')
+            rate_requested = rate is None
+            rate = rate if rate is not None else self.get_rate(instrument['instrument_id'])
+            quote_time = _broker_time(rate.get('date') or rate.get('timestamp') or rate.get('lastUpdated'))
+            bid, ask = _coerce_optional_float(rate.get('bid')), _coerce_optional_float(rate.get('ask'))
+            evidence['quote'] = {'bid': bid, 'ask': ask, 'quote_at': quote_time, 'quote_type': rate.get('quoteType')}
+            evidence['quote_validation'] = rate.get('quote_validation') or assess_rate(rate)
+            if (bid is None or ask is None or bid <= 0 or ask < bid
+                    or str(rate.get('quoteType', '')).lower() != 'realtime'
+                    or not quote_time
+                    or not -5 <= (datetime.now(timezone.utc)-datetime.fromisoformat(quote_time)).total_seconds() <= 60):
+                raise ValueError(evidence['quote_validation']['reason'])
+            # The session may have ended while the broker requests were pending.
+            if not execution_session(instrument).get('is_regular_session'):
+                raise ValueError('Primary exchange regular session ended during verification.')
+            evidence['verified'] = True
+            evidence['reason'] = 'Search exchange flag conflicts with regular-session, account and quote evidence.'
+            instrument['tradeable'] = True
+        except Exception as error:
+            evidence['reason'] = str(error)
+            if rate_requested and rate is None and raise_quote_errors:
+                raise
+        return rate
 
     def _normalize_instrument(self, symbol, instrument):
         asset_class = str(
@@ -202,6 +268,7 @@ class EtoroBrokerAdapter:
             "buy_enabled": instrument.get("isBuyEnabled"),
             "short_enabled": instrument.get("isSellEnabled", instrument.get("isShortEnabled")),
             "exchange_name": instrument.get("internalExchangeName") or instrument.get("exchangeName"),
+            "exchange_id": instrument.get("internalExchangeId") or instrument.get("exchangeID") or instrument.get("exchangeId"),
             "currently_tradeable": instrument.get("isCurrentlyTradable", instrument.get("isTradable")),
             "instrument": instrument,
         }
@@ -217,25 +284,40 @@ class EtoroBrokerAdapter:
             result_id = _etoro_instrument_id(result)
             if result_id == instrument_id:
                 return result
-        raise ValueError(f"eToro did not return market data for instrument {instrument_id}.")
+        raise MissingQuote(f"eToro did not return market data for instrument {instrument_id}.")
 
     def get_rate(self, instrument_id: int) -> Dict[str, Any]:
-        return self._get_rate(instrument_id)
+        return read_rate_with_retries(lambda: self._get_rate(instrument_id))
 
     def get_quote(self, symbol: str) -> Dict[str, Any]:
         observed_at = datetime.now(timezone.utc).isoformat()
         instrument = None
         try:
-            instrument = self.resolve_instrument(symbol)
-            rate = self.get_rate(instrument['instrument_id'])
+            instrument = self.resolve_instrument(symbol, verify_availability=False)
+            rate = self._reconcile_exchange_flag(instrument, raise_quote_errors=True)
+            if rate is None:
+                rate = self.get_rate(instrument['instrument_id'])
             bid = _coerce_optional_float(rate.get('bid'))
             ask = _coerce_optional_float(rate.get('ask'))
             if bid is None or ask is None or bid <= 0 or ask < bid:
+                validation = assess_rate(rate)
                 return {'available': False, 'executable': False, 'provider': 'eToro',
                         'ticker': symbol, 'fetched_at': observed_at, 'instrument': instrument,
-                        'status': 'invalid_quote', 'reason': 'Broker response has no valid bid/ask prices.'}
+                        'status': validation['code'], 'reason': validation['reason'], 'quote_validation': validation}
             blockers = instrument_blockers(instrument)
-            quote_time = _broker_time(rate.get('timestamp') or rate.get('lastUpdated') or rate.get('fetched_at'))
+            validation = assess_rate(rate)
+            validation['attempts'] = (rate.get('quote_validation') or {}).get('attempts', [])
+            validation['retries_used'] = (rate.get('quote_validation') or {}).get('retries_used', 0)
+            if validation['code'] == 'stale_quote' and validation['retries_used'] == 2:
+                validation['reason'] += ' Still stale after 3 reads (2 retries).'
+            if validation['code'] != 'fresh':
+                blockers.append(validation['reason'])
+            quote_time = _broker_time(rate.get('date') or rate.get('timestamp') or rate.get('lastUpdated') or rate.get('fetched_at'))
+            reconciled = (instrument.get('execution_availability') or {}).get('verified') is True
+            if ('date' in rate and not quote_time) or (reconciled and not quote_time):
+                blockers.append('Broker quote timestamp is missing or invalid.')
+            if reconciled and str(rate.get('quoteType', '')).lower() != 'realtime':
+                blockers.append('Reconciled execution requires a realtime broker quote.')
             if quote_time:
                 age = (datetime.now(timezone.utc)-datetime.fromisoformat(quote_time)).total_seconds()
                 if age < -5 or age > 60:
@@ -249,11 +331,15 @@ class EtoroBrokerAdapter:
                     'fetched_at': observed_at, 'source': 'eToro Public API', 'quote_type': rate.get('quoteType'),
                     'status': 'indicative' if blockers else 'executable', 'reason': '; '.join(blockers),
                     'quote_at': quote_time,
+                    'quote_validation': validation,
                     'instrument': instrument}
         except Exception as error:
             return {'available': False, 'executable': False, 'provider': 'eToro', 'ticker': symbol,
                     'price': None, 'fetched_at': observed_at, 'instrument': instrument,
-                    'status': 'request_failed', 'reason': str(error)}
+                    'status': 'missing_quote' if isinstance(error, MissingQuote) else 'rate_limited' if getattr(error, 'status_code', None) == 429 else 'request_failed', 'reason': str(error),
+                    'quote_validation': {'code': 'missing_quote' if isinstance(error, MissingQuote) else 'rate_limited' if getattr(error, 'status_code', None) == 429 else 'request_failed',
+                        'reason': str(error), 'attempts': getattr(error, 'quote_attempts', []),
+                        'retry_after_seconds': getattr(error, 'retry_after_seconds', None)}}
 
     def _prepare_order(self, order: Dict[str, Any]) -> Dict[str, Any]:
         if not self.settings.etoro_demo_trading:
@@ -268,10 +354,18 @@ class EtoroBrokerAdapter:
         if not math.isfinite(leverage) or leverage <= 0 or not leverage.is_integer():
             raise ValueError("eToro order leverage must be a positive whole number.")
         try:
-            instrument = self._find_instrument(symbol)
+            resolved = self.resolve_instrument(symbol)
+            instrument = resolved['instrument']
         except Exception as error:
             raise BrokerPreflightError("Order not submitted: instrument lookup failed: " + str(error)) from error
-        blockers = instrument_blockers(self._normalize_instrument(symbol, instrument), side)
+        blockers = instrument_blockers(resolved, side)
+        availability = resolved.get('execution_availability') or {}
+        if availability.get('verified'):
+            configs = availability['eligibility'].get('leverageConfigs') or []
+            if not any(str(config.get('direction', '')).upper() == side
+                       and config.get('isPotential') is False
+                       and leverage in config.get('leverageValues', []) for config in configs):
+                blockers.append('Broker account eligibility does not permit this direction and leverage.')
         if blockers:
             raise BrokerPreflightError("Order not submitted: " + "; ".join(blockers))
         instrument_id = _etoro_instrument_id(instrument)

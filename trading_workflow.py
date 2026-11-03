@@ -6,7 +6,72 @@ from price_structure import structure_target
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-VERSION = "news_reaction_v2"
+VERSION = "news_reaction_v4"
+MANAGED_VERSIONS = frozenset({'news_reaction_v2', 'news_reaction_v3', VERSION})
+
+
+def continuation_setup(candidate, side, rules, risk_rules=None):
+    """Two completed closes must hold beyond an observed range boundary."""
+    risk_rules = risk_rules or {}
+    trend = candidate.get('daily_trend_context') or {}
+    reaction = candidate.get('news_reaction') or {}
+    result = {'approved': False, 'framework': 'NEWS_BREAKOUT_CONTINUATION', 'reasons': []}
+    if side not in {'LONG', 'SHORT'} or not rules.get('fresh_boundary_entries_enabled', True):
+        result['reasons'].append('Fresh boundary continuation is disabled or direction is invalid.')
+        return result
+    try:
+        entry = positive(candidate.get('price'), 'Entry')
+        atr = positive(trend.get('atr14'), 'ATR')
+        sign = 1 if side == 'LONG' else -1
+        _, evidence = structure_target(side, entry, entry+sign*3*atr, atr,
+            trend.get('price_structure'), mode='range_boundary',
+            range_months=risk_rules.get('structure_range_months', 1),
+            range_weeks=risk_rules.get('structure_range_weeks', 4))
+        result['boundary_evidence'] = {k:v for k,v in evidence.items() if k not in {'structure','crossed_obstacles'}}
+        if not evidence.get('entry_blocked'):
+            result['reasons'].append('No crossed observed monthly/weekly boundary.')
+            return result
+        zone = evidence['zone']
+        boundary = float(zone['low'] if side == 'LONG' else zone['high'])
+        buffer = .1*atr
+        if not reaction.get('available') or int(reaction.get('bars', 0)) < 2:
+            result['reasons'].append('Breakout requires two completed post-event bars.')
+        else:
+            last, previous = positive(reaction['last'], 'Last close'), positive(reaction['previous'], 'Previous close')
+            if min(sign*(last-boundary), sign*(previous-boundary), sign*(entry-boundary)) <= buffer or sign*(last-previous) <= 0:
+                result['reasons'].append('Breakout has not held beyond the boundary with directional follow-through.')
+        if float(candidate.get('confidence') or 0) < float(rules.get('conditional_mean_reversion_min_confidence', .7)):
+            result['reasons'].append('Breakout confidence is below the setup minimum.')
+        result.update(boundary=boundary, buffer=buffer, side=side)
+        result['approved'] = not result['reasons']
+    except (KeyError, ValueError, TypeError, OverflowError):
+        result['reasons'].append('Breakout inputs are missing or invalid.')
+    return result
+
+
+def select_entry_side(candidate, rules, risk_rules=None):
+    """One direction selector for research, strategy and submission rechecks."""
+    signal = candidate.get('signal')
+    side = 'LONG' if signal == 'bullish' else 'SHORT' if signal == 'bearish' else 'HOLD'
+    if side == 'HOLD':
+        return side
+    trend = str((candidate.get('daily_trend_context') or {}).get('trend_state') or 'unknown').lower()
+    quote = candidate.get('market_quote') or {}
+    directional = {**candidate, 'price': quote.get('ask' if side == 'LONG' else 'bid') or candidate.get('price')}
+    if side != 'HOLD' and continuation_setup(directional, side, rules, risk_rules).get('approved'):
+        return side
+    if (candidate.get('ai_analysis') or {}).get('reaction_assessment') == 'temporary':
+        mixed_allowed = trend == 'mixed' and rules.get('allow_mixed_trend_reversals', True)
+        if signal == 'bearish' and (trend == 'bullish' or mixed_allowed):
+            return 'LONG'
+        if signal == 'bullish' and (trend == 'bearish' or mixed_allowed):
+            return 'SHORT'
+        opposite = 'LONG' if signal == 'bearish' else 'SHORT'
+        opposite_candidate = {**candidate, 'price': quote.get('ask' if opposite == 'LONG' else 'bid') or candidate.get('price')}
+        if (trend in {'bullish', 'bearish'} and float(candidate.get('confidence') or 0) >= float(rules.get('countertrend_long_min_confidence' if opposite == 'LONG' else 'countertrend_short_min_confidence', .85))
+                and mean_reversion_setup(opposite_candidate, opposite, rules).get('approved')):
+            return opposite
+    return side
 
 
 def positive(value: Any, name: str) -> float:
@@ -29,6 +94,8 @@ def reaction_from_bars(bars, event_at: str, now: datetime | None = None) -> dict
         index = index.tz_localize("UTC")
     frame.index = index
     frame = frame.loc[index + pd.Timedelta(minutes=5) <= pd.Timestamp(now)].sort_index()
+    if frame.empty or (pd.Timestamp(now)-frame.index[-1]-pd.Timedelta(minutes=5)).total_seconds() > 900:
+        return {'available': False, 'reason': 'Completed post-news bars are unavailable or stale (over 15 minutes).'}
     before = frame.loc[frame.index + pd.Timedelta(minutes=5) <= event]
     after = frame.loc[frame.index >= event]
     if before.empty or len(after) < 2:
@@ -101,17 +168,38 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
             positive(risk_rules[key], key)
     sign = 1 if side == "LONG" else -1
     setup = setup or {}
-    stop = float(setup["stop"]) if setup.get("approved") else entry - sign * atr * positive(risk_rules.get("stop_atr_multiple", 2), "Stop ATR")
+    reversion = bool(setup.get('approved') and setup.get('framework', 'CONDITIONAL_MEAN_REVERSION') == 'CONDITIONAL_MEAN_REVERSION')
+    breakout = bool(setup.get('approved') and setup.get('framework') == 'NEWS_BREAKOUT_CONTINUATION')
+    stop = float(setup["stop"]) if reversion else entry - sign * atr * positive(risk_rules.get("stop_atr_multiple", 2), "Stop ATR")
     distance = sign * (entry - stop)
     positive(stop, "Stop price")
     positive(distance, "Stop distance")
-    target = float(setup["target"]) if setup.get("approved") else entry + sign * distance * positive(risk_rules.get("target_reward_risk", 1.5), "Target R")
-    if not setup.get("approved"):
+    target = float(setup["target"]) if reversion else entry + sign * distance * positive(risk_rules.get("target_reward_risk", 1.5), "Target R")
+    if not reversion:
         # Independent ceiling, preserving the existing 2 ATR stop / 1.5R default.
         target = entry + sign*min(abs(target-entry), atr*positive(risk_rules.get('max_target_atr_multiple', 3.0), 'Max target ATR'))
+    baseline = target
     target, target_evidence = structure_target(side, entry, target, atr, structure,
-        mode='nearest' if setup.get('approved') else risk_rules.get('structure_target_mode','range_boundary'),
+        mode='nearest' if reversion else risk_rules.get('structure_target_mode','range_boundary'),
         range_months=risk_rules.get('structure_range_months',1), range_weeks=risk_rules.get('structure_range_weeks',4))
+    target_evidence['structure_state'] = ('unavailable' if not structure or not structure.get('available')
+        else 'boundary_crossed' if target_evidence.get('entry_blocked') else
+        'opposing_boundary' if target_evidence.get('zone') else 'no_opposing_boundary')
+    if target_evidence.get('entry_blocked') and breakout:
+        boundary = float((target_evidence.get('zone') or {}).get('low' if side == 'LONG' else 'high', float('nan')))
+        if setup.get('side') == side and math.isfinite(boundary) and abs(boundary-float(setup['boundary'])) < .000001 and sign*(entry-boundary) > .1*atr:
+            target, ahead = structure_target(side, entry, baseline, atr, structure, mode='nearest')
+            target_evidence.update(entry_blocked=False, breakout_confirmed=True, selected_target=target,
+                adjusted=target!=baseline, breakout_setup=setup, opposing_boundary=ahead.get('zone'),
+                breakout_assumption='Two completed closes held beyond the observed boundary with directional follow-through.')
+            target_evidence.pop('entry_block_reason', None)
+    if sign*(target-entry) <= 0:
+        target_evidence.update(entry_blocked=True, entry_block_reason=target_evidence.get('entry_block_reason') or
+            'Opposing structure leaves no valid target beyond entry.', rejected_target=target)
+        target = baseline
+        target_evidence['selected_target'] = target
+    if setup and not setup.get('approved') and setup.get('framework') == 'CONDITIONAL_MEAN_REVERSION':
+        target_evidence.update(entry_blocked=True, entry_block_reason='Measured temporary-reaction reversal is not confirmed.')
     positive(target, "Target price")
     reward = sign * (target - entry)
     gross = 0.0
@@ -144,7 +232,7 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
     units = math.floor(max(0, min(limits.values())) * 1_000_000) / 1_000_000
     spread = max(0, float(execution_rules.get("observed_spread", 0)))
     configured_bps = max(0, float(risk_rules.get("estimated_roundtrip_cost_bps", 10)))
-    holding_hours = float(risk_rules.get("mean_reversion_max_hold_hours" if setup.get("approved") else "news_max_hold_hours", 24 if setup.get("approved") else 48))
+    holding_hours = float(risk_rules.get("mean_reversion_max_hold_hours" if reversion else "news_max_hold_hours", 24 if reversion else 48))
     annual = max(0, float(risk_rules.get("estimated_financing_annual_pct", 8))) / 100
     cost_per_unit = spread + entry * (configured_bps/10000 + annual*holding_hours/(365*24))
     # Reserve estimated costs inside both spending and available-cash ceilings.
@@ -170,12 +258,15 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
     net_reward = reward - cost_per_unit
     minimum_rr = float(risk_rules.get("minimum_reward_risk", 0))
     economic_failures = []
+    if target_evidence.get('entry_blocked'):
+        economic_failures.append('no_valid_structure_target')
     if net_reward <= 0:
         economic_failures.append("non_positive_net_reward")
     if net_reward / distance < minimum_rr:
         economic_failures.append("below_minimum_reward_risk")
     if economic_failures:
         reason = (
+            target_evidence['entry_block_reason'] if target_evidence.get('entry_blocked') else
             f"Target does not cover estimated costs: gross reward ${reward:.4f}/unit, costs ${cost_per_unit:.4f}/unit."
             if net_reward <= 0 else
             f"Target is profitable (${units*net_reward:.2f} estimated net), but net reward/risk {net_reward/distance:.3f} is below the {minimum_rr:.3f} minimum."
@@ -197,7 +288,7 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
     }
     protection = {
         "target_selection": target_evidence,
-        "framework": "CONDITIONAL_MEAN_REVERSION" if setup.get("approved") else "DIRECTIONAL_NEWS",
+        "framework": "CONDITIONAL_MEAN_REVERSION" if reversion else "NEWS_BREAKOUT_CONTINUATION" if breakout else "DIRECTIONAL_NEWS",
         "atr14": atr,
         "entry_price": entry,
         "stop_loss_price": stop,
@@ -212,7 +303,7 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
             target_evidence.get("formula", "Baseline target capped before daily/weekly/monthly support/resistance; stop preserved.")
             if target_evidence["adjusted"] else
             "Mean-reversion stop and anchor target derived from the measured news reaction."
-            if setup.get("approved") else
+            if reversion else
             "Stop = entry ± configured ATR multiple; take profit = entry ∓/± stop distance × target reward/risk."
         ),
     }

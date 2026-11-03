@@ -35,6 +35,12 @@ Directional entries use a stop 2×ATR14 from entry and a target 1.5 times that s
 - Bullish daily trend + temporary bearish news: LONG after a measured dip and recovery.
 - Bearish daily trend + temporary bullish news: SHORT after a measured burst and reversal.
 
+The approved 30 October `news_reaction_v3` update also permits these measured
+reversals in a mixed daily trend at half risk, controlled by
+`strategist.allow_mixed_trend_reversals` (enabled). An established opposing trend
+still requires its configured higher countertrend confidence. Direction selection
+is shared by initial analysis, Strategist and final order review.
+
 The reference is the completed five-minute close immediately before the news timestamp. At least two completed post-news bars are required. The excursion from that anchor must exceed 1.25×ATR14 by default; recovery from the extreme must reach 0.2×ATR14, and the latest completed close must turn in the intended direction. Research confidence must reach 70%. The target is the pre-news anchor; the stop is 0.25×ATR14 beyond the reaction extreme. The actual entry must retain a favorable stop/target and pass the normal cost/reward and risk gates. Failed conditions reject this setup. This replaces the earlier SMA-distance-only interpretation; old decisions retain their stored evidence.
 
 Notes carry `STRATEGY: CONDITIONAL_MEAN_REVERSION; ENTRY_ZONE: ... to ...; SOURCE_ATR: ...` for downstream agents. All thresholds are agent settings.
@@ -276,3 +282,153 @@ broker opening costs. A payoff below 1R is permitted. Stops, targets, monthly
 breakout blocks, sizing, exposure, broker eligibility and other gates are retained.
 Reward/risk is still recorded as evidence; positive payoff is not a probability
 or profitability guarantee. Existing position protection is unchanged.
+
+## eToro search exchange flag reconciliation — 30 October 2026
+
+The search endpoint's `isExchangeOpen` remains recorded exactly as returned.
+For demo entries only, an otherwise active, currently tradable supported
+instrument with a false search flag can now be verified independently: a
+mapped `exchange_calendars` regular session (including holidays, early closes
+and lunch breaks), matching demo-account eligibility with `allowOpenPosition=true`,
+and valid realtime bid/ask carrying a broker timestamp no older than 60 seconds
+and no more than five seconds in the future. All three checks are required.
+Unknown calendars, unavailable/ambiguous eligibility, inactive/delisted assets,
+stale/undated/delayed quotes and direction restrictions retain execution blocks.
+Order preflight repeats the checks and requires a non-potential direction/leverage
+configuration. No old candidate is replayed automatically.
+
+`execution_availability` records the calendar, eligibility, quote and conflict
+reason separately from the raw search flag. This is a conservative Finbot
+execution policy, not a claim that eToro supplies a real-time market-open flag
+through eligibility. Exceptional unscheduled halts are not established by the
+calendar; broker order acceptance remains authoritative. Failed submissions
+retain the existing rejection/uncertain-outcome recovery handling.
+
+The broker's v2 quote `date` is now normalized and checked; previously freshness
+looked only for timestamp aliases and could overlook an old v2 quote.
+Position ownership, research/strategy/risk rules and trailing configuration are
+unchanged. Reference: [eToro demo eligibility](https://api-portal.etoro.com/api-reference/trading--demo/check-instrument-trading-eligibility),
+[v2 rates](https://api-portal.etoro.com/api-reference/market-data/retrieve-bidask-rates-for-one-or-more-instruments).
+
+### Automatic exchange discovery
+
+An unfamiliar exchange now triggers discovery during instrument resolution,
+even when the instrument is inactive or the session is closed. Finbot verifies
+the exchange name and, when present, exchange ID against eToro's official
+`GET /api/v1/market-data/exchanges` directory. Without an instrument exchange ID,
+the directory must contain exactly one matching name. Exact installed calendar
+names/MICs/aliases and explicit venue-name synonyms can register a calendar;
+substring/fuzzy matches, generic 24/7 schedules and product-dependent calendars
+cannot. Valid exchanges whose schedules are unsupported remain unresolved;
+Finbot records why and retries rather than inventing trading hours.
+
+Discovered mappings and unresolved attempts are stored in
+`exchange_calendar_registry.json` beside `FINBOT_DB_PATH` in the existing volume.
+Records include broker identity, calendar and library version, timezone, source,
+verification time and next retry. Verified mappings refresh after 24 hours,
+unresolved attempts after one hour, and library-version changes force
+reverification. The process shares directory reads for 15 minutes (five minutes
+on directory failure). Atomic writes and file locking preserve records across
+worker/web processes and container replacement. This is derived data: it can be
+rebuilt if a SQLite-only backup is restored. Without a configured database path,
+discovery uses memory only and creates no host database or registry file.
+
+Registration expands calendar coverage; it does not enable an inactive asset,
+change symbol ownership, bypass USD/strategy/risk gates or submit an order.
+Lifecycle instrument/session evidence includes the discovery result. See
+[eToro exchanges](https://api-portal.etoro.com/api-reference/market-data/list-supported-exchanges)
+and the [calendar catalog](https://github.com/gerrymanoim/exchange_calendars).
+
+## Fresh dips, rallies and quote retries — 30 October 2026
+
+Workflow `news_reaction_v3` uses one shared direction selector for proposals and
+fresh submission. Temporary negative reactions can qualify LONG after measured
+recovery; temporary positive reactions can qualify SHORT after measured reversal.
+Mixed daily trends are allowed with half risk (`allow_mixed_trend_reversals=true`).
+Existing 70% confidence, >1.25 ATR excursion, >=0.2 ATR recovery/turning close and
+0.25 ATR stop cushion remain. Established opposing trends retain their higher
+countertrend confidence. Missing reversal evidence does not authorize an entry.
+
+`fresh_boundary_entries_enabled=true` allows directional continuation beyond a
+recorded monthly/weekly boundary only when at least two completed post-event
+closes and the executable entry hold beyond the boundary plus 0.1 ATR, with the
+latest close progressing in the trade direction. Direction-aligned confidence
+and existing portfolio checks still apply. These entries retain ATR stops and
+the <=3 ATR baseline target, capped by an actual opposing level ahead when one
+exists. Missing structure is distinct from an observed crossed boundary and
+cannot establish breakout confirmation. Rejected target calculations never
+present a take-profit on the losing side of entry; their rejection evidence
+retains the unusable level. Mean reversion retains its anchor/nearest-level cap.
+
+Reaction anchors persist by symbol and identified catalyst topic in SQLite
+`reaction_anchors`, using the first recorded dated report within 24 hours rather
+than the newest commentary. Later commentary cannot reset an active anchor.
+After expiry, a distinct explicit event-report headline is required to replace
+it. First-report time is labeled as such; actual release timing is unverified.
+Measured reactions require two completed post-event 5-minute bars and the last
+completed bar must be no more than 15 minutes old.
+
+eToro quote acquisition uses the broker's timestamp and realtime type. A stale
+quote (>60s) gets two further data reads, after 2s and 5s; each acquisition has
+one shared budget across quote and exchange-availability checks. Missing quote,
+invalid prices, missing timestamp, future timestamp, delayed/unknown type,
+request failure and rate-limit failure have separate codes; none trigger stale
+retries. Rate limits are surfaced for deferral without immediate extra polling.
+Attempt times, ages and outcomes are retained in `quote_validation`. No broker
+order is retried by this mechanism. The held-position quote path also respects
+the recorded freshness result; installed broker protection remains active.
+
+Final execution checks both retrieval age and broker quote age. If the quote
+expires during cost review, one bounded fresh account/strategy/risk/cost
+calculation runs under the same account lease before SUBMITTING; changed prices
+therefore recalculate units, stops and targets. Another expiry blocks submission.
+Ambiguous broker order results retain existing recovery and no-blind-retry rules.
+Existing positions retain saved entry policies and current profit-tracker
+settings; no historical rejected candidate is automatically replayed.
+
+## Volume-supported directional qualification — 3 November 2026
+
+New decisions use `news_reaction_v4`; v2/v3 positions retain their saved policies.
+RVOL and session VWAP are deterministic optional evidence for both LONG and SHORT.
+OBV remains deferred. Yahoo underlying five-minute OHLCV is kept separate from
+broker execution prices. Explicit Yahoo-exchange/calendar mappings provide regular
+sessions, holidays, early closes and breaks; unsupported exchanges remain unavailable.
+
+RVOL compares cumulative completed regular-session slots with the same elapsed
+slots in the last 20 usable sessions (minimum 10). Incomplete comparison sessions
+are excluded; incomplete current coverage withholds evidence. VWAP is a labelled
+bar approximation using typical price times volume. The current unfinished bar is
+excluded. Evidence must be within its session and no more than 15 minutes old.
+
+Research examines volume for at most 40 recent news candidates with at most four
+concurrent data reads. Held-company refresh priority stays intact. Half the remaining
+analysis slots (rounded up) retain news-recency priority; RVOL ranks the rest.
+Unavailable volume preserves recency ordering. This adds Yahoo reads, not model
+analyses or additional trading workers. Data latency and provider availability can
+limit coverage. Volume observations accompany research and candidate lifecycle data.
+
+Strategist controls:
+
+- `volume_confirmation_enabled=true` enables conditional confidence relaxation.
+- `volume_min_rvol=1.5` requires above-normal participation.
+- `volume_max_vwap_distance_atr=0.75` bounds entry stretch on the proposed side.
+- `volume_confidence_relaxation=0.05` allows at most five percentage points off
+  ordinary directional thresholds; countertrend reductions are capped at 0.025.
+  An effective threshold never drops below 0.60, and a baseline already below
+  that floor is never raised.
+
+LONG requires current entry and latest completed close at/above VWAP and an
+upward last-close change; SHORT mirrors these requirements below VWAP and downward.
+High RVOL alone never qualifies. Conditional mean-reversion confidence, excursion,
+recovery and stop rules remain unchanged, as does reversal direction selection.
+The evidence can support a measured reversal but never substitutes for its setup.
+
+Strategy and Risk Manager use the same directional threshold helper. Risk Manager
+retains half allocation for mixed/opposing/unavailable trends and all original
+portfolio, cost, protection, broker and execution gates. No extra leverage or
+position size is authorized. Missing/invalid/stale volume restores baseline rules.
+Final submission reloads volume and recomputes qualification; saved approval cannot
+bypass a missing fresh confirmation. Gate evidence includes baseline/effective
+thresholds, baseline acceptance and whether relaxation actually admitted the candidate;
+Risk Manager records confirmation and its unchanged budget multiplier. These are
+experimental qualification rules, not calibrated confidence or proven profitability.

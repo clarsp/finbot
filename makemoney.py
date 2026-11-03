@@ -1,3 +1,4 @@
+from volume_context import load_volume_context, adjusted_rules, decision_note
 from brokers.factory import demo_execution_enabled, account_lease_name
 from brokers.contracts import instrument_blockers, validate_runtime_binding
 import asyncio
@@ -17,7 +18,7 @@ from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from trading_workflow import VERSION as WORKFLOW_VERSION, size_order, mean_reversion_setup, reaction_from_bars, exit_reason
+from trading_workflow import VERSION as WORKFLOW_VERSION, MANAGED_VERSIONS, size_order, mean_reversion_setup, reaction_from_bars, exit_reason, select_entry_side, continuation_setup
 import workflow_store
 import broker_recovery
 import performance_analysis
@@ -83,6 +84,10 @@ DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
         "enabled": True,
         "status": "idle",
         "min_confidence": 0.7,
+        "volume_confirmation_enabled": True,
+        "volume_min_rvol": 1.5,
+        "volume_max_vwap_distance_atr": 0.75,
+        "volume_confidence_relaxation": 0.05,
         "fundamental_confirmation_min_confidence": 0.6,
         "countertrend_short_min_confidence": 0.85,
         "countertrend_long_min_confidence": 0.85,
@@ -90,6 +95,8 @@ DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
         "conditional_mean_reversion_min_confidence": 0.7,
         "conditional_mean_reversion_confirmation_atr": 0.2,
         "conditional_mean_reversion_stop_cushion_atr": 0.25,
+        "allow_mixed_trend_reversals": True,
+        "fresh_boundary_entries_enabled": True,
         "strong_fundamentals_min_revenue_growth_pct": 15.0,
         "strong_fundamentals_min_net_profit_margin_pct": 20.0,
         "strong_fundamentals_max_debt_to_equity": 1.0,
@@ -211,13 +218,53 @@ def serialized_account(function):
 
 
 def load_news_reaction(symbol: str, headlines: list) -> dict:
-    timestamp = newest_known_article_time(headlines)
-    if not timestamp:
-        return {"available": False, "reason": "A news timestamp is needed to measure its market reaction."}
+    # Anchor a directly supplied catalyst, not the newest commentary headline.
+    now = datetime.now(timezone.utc)
+    topic = None
+    reports = []
+    for category, pattern in [('earnings', r'\b(earnings|results)\b'), ('guidance', r'\b(guidance|forecast|spending)\b'),
+            ('regulatory', r'\b(approval|recall|regulator)\b'), ('legal', r'\b(lawsuit|court|settlement)\b'),
+            ('transaction', r'\b(merger|acquisition|takeover)\b')]:
+        for article in headlines:
+            if re.search(pattern, str(article.get('title') or ''), re.IGNORECASE):
+                timestamp = newest_known_article_time([article])
+                if 0 <= now.timestamp()-timestamp <= 86400:
+                    reports.append((timestamp, article))
+        if reports:
+            topic = category
+            break
+    if not reports:
+        return {'available': False, 'reason': 'A dated identifiable catalyst within 24 hours is required to anchor the reaction.'}
+    timestamp, article = min(reports, key=lambda item: item[0])
+    conn = get_connection()
+    try:
+        conn.execute('''CREATE TABLE IF NOT EXISTS reaction_anchors (
+            symbol TEXT NOT NULL, topic TEXT NOT NULL, event_at REAL NOT NULL,
+            article_key TEXT NOT NULL, title TEXT NOT NULL, first_seen_at REAL NOT NULL,
+            PRIMARY KEY(symbol,topic))''')
+        conn.execute('''INSERT INTO reaction_anchors VALUES (?,?,?,?,?,?)
+            ON CONFLICT(symbol,topic) DO UPDATE SET event_at=excluded.event_at,
+            article_key=excluded.article_key,title=excluded.title,first_seen_at=excluded.first_seen_at
+            WHERE reaction_anchors.event_at<? AND ?=1 AND reaction_anchors.article_key<>excluded.article_key''',
+            (symbol.upper(), topic, timestamp, article.get('article_key') or article.get('url') or '',
+             str(article.get('title') or ''), now.timestamp(), now.timestamp()-86400,
+             int(bool(re.search(r'\b(reports?|posts?|announces?|releases?|raises|cuts)\b', str(article.get('title') or ''), re.IGNORECASE))
+                 and not bool(re.search(r'\b(preview|ahead|could|update)\b', str(article.get('title') or ''), re.IGNORECASE)))))
+        row = conn.execute('SELECT event_at,article_key,title FROM reaction_anchors WHERE symbol=? AND topic=?', (symbol.upper(),topic)).fetchone()
+        conn.commit()
+        timestamp = float(row[0])
+        anchor_evidence = {'topic': topic, 'event_at': datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+            'article_key': row[1], 'title': row[2], 'source': 'first_recorded_catalyst_report',
+            'timing_warning': 'First recorded report time; actual event release time is unverified.'}
+    finally:
+        conn.close()
+    if now.timestamp()-timestamp > 86400:
+        return {'available': False, 'reason': 'Recorded catalyst has expired; a distinct new event report is required, not later commentary.',
+                'catalyst_anchor': anchor_evidence}
     try:
         import yfinance as yf
         bars = yf.Ticker(symbol).history(period="5d", interval="5m", auto_adjust=True, actions=False)
-        return reaction_from_bars(bars, datetime.fromtimestamp(timestamp, timezone.utc).isoformat())
+        return {**reaction_from_bars(bars, anchor_evidence['event_at']), 'catalyst_anchor': anchor_evidence}
     except Exception as error:
         return {"available": False, "reason": f"Post-news price history unavailable ({type(error).__name__})."}
 
@@ -344,7 +391,7 @@ async def _manage_etoro_demo_positions(settings=None) -> dict:
         # Existing historical positions keep their original levels. New orders
         # carry a versioned policy whose directional ATR levels follow the fill.
         stop, target = trade.get("stop_loss_price"), trade.get("take_profit_price")
-        if trade.get("strategy_version") == WORKFLOW_VERSION and not policy.get("fill_adjusted") and position.get("open_rate"):
+        if trade.get("strategy_version") in MANAGED_VERSIONS and not policy.get("fill_adjusted") and position.get("open_rate"):
             if policy.get("framework") != "CONDITIONAL_MEAN_REVERSION":
                 stop = float(position["open_rate"]) + float(policy["stop_offset"])
                 if not policy.get("target_selection", {}).get("adjusted"):
@@ -408,7 +455,7 @@ async def _manage_etoro_demo_positions(settings=None) -> dict:
                     except Exception as error:
                         logger.warning('Tracked profit-trailing close awaits recovery for %s: %s', trade['id'], type(error).__name__)
                     continue
-        if trade.get("strategy_version") != WORKFLOW_VERSION:
+        if trade.get("strategy_version") not in MANAGED_VERSIONS:
             continue
         captured = json.loads(trade.get("config_json") or "{}")
         caps = captured.get("execution", DEFAULT_AGENT_RULES["execution"])
@@ -1454,6 +1501,8 @@ def update_agent_rules(agent_name: str, new_rules: Dict[str, Any]) -> Dict[str, 
     merged = dict(current.get(agent_name, DEFAULT_AGENT_RULES.get(agent_name, {})))
     merged.update(new_rules)
     for key, value in new_rules.items():
+        if key in {'volume_confirmation_enabled', 'allow_mixed_trend_reversals', 'fresh_boundary_entries_enabled'} and not isinstance(value, bool):
+            raise ValueError(f'{key} must be true or false.')
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             if not math.isfinite(float(value)):
                 raise ValueError(f"{key} must be finite.")
@@ -1468,6 +1517,11 @@ def update_agent_rules(agent_name: str, new_rules: Dict[str, Any]) -> Dict[str, 
             raise ValueError(f"{key} must be a positive integer.")
     if int(merged.get("analysis_retention_days", 3)) > 365:
         raise ValueError("Analysis retention cannot exceed 365 days.")
+    if agent_name == 'strategist':
+        for key, low, high in [('volume_min_rvol', 1, 10), ('volume_max_vwap_distance_atr', .05, 2), ('volume_confidence_relaxation', 0, .05)]:
+            value = merged.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
+                raise ValueError(f'{key} must be numeric between {low} and {high}.')
     if agent_name == "risk_manager":
         value = merged.get('max_target_atr_multiple')
         if isinstance(value, bool) or not isinstance(value, (int,float)) or not math.isfinite(value) or value <= 0:
@@ -3002,10 +3056,9 @@ class StrategistAgent:
             news_sentiments = {sentiment_value.lower()}
         else:
             news_sentiments = {str(value).lower() for value in (sentiment_value or [])}
-        if (tech_data.get("ai_analysis") or {}).get("reaction_assessment") == "temporary" and trend_state == "bullish" and "bearish" in news_sentiments:
-            position = "LONG"
-        elif (tech_data.get("ai_analysis") or {}).get("reaction_assessment") == "temporary" and trend_state == "bearish" and "bullish" in news_sentiments:
-            position = "SHORT"
+        position = select_entry_side(tech_data, rules, get_agent_rules().get('risk_manager'))
+        quote = tech_data.get('market_quote') or {}
+        tech_data = {**tech_data, 'price': quote.get('ask' if position == 'LONG' else 'bid') or tech_data.get('price')}
         default_leverage_value = float(rules.get("default_leverage", 2))
         max_leverage_value = float(rules.get("max_leverage", 3))
         if (
@@ -3026,7 +3079,7 @@ class StrategistAgent:
             else 1.0
         )
         recent_news = market_data.get("recent_news", [])
-        decision_gate = evaluate_strategist_gate(tech_data, position, recent_news, rules)
+        decision_gate = evaluate_strategist_gate(tech_data, position, recent_news, rules, risk_rules=get_agent_rules().get('risk_manager'))
         decision = "accepted" if decision_gate["accepted"] and leverage > 0 else "rejected"
         if leverage <= 0:
             decision_gate["rejection_reasons"].append("Proposed leverage is not positive.")
@@ -3062,7 +3115,7 @@ class StrategistAgent:
                 f"Strategist approved {position} at {float(tech_data.get('confidence', 0.0)):.0%} confidence."
                 if decision == "accepted"
                 else f"Strategist rejected {position}: {' '.join(decision_gate['rejection_reasons'])}"
-            ),
+            ) + decision_note(decision_gate.get("volume_confirmation")),
             decision,
             payload,
         )
@@ -3137,6 +3190,7 @@ class RiskManagerAgent:
         all_rules = get_agent_rules()
         rules = all_rules.get("risk_manager", DEFAULT_AGENT_RULES["risk_manager"])
         execution_rules = all_rules.get("execution", DEFAULT_AGENT_RULES["execution"])
+        strategy_rules, volume_confirmation = adjusted_rules(candidate, strategy.get("position"), all_rules.get("strategist", DEFAULT_AGENT_RULES["strategist"]))
         positions = broker_snapshot.get("positions") or []
         equity = account.get("equity")
         reasons: List[str] = []
@@ -3165,13 +3219,13 @@ class RiskManagerAgent:
             risk_budget_multiplier = 0.5
         elif strategy.get("position") == "LONG" and trend_state == "bearish":
             trend_alignment = "opposes_news_direction"
-            required_confidence = float(get_agent_rules().get("strategist", DEFAULT_AGENT_RULES["strategist"]).get("countertrend_long_min_confidence", 0.85))
+            required_confidence = float(strategy_rules.get("countertrend_long_min_confidence", 0.85))
             risk_budget_multiplier = 0.5
             if float(candidate.get("confidence") or 0.0) < required_confidence:
                 reasons.append(f"Risk Manager rejects the bullish countertrend setup below {required_confidence:.0%} research confidence.")
         elif strategy.get("position") == "SHORT" and trend_state == "bullish":
             trend_alignment = "opposes_news_direction"
-            required_confidence = float(get_agent_rules().get("strategist", DEFAULT_AGENT_RULES["strategist"]).get("countertrend_short_min_confidence", 0.85))
+            required_confidence = float(strategy_rules.get("countertrend_short_min_confidence", 0.85))
             risk_budget_multiplier = 0.5
             if float(candidate.get("confidence") or 0.0) < required_confidence:
                 reasons.append(f"Risk Manager rejects the bearish countertrend setup below {required_confidence:.0%} research confidence.")
@@ -3227,7 +3281,7 @@ class RiskManagerAgent:
                     positions=positions, risk_rules=rules, sector=(candidate.get("fundamentals") or {}).get("sector"),
                     execution_rules={**execution_rules, "observed_spread": max(0, float(quote.get("ask") or 0)-float(quote.get("bid") or 0))},
                     multiplier=risk_budget_multiplier,
-                    setup=strategy.get("decision_gate", {}).get("conditional_mean_reversion"),
+                    setup=strategy.get("decision_gate", {}).get("entry_setup") or strategy.get("decision_gate", {}).get("conditional_mean_reversion"),
                     structure=daily_trend.get("price_structure") if rules.get("structure_targets_enabled", True) else None,
                 )
                 reasons.extend(sized.pop("rejection_reasons", []))
@@ -3244,14 +3298,17 @@ class RiskManagerAgent:
             "atr14": atr14, "daily_trend_context": daily_trend, "daily_trend_alignment": trend_alignment,
             "market_session_context": market_session,
             "strategy_notes": strategy.get("notes"), "strategy_framework": strategy.get("decision_gate", {}).get("strategy_framework"),
-            "risk_budget_multiplier": risk_budget_multiplier, "leverage": int(approved_leverage) if str(approved_leverage).replace(".", "", 1).isdigit() else None,
+            "volume_confirmation": volume_confirmation, "risk_budget_multiplier": risk_budget_multiplier, "leverage": int(approved_leverage) if str(approved_leverage).replace(".", "", 1).isdigit() else None,
             "broker_order_submitted": False,
             "broker_instrument": instrument,
             "broker_quote": quote,
         }
+        volume_confirmation.update({key: strategy.get('decision_gate', {}).get('volume_confirmation', {}).get(key)
+                                    for key in ('baseline_accepted', 'relaxation_used')})
+        result['decision_message'] = ("; ".join(reasons) if reasons else "Portfolio, position, quote, and ATR risk checks passed; no order was submitted.") + decision_note(volume_confirmation)
         record_agent_event(
             "risk_manager", "completed", "news_candidate_portfolio_risk",
-            "; ".join(reasons) if reasons else "Portfolio, position, quote, and ATR risk checks passed; no order was submitted.",
+            result['decision_message'],
             result["decision"], result,
         )
         return result
@@ -3426,6 +3483,10 @@ class PositionManagerAgent:
                 raise ValueError('Invalid executable bid/ask')
             return {'available':True,'provider':'eToro','instrument_id':str(instrument_id),
                 'bid':bid,'ask':ask,'price':(bid+ask)/2,
+                'executable':not rate.get('quote_validation') or rate['quote_validation'].get('code') == 'fresh',
+                'quote_at':(rate.get('quote_validation') or {}).get('quote_at'),
+                'quote_validation':rate.get('quote_validation'),
+                'reason':(rate.get('quote_validation') or {}).get('reason'),
                 'fetched_at':datetime.now(timezone.utc).isoformat(),
                 'source':'eToro verified held instrument ID'}
         except Exception as error:
@@ -3576,10 +3637,13 @@ def evaluate_strategist_gate(
     proposed_position: str,
     related_news: List[Dict[str, Any]],
     rules: Dict[str, Any],
+    risk_rules: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    baseline_rules = rules
+    rules, volume_confirmation = adjusted_rules(candidate, proposed_position, rules)
     rejection_reasons = []
     confidence = float(candidate.get("confidence", 0.0))
-    base_threshold = float(rules.get("min_confidence", 0.7))
+    base_threshold = float(baseline_rules.get("min_confidence", 0.7))
     price = candidate.get("price")
     quote = candidate.get("market_quote") or {}
     quote_available = bool(quote.get("available"))
@@ -3702,12 +3766,15 @@ def evaluate_strategist_gate(
     current_price = candidate.get("price")
     sma50 = daily_trend.get("sma50")
     atr14 = daily_trend.get("atr14")
+    mixed_allowed = trend_state == 'mixed' and rules.get('allow_mixed_trend_reversals', True)
+    opposed_reversal = confidence >= float(baseline_rules.get('countertrend_long_min_confidence' if proposed_position == 'LONG' else 'countertrend_short_min_confidence', .85))
     conditional_setup = (
-        (proposed_position == "LONG" and trend_state == "bullish" and "bearish" in company_news_sentiments)
-        or (proposed_position == "SHORT" and trend_state == "bearish" and "bullish" in company_news_sentiments)
+        (proposed_position == "LONG" and (trend_state == 'bullish' or mixed_allowed or (trend_state == 'bearish' and opposed_reversal)) and "bearish" in company_news_sentiments)
+        or (proposed_position == "SHORT" and (trend_state == 'bearish' or mixed_allowed or (trend_state == 'bullish' and opposed_reversal)) and "bullish" in company_news_sentiments)
     )
     setup_info = mean_reversion_setup(candidate, proposed_position, rules) if conditional_setup else {}
     conditional_approved = bool(conditional_setup and setup_info.get("approved"))
+    breakout_info = continuation_setup(candidate, proposed_position, rules, risk_rules) if not conditional_setup else {}
     conditional_failed_variance = bool(conditional_setup and not conditional_approved)
     variance_available = bool(setup_info.get("atr14"))
     variance_distance = setup_info.get("distance")
@@ -3744,7 +3811,7 @@ def evaluate_strategist_gate(
                 f"but confidence is below the {required_confidence:.0%} confirmation minimum."
             )
     else:
-        required_confidence = base_threshold
+        required_confidence = float(rules.get("min_confidence", .7))
         if confidence < required_confidence:
             rejection_reasons.append(
                 f"Confidence {confidence:.0%} is below the {required_confidence:.0%} minimum."
@@ -3777,8 +3844,8 @@ def evaluate_strategist_gate(
         trend_alignment = "mixed_or_not_directional"
 
     entry_floor = entry_ceiling = None
-    framework = None
-    notes = None
+    framework = 'NEWS_BREAKOUT_CONTINUATION' if breakout_info.get('approved') else None
+    notes = 'STRATEGY: NEWS_BREAKOUT_CONTINUATION; confirmed range breakout with two-bar follow-through.' if framework else None
     if conditional_approved:
         framework = "CONDITIONAL_MEAN_REVERSION"
         entry_floor = setup_info["entry_zone_floor"]
@@ -3789,11 +3856,16 @@ def evaluate_strategist_gate(
             f"SOURCE_ATR: {atr14:g}."
         )
 
+    baseline_accepted = None
+    if volume_confirmation['qualified']:
+        baseline_accepted = evaluate_strategist_gate(candidate, proposed_position, related_news,
+            {**baseline_rules, 'volume_confirmation_enabled': False}, risk_rules)['accepted']
     return {
         "accepted": not rejection_reasons,
         "rejection_reasons": rejection_reasons,
         "confidence": confidence,
         "base_confidence_threshold": base_threshold,
+        "volume_confirmation": {**volume_confirmation, "baseline_accepted": baseline_accepted, "relaxation_used": bool(not rejection_reasons and baseline_accepted is False)},
         "required_confidence": required_confidence,
         "countertrend_short_confidence_threshold": float(
             rules.get("countertrend_short_min_confidence", 0.85)
@@ -3815,6 +3887,7 @@ def evaluate_strategist_gate(
         "daily_trend_state": trend_state,
         "daily_trend_alignment": trend_alignment,
         "strategy_framework": framework,
+        "entry_setup": setup_info if conditional_setup else breakout_info,
         "conditional_mean_reversion": {
             **setup_info,
             "eligible": conditional_setup,
@@ -3939,7 +4012,7 @@ class TradeConfigurationAuditor:
                 "basis": "Side-aware protective/target levels; strategy policy governs ATR distances."}
             if level is not None and not valid:
                 checks["issues"].append(f"{key} is on the wrong side of the entry price.")
-        if trade["strategy_version"] == WORKFLOW_VERSION:
+        if trade["strategy_version"] in MANAGED_VERSIONS:
             execution_rules = snapshot_rules.get("execution", DEFAULT_AGENT_RULES["execution"])
             spent = float(trade["quantity"])*float(entry or 0)/actual_leverage
             size_valid = float(trade["quantity"]) <= float(execution_rules["max_order_units"]) and spent <= float(execution_rules["max_order_spend_usd"])
@@ -4236,8 +4309,15 @@ def is_fresh_broker_quote(
         quote_time = datetime.fromisoformat(str(quote["fetched_at"]).replace("Z", "+00:00"))
         if quote_time.tzinfo is None:
             quote_time = quote_time.replace(tzinfo=timezone.utc)
-        age_seconds = ((checked_at or datetime.now(timezone.utc)) - quote_time.astimezone(timezone.utc)).total_seconds()
-        return 0 <= age_seconds <= max_age_seconds
+        now = checked_at or datetime.now(timezone.utc)
+        age_seconds = (now - quote_time.astimezone(timezone.utc)).total_seconds()
+        if not 0 <= age_seconds <= max_age_seconds:
+            return False
+        if quote.get('quote_at'):
+            broker_time = datetime.fromisoformat(str(quote['quote_at']).replace('Z', '+00:00'))
+            if broker_time.tzinfo is None:broker_time = broker_time.replace(tzinfo=timezone.utc)
+            return -5 <= (now-broker_time).total_seconds() <= max_age_seconds
+        return not quote.get('quote_validation') or quote['quote_validation'].get('code') == 'fresh'
     except (TypeError, ValueError):
         return False
 
@@ -4346,7 +4426,15 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
         refresh_grouped=group_news_candidates(refresh_articles)
         for symbol in refresh_symbols:grouped[symbol]=refresh_grouped.get(symbol,grouped.get(symbol,[]))
     candidates = [(symbol,grouped.get(symbol,[])) for symbol in refresh_symbols]
-    candidates += sorted(((symbol,headlines) for symbol,headlines in grouped.items() if symbol not in refresh_symbols), key=lambda pair:newest_known_article_time(pair[1]), reverse=True)[:max_candidates-len(candidates)]
+    pool = sorted(((symbol, headlines) for symbol, headlines in grouped.items() if symbol not in refresh_symbols),
+                  key=lambda pair: newest_known_article_time(pair[1]), reverse=True)[:40]
+    volume_limit = asyncio.Semaphore(4)
+    async def volume_for(symbol):
+        async with volume_limit:
+            return symbol, await asyncio.to_thread(load_volume_context, symbol)
+    volume_by_symbol = dict(await asyncio.gather(*(volume_for(symbol) for symbol, _ in pool)))
+    from volume_context import prioritize
+    candidates += prioritize(pool, volume_by_symbol, max_candidates - len(candidates))
     signals: Dict[str, Dict[str, Any]] = {}
     research_results: List[Dict[str, Any]] = []
     submitted_this_cycle = 0
@@ -4375,7 +4463,7 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
         instrument: Dict[str, Any] = {}
         instrument_error = None
         try:
-            instrument = await asyncio.to_thread(adapter.resolve_instrument, ticker)
+            instrument = quote.get('instrument') or await asyncio.to_thread(adapter.resolve_instrument, ticker)
             if not instrument.get("supported_asset"):
                 raise ValueError("Broker instrument asset class is unsupported.")
             if str(instrument.get("currency") or "").upper() != "USD":
@@ -4396,7 +4484,10 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
         quote_fresh = is_fresh_broker_quote(quote)
 
         reaction = await asyncio.to_thread(load_news_reaction, ticker, headlines)
-        trends = {**trends, "news_reaction": reaction, "market_session_context": market_session_context}
+        volume_context = volume_by_symbol.get(ticker)
+        if volume_context is None:
+            volume_context = await asyncio.to_thread(load_volume_context, ticker)
+        trends = {**trends, "volume_context": volume_context, "news_reaction": reaction, "market_session_context": market_session_context}
         ai_result = await researcher_agent.analyze_news_candidate(
             ticker=ticker,
             company_name=company_name,
@@ -4449,10 +4540,10 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
         if not daily_trend_context.get("available"):
             daily_trend_context = {**daily_trend_context, "trend_state": "unknown"}
         provisional_side = "LONG" if signal == "bullish" else "SHORT"
-        if ai_result.get("reaction_assessment") == "temporary" and daily_trend_context.get("trend_state") == "bullish" and signal == "bearish":
-            provisional_side = "LONG"
-        elif ai_result.get("reaction_assessment") == "temporary" and daily_trend_context.get("trend_state") == "bearish" and signal == "bullish":
-            provisional_side = "SHORT"
+        provisional_side = select_entry_side({'signal': signal, 'confidence': confidence,
+            'ai_analysis': ai_result, 'daily_trend_context': daily_trend_context,
+            'news_reaction': reaction, 'market_quote': quote, 'price': quote_price},
+            get_agent_rules()['strategist'], get_agent_rules()['risk_manager'])
         quote_price = quote.get("ask" if provisional_side == "LONG" else "bid")
         research_candidate = {
             "ticker": ticker,
@@ -4461,6 +4552,7 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
             "signal": signal,
             "company_news_sentiment": signal,
             "news_reaction": reaction,
+            "volume_context": volume_context,
             "confidence": confidence,
             "catalyst": ai_result.get("catalyst") or "news_research",
             "notes": ai_result.get("summary") or ai_result.get("reason") or "OpenAI research did not return a summary.",
@@ -4675,13 +4767,13 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
             strategy_result["decision"],
             "; ".join(strategy_result["decision_gate"].get("rejection_reasons") or [
                 f"Strategist proposed {strategy_result.get('position')} with leverage {strategy_result.get('leverage')}x."
-            ]),
+            ]) + decision_note(strategy_result["decision_gate"].get("volume_confirmation")),
             strategy_result,
         )
         record_trade_event(
             trade_id, "risk", "risk_manager", "skipped" if risk_result["decision"] == "skipped" else "completed",
             risk_result["decision"],
-            "; ".join(risk_result.get("reasons") or ["Portfolio and ATR-based sizing checks passed."]),
+            risk_result.get("decision_message") or "; ".join(risk_result.get("reasons") or ["Portfolio and ATR-based sizing checks passed."]),
             risk_result,
         )
         record_trade_event(
@@ -4791,6 +4883,11 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
 @permission('operator')
 async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
     """Submit one explicitly confirmed, freshly rechecked analysis candidate to eToro demo."""
+    return await _place_analysis_candidate_demo_order_once(trade_id)
+
+
+async def _place_analysis_candidate_demo_order_once(trade_id: int, refresh_budget: int = 1) -> Dict[str, Any]:
+    """Refresh an expired pre-order calculation once under the existing account lease."""
     weekend_reason=weekend_entry_block_reason()
     if weekend_reason:raise ValueError(weekend_reason)
 
@@ -4844,7 +4941,8 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
     if blocker:
         raise ValueError(f"Trade #{blocker['id']} ({blocker['symbol']}) has an unresolved submission; verify its order outcome before adding account risk.")
     instrument = await asyncio.to_thread(adapter.resolve_instrument, symbol)
-    blockers = instrument_blockers(instrument)
+    # Quote-time availability below owns the final broker state.
+    blockers = instrument_blockers({**instrument, 'exchange_open': None})
     if str(instrument.get("currency") or "").upper() != "USD":
         blockers.append("Instrument currency is not supported by the USD execution workflow.")
     if blockers:
@@ -4858,25 +4956,35 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
         fetch_company_fundamentals(symbol),
         asyncio.to_thread(load_news_reaction, symbol, articles),
     )
+    volume_context = await asyncio.to_thread(load_volume_context, symbol)
     daily = evaluate_latest_signal(symbol, bars)
     account, snapshot = await asyncio.gather(asyncio.to_thread(adapter.get_account_snapshot), asyncio.to_thread(adapter.get_positions))
     if not account.get("available") or not snapshot.get("available"):
         raise ValueError("Fresh account equity and positions are required at submission.")
     quote = await fetch_market_quote(symbol)
     if not is_fresh_broker_quote(quote):
-        raise ValueError("A fresh executable broker bid/ask quote is required before submission.")
+        validation = quote.get('quote_validation') or {}
+        reason = validation.get('reason') if validation.get('code') not in {None, 'fresh'} else quote.get('reason')
+        raise ValueError("Order not submitted: " + str(reason or 'A fresh executable broker bid/ask quote is required before submission.'))
+    quoted_instrument = quote.get('instrument')
+    if quoted_instrument:
+        if str(quoted_instrument.get('instrument_id')) != str(instrument.get('instrument_id')):
+            raise ValueError('Broker instrument identity changed during quote verification.')
+        instrument = quoted_instrument
+    blockers = instrument_blockers(instrument)
+    if blockers:
+        raise ValueError('Order not submitted: ' + '; '.join(blockers))
     signal = str(candidate.get("signal"))
     trend = daily.get("trend_state")
     side = "LONG" if signal == "bullish" else "SHORT"
-    if (candidate.get("ai_analysis") or {}).get("reaction_assessment") == "temporary" and trend == "bullish" and signal == "bearish":
-        side = "LONG"
-    elif (candidate.get("ai_analysis") or {}).get("reaction_assessment") == "temporary" and trend == "bearish" and signal == "bullish":
-        side = "SHORT"
+    side = select_entry_side({**candidate, 'volume_context': volume_context, 'market_quote': quote,
+        'daily_trend_context': daily, 'news_reaction': reaction},
+        get_agent_rules()['strategist'], get_agent_rules()['risk_manager'])
     entry = quote["ask" if side == "LONG" else "bid"]
     market_session_context = build_market_session_context(
         instrument=instrument, fundamentals=fundamentals, quote=quote,
     )
-    candidate = {**candidate, "market_quote": quote, "price": entry,
+    candidate = {**candidate, "volume_context": volume_context, "market_quote": quote, "price": entry,
                  "fundamentals": fundamentals, "news_reaction": reaction, "daily_trend_context": daily,
                  "market_session_context": market_session_context}
     strategy = StrategistAgent().analyze_and_decide({
@@ -4972,6 +5080,13 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
     if cash is None or float(cash) < required_margin + risk["estimated_costs"]:
         raise ValueError("Verified demo cash is insufficient for the freshly sized order.")
 
+    if not is_fresh_broker_quote(quote):
+        if refresh_budget:
+            record_trade_event(trade_id, 'execution', 'execution', 'completed', 'deferred',
+                'Quote expired during pre-order review; refreshing account, strategy, sizing and costs before any submission.',
+                {'broker_order_submitted': False, 'quote_validation': quote.get('quote_validation'), 'quote_at': quote.get('quote_at')})
+            return await _place_analysis_candidate_demo_order_once(trade_id, refresh_budget-1)
+        raise ValueError('The execution quote expired during review; fresh recalculation also expired. No order was sent.')
     reference = str(uuid.uuid4())
     policy = {"entry_submitted_at": datetime.now(timezone.utc).isoformat(), "sector": (candidate.get("fundamentals") or {}).get("sector"), "research_model": (candidate.get("ai_analysis") or {}).get("model"),
               "research_provider": (candidate.get("ai_analysis") or {}).get("provider"),
@@ -5005,9 +5120,9 @@ async def place_analysis_candidate_demo_order(trade_id: int) -> Dict[str, Any]:
         raise ValueError("This candidate has already been submitted or changed; refresh the lifecycle.")
 
     record_trade_event(trade_id, "strategy", "strategist", "completed", "accepted",
-                       "Fresh demo-order strategy recheck passed.", {**strategy, "candidate_context": candidate})
+                       "Fresh demo-order strategy recheck passed." + decision_note(strategy["decision_gate"].get("volume_confirmation")), {**strategy, "candidate_context": candidate})
     record_trade_event(trade_id, "risk", "risk_manager", "completed", "accepted",
-                       "Fresh account, positions, quote, ATR, sizing, and stop checks passed.", risk)
+                       "Fresh account, positions, quote, ATR, sizing, and stop checks passed." + decision_note(risk.get("volume_confirmation")), risk)
     attempted_submission = False
     try:
         if not is_fresh_broker_quote(quote):
@@ -5317,7 +5432,7 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
         )
         record_trade_event(
             trade_id, "strategy", "strategist", "completed", strategy_decision,
-            strategy_message,
+            strategy_message + decision_note(decision_gate.get("volume_confirmation")),
             {**strategy, "stop_loss_price": stop_loss_price, "take_profit_price": take_profit_price},
         )
         trade_result["side"] = strategy["position"]

@@ -59,7 +59,7 @@ class BrokerBoundaryTests(unittest.TestCase):
                 ({'bid':11,'ask':10},False,False,'invalid_quote'),
                 ({'bid':10,'ask':11,'quoteType':'delayed'},True,False,'indicative'),
                 ({'bid':10,'ask':11,'timestamp':(datetime.now(timezone.utc)-timedelta(minutes=5)).isoformat()},True,False,'indicative')]:
-            a=self.adapter();a.get_rate=Mock(return_value=rate);q=a.get_quote('RIVN')
+            a=self.adapter();a.get_rate=Mock(return_value={'date':rate.get('timestamp') or datetime.now(timezone.utc).isoformat(),'quoteType':'realtime',**rate});q=a.get_quote('RIVN')
             self.assertEqual((q['available'],q['executable'],q['status']),(available,executable,status))
         a=self.adapter();a.get_rate=Mock(side_effect=TimeoutError('rates read timed out'))
         q=a.get_quote('RIVN');self.assertEqual(q['status'],'request_failed');self.assertIn('timed out',q['reason'])

@@ -150,6 +150,12 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(context['date'],'2026-10-27')
         self.assertEqual(sum(context['status_counts'].values()),1)
         self.assertNotIn('do-not-show',json.dumps(context))
+        record=next(r for r in context['recent_decisions'] if r['id']==tid)
+        self.assertEqual(record['trade_created_at'],'2026-10-26 23:30:00')
+        self.assertEqual(record['trade_created_stockholm'],'2026-10-27 00:30')
+        with app.access.service_request('telegram-owner'), patch.object(tg,'request_context',return_value=context):
+            reply=asyncio.run(tg.answer(app,'/today'))
+        self.assertIn(f"#{tid} ACME · 2026-10-27 00:30 ·",reply)
 
     def test_network_errors_and_config_repr_never_expose_token(self):
         self.assertNotIn('test-token',repr(self.cfg))

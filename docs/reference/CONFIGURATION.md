@@ -444,3 +444,15 @@ must exceed prime. These are alternative arming modes, not AND conditions.
 Existing broker mode and scan interval are preserved. Broker P/L already reflects
 sizing/leverage. A basis change resets observations but retains existing native
 stops. See POSITION_MANAGEMENT.md for persistence and direction handling.
+
+### Volume-supported qualification (3 November 2026)
+
+Strategist exposes `volume_confirmation_enabled` (true), `volume_min_rvol` (1.5,
+range 1–10), `volume_max_vwap_distance_atr` (0.75, range 0.05–2) and
+`volume_confidence_relaxation` (0.05, range 0–0.05). These use the existing GUI
+agent-rule controls, reporting metadata and validated Telegram setting path.
+The confidence adjustment is capped at 0.025 for countertrend thresholds and
+never increases risk allocation. No data-source credential or schema change is
+required. Missing/stale evidence restores baseline confidence rules.
+See [volume qualification](LOCAL_MVP.md#volume-supported-directional-qualification--3-november-2026)
+for calculation, discovery priority and unchanged reversal/capital limits.
