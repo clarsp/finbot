@@ -45,7 +45,7 @@ See [CONFIGURATION.md](docs/reference/CONFIGURATION.md) for the complete environ
 
 Under the sidebar agent configuration:
 
-- **Execution:** `max_order_units=5`, `max_order_spend_usd=200`, and `analysis_retention_days=3` by default. Both sizing caps apply. Spend is account margin/capital with estimated costs reserved; leverage 2 can produce nearly $400 gross exposure from $200 capital. Actual market fills can differ; an excessive confirmed fill raises a review; discretionary closure additionally requires the conservative net-profit guard.
+- **Execution:** `max_order_units=5`, `max_order_spend_usd=200`, `analysis_retention_days=3`, `analysis_archive_retention_days=7`, and `operational_history_retention_days=3` by default. Never-submitted analysis leaves the active UI after three days and is permanently purged after the restore horizon; broker-linked and uncertain lifecycles remain protected. Detailed evidence is stored once in trade lifecycles while operational signal/agent rows retain compact summaries. Both sizing caps apply. Spend is account margin/capital with estimated costs reserved; leverage 2 can produce nearly $400 exposure from $200 capital. Actual market fills can differ; an excessive confirmed fill raises a review; discretionary closure additionally requires the conservative net-profit guard.
 - **Risk Manager:** position count, aggregate stop risk, gross exposure, single-position exposure, gap-stress scenario, ATR stop/target, estimated costs, and reassessment timing (no automatic age-based exits).
 - **Strategist:** confidence/fundamental gates, integer leverage, and conditional mean reversion thresholds.
 
@@ -171,3 +171,9 @@ Optional RVOL/VWAP evidence now prioritizes part of the news research queue and
 provides bounded direction-aware confidence relaxation for LONG and SHORT.
 Capital risk limits and measured reversal requirements remain unchanged; missing
 volume retains baseline rules. See [volume qualification](docs/reference/LOCAL_MVP.md#volume-supported-directional-qualification--3-november-2026).
+
+Recent price direction now uses the existing completed daily history: 7-/14-session
+moves, five-session average slope, recent high/low ranges and completed weekly
+closes. Clear recent direction leads entry bias; fundamentals remain context,
+news/trend disagreement needs price/volume confirmation, and countertrend entries
+need a measured reversal. See [recent trend rules](docs/reference/LOCAL_MVP.md#recent-price-direction--3-november-2026).

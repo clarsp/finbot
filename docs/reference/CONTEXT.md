@@ -1,5 +1,12 @@
 # Current handoff — 24 October 2026
 
+## 5 November: short-horizon market structure
+
+- Added symmetric completed-bar SMA5/SMA14 entry direction.
+- Added a 0.75 ATR minimum-room gate to confirmed opposing daily structure.
+- Added beta plus ATR% as a capped 5% opportunity-speed ranking input.
+- High beta can reduce allocation; volatility never grants direction.
+
 - Finbot is a Python/Streamlit app. Sole local Compose container `finbot-finbot-1`,
   dashboard https://localhost:8501, external volume `finbot_migrated_20261022`,
   active SQLite `/data/finbot.db` inside Docker. Fly compute/volume retired.
@@ -325,3 +332,68 @@ ATR rules and accessible tooltips, identifying older snapshots explicitly.
   relaxation verified. Risk/execution limits and PM broker mode, amount10/20 and
   15-minute reconfirmation match the pre-deployment snapshot. No manual order or
   candidate replay triggered. Rollback: finbot:before-volume-confirmation-20261103.
+
+- 3 November recent-trend implementation (source only; runtime remains deployed
+  v4): `recent_trend.py` classifies existing completed daily history using
+  7/14-session displacement (each >=0.5 daily ATR), five-session-average change,
+  nonoverlapping five-session high/low ranges and completed weekly close/average
+  confirmation. Original SMA state remains intact. Directional recent evidence
+  leads new v5 entry bias; fundamentals are contextual on that path. Opposing
+  news requires fresh aligned RVOL/VWAP follow-through; countertrend requires
+  measured temporary reversal and original countertrend confidence. Shared
+  Strategy/Risk guards, final-submission recomputation and human-readable
+  messages/policy snapshots included. No increase to existing SMA allocation;
+  recent-countertrend capped at half. Shadow accepts RECENT_TREND_CONTINUATION.
+  Existing v2/v3/v4 positions retain policies. recent_trend_enabled boolean has
+  GUI/reporting metadata and Telegram validation/allowlist. Mixed/unavailable or
+  disabled recent direction uses explicit legacy fallback.
+  Daily bars are loaded once before research; compact recent/SMA/ATR evidence is
+  supplied to the model (full multiyear level arrays excluded). Prompt version
+  news_market_horizon_v3 explains market direction vs company quality and busts
+  old neutral reuse. No new feed, schema, broker call or trading worker.
+  META #2052 offline fixture selects bearish bias despite mixed SMA state;
+  unconfirmed LONG and opposing-news SHORT are rejected, not replayed to broker.
+  No live settings, orders, existing positions or runtime were changed.
+  Validation: full unittest suite passed 502 tests, including 11 new offline
+  trend/gate/fresh-submission regressions; git diff whitespace check passed.
+  The existing research-cycle test now mocks volume explicitly to avoid provider
+  network access. User's pre-existing .DS_Store and trade-review HTML preserved.
+
+- 3 November automatic-confirmation activation deployed at explicit user request.
+  Added Strategist checkbox **Auto-confirm trend entries** /
+  trend_auto_confirm_enabled=true. ON confirms only passing measured RVOL/VWAP
+  follow-through or measured countertrend reversal; OFF holds confirmation-needed
+  entries for review, including manual submission, without bypassing checks.
+  Aligned entries needing no additional confirmation retain normal rules.
+  Strategy/Risk messages record ON/OFF and confirmed/awaiting_measurement/
+  automatic_confirmation_disabled/not_required. Setting validated as boolean and
+  included in GUI/reporting metadata plus Telegram allowlist.
+  Deployed v5 recent analysis and this control together; persisted both
+  recent_trend_enabled and trend_auto_confirm_enabled true through the existing
+  settings function, with user-requested activation in access_events. Verified
+  eToro demo and automated demo orders enabled. Risk/execution limits, volume
+  thresholds and broker-mode amount10/20 trailing at 15 minutes matched before/
+  after snapshots. Sole container healthy, frontend/worker health passed, external
+  volume finbot_migrated_20261022 preserved. Full suite 506 tests passed; 15 focused
+  mocked tests passed inside deployed image 4a0d76a44fef. No manual order or
+  historical candidate replay triggered. Rollback image:
+  finbot:before-trend-autoconfirm-20261103. Earlier source-only v5 notes are now
+  superseded by this deployment.
+
+- 4 November reporting/retention repair deployed. Reporting now rebuilds only
+  affected UTC daily partitions and reuses unchanged v2 manifest parts; it runs
+  in a separate subprocess so reporting memory/failure cannot restart the backup
+  daemon or trading worker. Operational `signals.payload` and selected
+  `agent_events.details` retain compact decision summaries plus a hash/reference
+  to canonical immutable `trade_events`, rather than repeating full evidence.
+  Active non-executed analysis retention is 3 days, recoverable archive retention
+  is 7 days from archival, and duplicate operational history retention is 3 days
+  (latest sector signal is protected). Before mutation, a verified compressed
+  backup completed. Batch migration compacted 4,720 rows from 3,917,165,570 to
+  3,950,948 JSON bytes and removed 483 expired signals; 999 recent archive rows
+  were retained. Controlled WAL checkpoint/VACUUM/quick_check reduced the live DB
+  from 6,349,828,096 bytes to about 1.91 GB; quick_check returned ok. Sole demo
+  container is healthy with restart count zero; final image
+  9bbfbc39c220a57106b3c1ad6fdcb7906b90124fa7edd7d76092e7d2b8881edf.
+  Full suite passed 509 tests; final focused reporting/retention suite passed 20.
+  Rollback image: finbot:before-incremental-reporting-20261104.

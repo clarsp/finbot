@@ -456,3 +456,32 @@ never increases risk allocation. No data-source credential or schema change is
 required. Missing/stale evidence restores baseline confidence rules.
 See [volume qualification](LOCAL_MVP.md#volume-supported-directional-qualification--3-november-2026)
 for calculation, discovery priority and unchanged reversal/capital limits.
+
+### Recent price direction (3 November 2026)
+
+`strategist.recent_trend_enabled` defaults true and is a validated boolean exposed
+through the existing GUI, reporting metadata and Telegram rule interface. It uses
+completed daily data already fetched; it has no additional credentials or schema.
+Directional recent evidence owns entry bias; company metrics are contextual on that
+path. A disabled control or mixed/unavailable recent direction uses the legacy
+news/SMA path and is explicitly identified in decision text. RVOL/VWAP timing for
+news/trend disagreement remains distinct from optional volume confidence relief.
+See [recent price direction](LOCAL_MVP.md#recent-price-direction--3-november-2026).
+
+### Short-horizon structure and speed (5 November 2026)
+
+Completed daily bars now supply SMA5/SMA14 direction. LONG normally requires
+`close > SMA5 > SMA14`; SHORT uses the symmetric inverse. Entry is also deferred
+when less than 0.75 ATR remains to confirmed daily resistance (LONG) or support
+(SHORT), unless the measured-reversal workflow confirms a new setup.
+
+Yahoo beta and ATR percentage contribute only a capped opportunity-speed
+ranking component. They never select direction or relax a failed gate. Beta
+above 1.5 reduces Risk Manager allocation, with a 0.5 minimum multiplier.
+
+`strategist.trend_auto_confirm_enabled` (boolean, default true) is labeled
+**Auto-confirm trend entries**. ON lets the Strategist automatically confirm valid
+measured entries. OFF holds entries needing confirmation, rather than bypassing
+confirmation. Available in the existing agent sidebar, reporting metadata and
+Telegram `/set strategist trend_auto_confirm_enabled false`. The execution/demo
+master switches and all risk limits remain independent.

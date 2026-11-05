@@ -42,9 +42,10 @@ def partitions(snapshot):
             batch.append(row);size+=length+1
         if batch:yield kind,period,batch
 
-def publish_partitioned(snapshot,client,bucket,prefix,notify):
+def publish_partitioned(snapshot,client,bucket,prefix,notify,*,previous_manifest=None,rebuild_periods=None):
     from reporting_export import KINDS
     if not prefix.startswith('finbot/reporting/') or '..' in prefix:raise ValueError('Reporting partitions require a dedicated reporting prefix.')
+    rebuilt=set(rebuild_periods or ())
     descriptors=[];total=0
     for kind,period,rows in partitions(snapshot):
         raw=pack({'schema_version':2,'kind':kind,'period':period,'rows':rows})
@@ -59,13 +60,22 @@ def publish_partitioned(snapshot,client,bucket,prefix,notify):
             client.put_object(Bucket=bucket,Key=key,Body=data,ContentType='application/gzip',Metadata={'sha256':digest},ServerSideEncryption='AES256')
         descriptors.append({'object_key':key,'sha256':digest,'kind':kind,'period':period,'rows':len(rows),'raw_bytes':len(raw),'compressed_bytes':len(data)})
         total+=len(data)
-    manifest={k:snapshot[k] for k in ('generation_id','generated_at','source_id','profile','counts')}
+    if previous_manifest and rebuilt:
+        descriptors.extend(part for part in previous_manifest.get('parts',[])
+                           if (part.get('kind'),part.get('period')) not in rebuilt)
+        descriptors.sort(key=lambda part:(part.get('kind',''),part.get('period',''),part.get('object_key','')))
+        total=sum(int(part.get('compressed_bytes') or 0) for part in descriptors)
+    counts={kind:sum(int(part.get('rows') or 0) for part in descriptors if part.get('kind')==kind) for kind in KINDS}
+    manifest={k:snapshot[k] for k in ('generation_id','generated_at','source_id','profile')}
+    manifest['counts']=counts
     manifest.update(schema_version=2,parts=descriptors,compressed_bytes=total)
     raw=pack(manifest);data=gzip.compress(raw,compresslevel=3,mtime=0)
     if len(raw)>1024*1024:raise ValueError('Reporting manifest exceeds 1 MiB.')
     key=prefix+'/generations/'+snapshot['generation_id']+'.json.gz'
     client.put_object(Bucket=bucket,Key=key,Body=data,ContentType='application/gzip',ServerSideEncryption='AES256')
     base={'schema_version':2,'generation_id':snapshot['generation_id'],'generated_at':snapshot['generated_at']}
+    # The consumer stages rebuilt parts and transactionally reuses unchanged
+    # parts under the new generation before accepting the commit.
     for part in descriptors:
         result=notify({**base,**part,'action':'part'})
         if result.get('status') not in ('staged','unchanged'):raise RuntimeError('Dashboard did not stage reporting partition.')
@@ -99,4 +109,4 @@ def publish_partitioned(snapshot,client,bucket,prefix,notify):
         import logging
         logging.getLogger('finbot.reporting').warning('Partition export committed; retention cleanup failed (%s).',type(error).__name__)
 
-    return {'status':result['status'],'generation_id':snapshot['generation_id'],'compressed_bytes':total,'counts':snapshot['counts'],'partitions':len(descriptors)}
+    return {'status':result['status'],'generation_id':snapshot['generation_id'],'compressed_bytes':total,'counts':counts,'partitions':len(descriptors)}

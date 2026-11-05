@@ -37,7 +37,7 @@ def validate_rules(rules):
 def build_plan(rules, risk, policy, instrument_id):
     if not rules.get('shadow_tracking_enabled', True) or not risk.get('execution_ready') or risk.get('decision') != 'accepted':
         return None
-    if policy['framework'] not in {'DIRECTIONAL_NEWS', 'NEWS_BREAKOUT_CONTINUATION'}:
+    if policy['framework'] not in {'DIRECTIONAL_NEWS', 'NEWS_BREAKOUT_CONTINUATION', 'RECENT_TREND_CONTINUATION'}:
         return None
     validate_rules(rules)
     broker_costs = policy.get('broker_cost_evidence', {})

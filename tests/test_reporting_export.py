@@ -130,21 +130,20 @@ class ReportingBackupLifecycleTests(unittest.TestCase):
         from unittest.mock import patch,Mock
         from types import SimpleNamespace
         import s3_backup
-        backup=Mock();backup.settings=SimpleNamespace(interval_seconds=3600)
+        backup=Mock();backup.settings=SimpleNamespace(interval_seconds=3600,database_path=Path('/tmp/test.db'))
         stop=Mock();stop.wait.side_effect=[False,False,True]
-        thread=Mock();thread.is_alive.return_value=True
-        with patch.object(s3_backup,'configuration_environment',return_value={'FINBOT_REPORTING_ENABLED':'true'}),patch.object(s3_backup.signal,'signal'),patch.object(s3_backup.threading,'Event',return_value=stop),patch.object(s3_backup.threading,'Thread',return_value=thread) as factory:
+        process=Mock();process.poll.return_value=None
+        with patch.object(s3_backup,'configuration_environment',return_value={'FINBOT_REPORTING_ENABLED':'true'}),patch.object(s3_backup.signal,'signal'),patch.object(s3_backup.threading,'Event',return_value=stop),patch.object(s3_backup.subprocess,'Popen',return_value=process) as factory:
             s3_backup.run_daemon(backup)
         self.assertEqual(backup.create_snapshot.call_count,3)
-        factory.assert_called_once();thread.start.assert_called_once();thread.join.assert_not_called()
-        self.assertTrue(factory.call_args.kwargs['daemon'])
+        factory.assert_called_once()
 
     def test_disabled_reporting_does_not_start_export_thread(self):
         from unittest.mock import patch,Mock
         from types import SimpleNamespace
         import s3_backup
         backup=Mock();backup.settings=SimpleNamespace(interval_seconds=3600);stop=Mock();stop.wait.side_effect=[False,True]
-        with patch.object(s3_backup,'configuration_environment',return_value={}),patch.object(s3_backup.signal,'signal'),patch.object(s3_backup.threading,'Event',return_value=stop),patch.object(s3_backup.threading,'Thread') as factory:
+        with patch.object(s3_backup,'configuration_environment',return_value={}),patch.object(s3_backup.signal,'signal'),patch.object(s3_backup.threading,'Event',return_value=stop),patch.object(s3_backup.subprocess,'Popen') as factory:
             s3_backup.run_daemon(backup)
         self.assertEqual(backup.create_snapshot.call_count,2);factory.assert_not_called()
 

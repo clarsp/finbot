@@ -2,9 +2,21 @@
 
 
 def group_shadow_events(events):
-    """One shadow step per trade; preserve every observation in its evidence trail."""
+    """Collapse repeated observation stages without changing audit evidence.
+
+    Entry decisions and broker submission remain individual steps. Repeated
+    shadow, reassessment, trailing, recovery and protection observations become
+    one visual step whose attached collection retains every source event.
+    """
     grouped=list(events)
-    for stage,field in [('shadow','shadow_observations'),('reassessment','reassessments')]:
+    for stage,field in [
+        ('shadow','shadow_observations'),
+        ('reassessment','reassessments'),
+        ('profit_trailing','management_observations'),
+        ('trailing','management_observations'),
+        ('recovery','management_observations'),
+        ('protection','management_observations'),
+    ]:
         observations=[e for e in grouped if e.get('stage')==stage]
         if not observations:continue
         result=[];inserted=False

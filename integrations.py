@@ -710,6 +710,7 @@ def _fetch_company_fundamentals(ticker: str) -> Dict[str, Any]:
         "forward_pe": numeric_value(info.get("forwardPE")),
         "trailing_eps": numeric_value(info.get("trailingEps")),
         "forward_eps": numeric_value(info.get("forwardEps")),
+        "beta": numeric_value(info.get("beta")),
         "total_revenue_ttm": revenue_ttm,
         "revenue_yoy_growth_pct": revenue_growth,
         "net_profit_margin_pct": net_profit_margin,
@@ -990,6 +991,11 @@ class OpenAIResearchAdapter:
                             " Prioritize direct, dated instrument evidence over generic or other-company stories. "
                             "Opposing details do not automatically require neutral: identify the dominant supported catalyst, "
                             "while retaining uncertainty and explaining counterevidence. Never force a direction. "
+                            "For short-horizon research distinguish current market behaviour from longer-term company quality. "
+                            "Use supplied recent_trend evidence, including recent returns, slope, range structure and completed weeks, "
+                            "when assessing likely near-term direction. Strong cash flow, EPS or low debt alone cannot establish "
+                            "a price reversal. Explicitly explain conflict between the catalyst and recent price direction; "
+                            "do not turn a longer-term recovery narrative into an immediate entry recommendation. "
                             "For a neutral signal return neutral_reason as no_direct_evidence, conflicting_evidence, "
                             "no_actionable_catalyst, or insufficient_evidence, and explain specifically why neither direction is supported. "
                             "Also return supporting_headline_indices and opposing_headline_indices as zero-based indices into the supplied headlines."

@@ -398,6 +398,7 @@ class NewsExecutionGateRegressionTests(unittest.TestCase):
                 patch.object(makemoney, "fetch_market_quote", new=AsyncMock(return_value={"available": True, "provider": "eToro", "ask": 100, "bid": 99, "fetched_at": now})),
                 patch.object(makemoney, "fetch_market_trends", new=AsyncMock(return_value={"data_source": "test"})),
                 patch.object(makemoney, "load_daily_bars", return_value=bars),
+                patch.object(makemoney, "load_volume_context", return_value={"available": False}),
                 patch.object(makemoney, "evaluate_latest_signal", return_value={"available": False, "trend_state": "unknown"}),
                 patch.object(makemoney, "ResearcherAgent", return_value=researcher),
                 patch.object(makemoney, "StrategistAgent", return_value=strategist),

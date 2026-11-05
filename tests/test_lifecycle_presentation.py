@@ -34,6 +34,25 @@ class ShadowPresentationTests(unittest.TestCase):
         self.assertEqual([e['id'] for e in reviews[0]['reassessments']],[2,4])
         self.assertEqual(len(events),4)
 
+    def test_repeated_position_management_stages_share_one_visual_step(self):
+        events=[
+            {'id':1,'stage':'execution','decision':'submitted'},
+            {'id':2,'stage':'profit_trailing','decision':'tracking','message':'First observation'},
+            {'id':3,'stage':'recovery','decision':'attention','message':'Retry required'},
+            {'id':4,'stage':'profit_trailing','decision':'tracking','message':'Second observation'},
+            {'id':5,'stage':'recovery','decision':'accepted','message':'Recovered'},
+            {'id':6,'stage':'reconciliation','decision':'accepted'},
+        ]
+        before=copy.deepcopy(events)
+        result=group_shadow_events(events)
+        self.assertEqual([e['stage'] for e in result],['execution','profit_trailing','recovery','reconciliation'])
+        trailing=next(e for e in result if e['stage']=='profit_trailing')
+        recovery=next(e for e in result if e['stage']=='recovery')
+        self.assertEqual([e['id'] for e in trailing['management_observations']],[2,4])
+        self.assertEqual([e['decision'] for e in recovery['management_observations']],['attention','accepted'])
+        self.assertEqual(recovery['decision'],'accepted')
+        self.assertEqual(events,before)
+
 
 class BrokerStatusPresentationTests(unittest.TestCase):
     def test_preflight_failure_is_not_broker_rejection_or_pending(self):

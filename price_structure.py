@@ -3,6 +3,33 @@ import math
 import pandas as pd
 
 
+def entry_structure_room(side, entry, atr, structure, minimum_atr=.75):
+    """Measure room to the nearest confirmed opposing daily swing, symmetrically."""
+    evidence = {"available": False, "side": side, "minimum_room_atr": minimum_atr,
+                "qualified": True, "reason": "Confirmed opposing structure unavailable."}
+    try:
+        sign = 1 if side == "LONG" else -1
+        key = "resistance" if side == "LONG" else "support"
+        zones = [z for z in (structure or {}).get(key, [])
+                 if z.get("kind") in (None, "confirmed_swing_zone") and z.get("timeframe") in (None, "daily")]
+        ahead = [z for z in zones if sign * (float(z["low"] if sign == 1 else z["high"]) - float(entry)) >= 0]
+        if not ahead or not math.isfinite(float(atr)) or float(atr) <= 0:
+            return evidence
+        edge = lambda z: float(z["low"] if sign == 1 else z["high"])
+        zone = min(ahead, key=lambda z: sign * (edge(z) - float(entry)))
+        distance = sign * (edge(zone) - float(entry))
+        room_atr = distance / float(atr)
+        qualified = room_atr >= float(minimum_atr)
+        return {"available": True, "side": side, "boundary": key, "zone": zone,
+                "entry": float(entry), "distance": distance, "room_atr": room_atr,
+                "minimum_room_atr": float(minimum_atr), "qualified": qualified,
+                "reason": (f"{room_atr:.2f} ATR room to nearest confirmed {key}; minimum {float(minimum_atr):.2f} ATR."
+                           if qualified else
+                           f"Entry deferred: only {room_atr:.2f} ATR room to nearest confirmed {key}; minimum {float(minimum_atr):.2f} ATR or a measured break/retest is required.")}
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return evidence
+
+
 def daily_structure(bars):
     """Use at most 120 completed bars; pivots need two bars on either side.
 

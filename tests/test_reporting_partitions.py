@@ -28,7 +28,20 @@ class PartsTests(unittest.TestCase):
   self.assertFalse(any(c.kwargs['Key'].endswith('/latest.json') for c in client.put_object.call_args_list))
  def test_oversized_single_row_is_never_summarized(self):
   with patch.object(p,'MAX_ROW_BYTES',10),self.assertRaises(ValueError):list(p.partitions(self.snapshot()))
- def test_database_snapshot_preserves_long_evidence_before_partitioning(self):
+ def test_incremental_rebuild_reuses_untouched_daily_parts(self):
+  s=p.full_clean(self.snapshot());s['events']=[row for row in s['events'] if row['created_at'].startswith('2026-10-22')]
+  prior={'parts':[{'object_key':'old-21','sha256':'a','kind':'events','period':'2026-10-21','rows':4,'raw_bytes':10,'compressed_bytes':8},
+                  {'object_key':'old-22','sha256':'b','kind':'events','period':'2026-10-22','rows':9,'raw_bytes':10,'compressed_bytes':8}]}
+  client=Mock();client.get_object.side_effect=[{'Body':io.BytesIO(json.dumps({'schema_version':2,'object_key':'prior-manifest'}).encode())},
+                                               {'Body':io.BytesIO(gzip.compress(json.dumps(prior).encode()))}]
+  client.get_paginator.return_value.paginate.return_value=[]
+  calls=[]
+  result=p.publish_partitioned(s,client,'datadb','finbot/reporting/shared-demo',lambda m:(calls.append(m),{'status':'staged' if m['action']=='part' else 'imported'})[1],previous_manifest=prior,rebuild_periods={('events','2026-10-22')})
+  manifest=gzip.decompress(next(call.kwargs['Body'] for call in client.put_object.call_args_list if '/generations/' in call.kwargs['Key']))
+  parts=json.loads(manifest)['parts']
+  self.assertTrue(any(part['object_key']=='old-21' for part in parts));self.assertFalse(any(part['object_key']=='old-22' for part in parts))
+  self.assertEqual(result['counts']['events'],9)
+ def test_database_snapshot_summarizes_long_evidence_before_partitioning(self):
   import sqlite3,tempfile
   from pathlib import Path
   from reporting_export import build_snapshot
@@ -39,4 +52,4 @@ class PartsTests(unittest.TestCase):
    evidence={'bars':list(range(180)),'reason':'decision evidence '*2000,'api_key':'private'}
    c.execute('INSERT INTO trade_events VALUES (1,1,?,?,?,?,?,?,?)',('risk','risk_manager','accepted','accepted','Evidence','2026-10-22T12:00:00Z',json.dumps(evidence)));c.commit();c.close()
    report=build_snapshot(path);details=report['events'][0]['details']
-   self.assertEqual(details['bars'],evidence['bars']);self.assertEqual(details['reason'],evidence['reason']);self.assertNotIn('api_key',details)
+   self.assertLess(len(json.dumps(details)),12000);self.assertLess(len(details['bars']),len(evidence['bars']));self.assertLess(len(details['reason']),len(evidence['reason']));self.assertNotIn('api_key',details)

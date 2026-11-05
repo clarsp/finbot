@@ -19,6 +19,8 @@ import signal
 import sqlite3
 import tempfile
 import threading
+import subprocess
+import sys
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -338,14 +340,14 @@ def run_daemon(backup):
     def stop(_signum,_frame):stopping.set()
     signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
     logger.info('S3 backup daemon started; interval=%s seconds',backup.settings.interval_seconds)
-    report_thread=None
+    report_process=None
     def start_report():
-        nonlocal report_thread
+        nonlocal report_process
         if str(configuration_environment().get('FINBOT_REPORTING_ENABLED','false')).lower() not in {'true','1','yes','on'}:return
-        if report_thread is not None and report_thread.is_alive():return
-        from reporting_export import scheduled_publish
-        report_thread=threading.Thread(target=scheduled_publish,args=(backup.settings,),name='reporting-export',daemon=True)
-        report_thread.start()
+        if report_process is not None and report_process.poll() is None:return
+        # Reporting has a separate process because a large/invalid report must
+        # never kill the recovery-backup daemon or restart the trading runtime.
+        report_process=subprocess.Popen([sys.executable,'reporting_export.py','--db',str(backup.settings.database_path),'--notify'])
     delay=min(10,backup.settings.interval_seconds)
     while not stopping.wait(delay):
         try:

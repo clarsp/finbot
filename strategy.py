@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, Optional
 
 import pandas as pd
 import yfinance as yf
+from recent_trend import analyze_recent_trend
 from price_structure import multi_timeframe_structure
 from market_instruments import reference_symbol
 
@@ -67,6 +68,8 @@ def load_daily_bars(symbol: str, period: str = "5y", now=None) -> pd.DataFrame:
     ).max(axis=1)
     frame["sma50"] = frame["Close"].rolling(50, min_periods=50).mean()
     frame["sma200"] = frame["Close"].rolling(200, min_periods=200).mean()
+    frame["sma5"] = frame["Close"].rolling(5, min_periods=5).mean()
+    frame["sma14"] = frame["Close"].rolling(14, min_periods=14).mean()
     frame["atr14"] = true_range.rolling(14, min_periods=14).mean()
     # ATR is an execution-risk input and becomes available before the slower
     # trend averages for newly listed instruments. Preserve those rows so a
@@ -80,6 +83,8 @@ def evaluate_latest_signal(symbol: str, bars: pd.DataFrame) -> Dict[str, Any]:
     row = bars.iloc[-1]
     close, atr14 = (float(row[key]) for key in ("Close", "atr14"))
     sma50, sma200 = (float(row[key]) for key in ("sma50", "sma200"))
+    sma5 = float(row.get("sma5", bars["Close"].tail(5).mean()))
+    sma14 = float(row.get("sma14", bars["Close"].tail(14).mean()))
     timestamp = pd.Timestamp(bars.index[-1]).isoformat()
     base = {
         "symbol": symbol,
@@ -89,9 +94,18 @@ def evaluate_latest_signal(symbol: str, bars: pd.DataFrame) -> Dict[str, Any]:
         "close": close if math.isfinite(close) and close > 0 else None,
         "sma50": sma50 if math.isfinite(sma50) and sma50 > 0 else None,
         "sma200": sma200 if math.isfinite(sma200) and sma200 > 0 else None,
+        "sma5": sma5 if math.isfinite(sma5) and sma5 > 0 else None,
+        "sma14": sma14 if math.isfinite(sma14) and sma14 > 0 else None,
         "atr14": atr14 if math.isfinite(atr14) and atr14 > 0 else None,
         "price_structure": multi_timeframe_structure(bars),
+        "recent_trend": analyze_recent_trend(bars),
     }
+    base["short_term_trend_state"] = (
+        "bullish" if base["sma5"] and base["sma14"] and close > sma5 > sma14
+        else "bearish" if base["sma5"] and base["sma14"] and close < sma5 < sma14
+        else "mixed"
+    )
+    base["atr_pct"] = 100 * atr14 / close if close > 0 and atr14 > 0 else None
     if base["close"] is None or base["atr14"] is None:
         return {**base, "available": False, "trend_state": "unknown", "reason": "Daily close or ATR14 data is invalid."}
     if base["sma50"] is None or base["sma200"] is None:

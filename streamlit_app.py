@@ -2385,13 +2385,17 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                 flow = ""
                 for index, (event, event_label) in enumerate(zip(events, event_labels)):
                     decision = _lifecycle_event_decision(event)
+                    grouped_observations = event.get("management_observations") or []
+                    agent_label = event["agent_name"].replace("_", " ").title()
+                    if grouped_observations:
+                        agent_label += f" · {len(grouped_observations)} observations"
                     status_class = (
                         decision if decision in {"accepted", "rejected", "unavailable", "skipped", "deferred"}
                         else "pending"
                     )
                     flow += (
                         f'<div class="flow-item {status_class}"><strong>{html.escape(event_label)}</strong>'
-                        f'<br>{html.escape(event["agent_name"].replace("_", " ").title())}'
+                        f'<br>{html.escape(agent_label)}'
                         f'<br><small>{html.escape(decision.title())}</small></div>'
                     )
                     if index < len(events) - 1:
@@ -2408,6 +2412,7 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                         st.caption(format_local_timestamp(event["created_at"]))
                         observations = event.get("shadow_observations")
                         reviews = event.get("reassessments")
+                        management_observations = event.get("management_observations")
                         if reviews:
                             st.dataframe(pd.DataFrame([
                                 {"Reviewed at":format_local_timestamp(item.get("created_at")),
@@ -2430,6 +2435,20 @@ def render_trade_lifecycles(trades: list[Dict[str, Any]]) -> None:
                             ]), hide_index=True, width="stretch")
                             with st.expander("Full shadow evidence trail"):
                                 st.json(observations)
+                        elif management_observations:
+                            st.write(
+                                f"{len(management_observations)} Position Manager observations grouped into this lifecycle step. "
+                                "These are monitoring updates, not separate positions or entry decisions."
+                            )
+                            st.dataframe(pd.DataFrame([
+                                {"Observed at": format_local_timestamp(item.get("created_at")),
+                                 "Decision": _lifecycle_event_decision(item).title(),
+                                 "Status": str(item.get("status") or "").replace("_", " ").title(),
+                                 "Evidence": item.get("message")}
+                                for item in management_observations
+                            ]), hide_index=True, width="stretch")
+                            with st.expander("Full management evidence trail"):
+                                st.json(management_observations)
                         else:
                             render_event_evidence(event)
             else:

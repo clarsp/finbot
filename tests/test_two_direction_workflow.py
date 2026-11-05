@@ -409,6 +409,32 @@ class DatabaseTests(unittest.TestCase):
         c=app.get_connection();store.archive_analysis(c);store.restore_analysis(c,tid)
         self.assertEqual(store.archive_analysis(c),[]);c.close()
 
+    def test_expired_archives_are_previewed_then_purged_without_touching_broker_history(self):
+        old=self.trade();submitted=self.trade()
+        self.update(old,created_at='2026-01-01 00:00:00')
+        self.update(submitted,created_at='2026-01-01 00:00:00',status='SUBMITTED_PENDING_RECONCILIATION',broker_order_id='safe-order')
+        c=app.get_connection();store.archive_analysis(c,3,archive_retention_days=30)
+        c.execute("UPDATE archived_analysis SET archived_at='2026-01-01 00:00:00' WHERE trade_id=?",(old,));c.commit()
+        preview=store.purge_archived_analysis(c,7,apply=False)
+        self.assertEqual(preview['trade_ids'],[old]);self.assertFalse(preview['applied'])
+        applied=store.purge_archived_analysis(c,7,apply=True);c.commit()
+        self.assertEqual(applied['count'],1)
+        self.assertIsNotNone(c.execute('SELECT id FROM trades WHERE id=?',(submitted,)).fetchone())
+        c.close()
+
+    def test_duplicate_operational_json_is_compacted_and_old_signals_expire(self):
+        detail={'trade_id':7,'ticker':'ACME','status':'analysis_complete','research_candidates':[{'evidence':'x'*30000}],
+                'trades':[{'trade_id':7,'symbol':'ACME','side':'LONG','status':'ANALYSIS_ONLY'}]}
+        compact=store.compact_operational_detail(detail)
+        self.assertEqual(compact['trade_id'],7);self.assertEqual(compact['evidence_storage'],'trade_events')
+        self.assertNotIn('research_candidates',compact)
+        c=app.get_connection();c.execute("INSERT INTO signals(created_at,sector,signal,catalyst,confidence,payload) VALUES ('2026-01-01','Tech','bullish','x',.8,?)",(json.dumps(detail),))
+        c.execute("INSERT INTO signals(created_at,sector,signal,catalyst,confidence,payload) VALUES (CURRENT_TIMESTAMP,'Tech','neutral','x',.5,'{}')");c.commit()
+        preview=store.purge_operational_history(c,7,datetime(2026,11,4,tzinfo=timezone.utc))
+        self.assertEqual(preview['count'],1);self.assertFalse(preview['applied'])
+        applied=store.purge_operational_history(c,7,datetime(2026,11,4,tzinfo=timezone.utc),apply=True);c.commit()
+        self.assertEqual(applied['count'],1);self.assertEqual(c.execute('SELECT count(*) FROM signals').fetchone()[0],1);c.close()
+
     def test_multi_company_article_associations_survive_storage(self):
         article=dict(article_key='both',ticker='ACME',related_tickers=['ACME','OTHER'],title='Joint venture',fetched_at=datetime.now(timezone.utc).isoformat())
         app.save_news_articles([article])

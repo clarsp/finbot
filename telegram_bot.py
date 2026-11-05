@@ -29,7 +29,7 @@ EDITABLE = {
         'minimum_reward_risk', 'stop_atr_multiple', 'target_reward_risk', 'max_target_atr_multiple'},
     'strategist': {'min_confidence', 'fundamental_confirmation_min_confidence',
         'allow_mixed_trend_reversals', 'fresh_boundary_entries_enabled',
-        'volume_confirmation_enabled', 'volume_min_rvol', 'volume_max_vwap_distance_atr', 'volume_confidence_relaxation',
+        'trend_auto_confirm_enabled', 'recent_trend_enabled', 'volume_confirmation_enabled', 'volume_min_rvol', 'volume_max_vwap_distance_atr', 'volume_confidence_relaxation',
         'countertrend_long_min_confidence', 'countertrend_short_min_confidence',
         'weak_fundamentals_max_net_profit_margin_pct', 'weak_fundamentals_max_revenue_growth_pct',
         'weak_fundamentals_min_debt_to_equity', 'strong_fundamentals_min_net_profit_margin_pct',

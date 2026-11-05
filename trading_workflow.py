@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import math
+from recent_trend import active_recent_trend
 from price_structure import structure_target
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-VERSION = "news_reaction_v4"
-MANAGED_VERSIONS = frozenset({'news_reaction_v2', 'news_reaction_v3', VERSION})
+VERSION = "news_reaction_v5"
+MANAGED_VERSIONS = frozenset({'news_reaction_v2', 'news_reaction_v3', 'news_reaction_v4', VERSION})
 
 
 def continuation_setup(candidate, side, rules, risk_rules=None):
@@ -55,6 +56,17 @@ def select_entry_side(candidate, rules, risk_rules=None):
     side = 'LONG' if signal == 'bullish' else 'SHORT' if signal == 'bearish' else 'HOLD'
     if side == 'HOLD':
         return side
+    recent = active_recent_trend(candidate, rules)
+    if recent:
+        bias = 'LONG' if recent['state'] == 'bullish' else 'SHORT'
+        reversal_side = 'SHORT' if bias == 'LONG' else 'LONG'
+        quote = candidate.get('market_quote') or {}
+        reversal = {**candidate, 'price': quote.get('ask' if reversal_side == 'LONG' else 'bid') or candidate.get('price')}
+        minimum = float(rules.get('countertrend_long_min_confidence' if reversal_side == 'LONG' else 'countertrend_short_min_confidence', .85))
+        if (float(candidate.get('confidence') or 0) >= minimum
+                and mean_reversion_setup(reversal, reversal_side, rules).get('approved')):
+            return reversal_side
+        return bias
     trend = str((candidate.get('daily_trend_context') or {}).get('trend_state') or 'unknown').lower()
     quote = candidate.get('market_quote') or {}
     directional = {**candidate, 'price': quote.get('ask' if side == 'LONG' else 'bid') or candidate.get('price')}
@@ -288,7 +300,7 @@ def size_order(*, side: str, entry: float, atr: float, equity: float, cash: floa
     }
     protection = {
         "target_selection": target_evidence,
-        "framework": "CONDITIONAL_MEAN_REVERSION" if reversion else "NEWS_BREAKOUT_CONTINUATION" if breakout else "DIRECTIONAL_NEWS",
+        "framework": "CONDITIONAL_MEAN_REVERSION" if reversion else "NEWS_BREAKOUT_CONTINUATION" if breakout else "RECENT_TREND_CONTINUATION" if setup.get("framework") == "RECENT_TREND_CONTINUATION" else "DIRECTIONAL_NEWS",
         "atr14": atr,
         "entry_price": entry,
         "stop_loss_price": stop,
@@ -337,3 +349,50 @@ def exit_reason(trade: dict, mark: float, now: datetime | None = None) -> str | 
         return "take_profit_level_observed"
     # Holding age is a reassessment trigger, never an exit condition.
     return None
+
+
+def recent_entry_requirements(candidate, side, rules):
+    """Shared Strategy/Risk guard; a news score never becomes a short probability."""
+    from volume_context import confirmation, adjusted_rules
+    recent = active_recent_trend(candidate, rules)
+    result = {'active': bool(recent), 'reasons': [], 'recent_trend': recent,
+              'auto_confirm_enabled': rules.get('trend_auto_confirm_enabled', True),
+              'confirmation_status': 'not_required'}
+    if not recent:
+        return result
+    bias = 'LONG' if recent['state'] == 'bullish' else 'SHORT'
+    countertrend = side != bias
+    result.update(bias=bias, countertrend=countertrend,
+                  confidence_role='research_quality_threshold; not a probability for the selected trade direction')
+    if countertrend:
+        setup = mean_reversion_setup(candidate, side, rules)
+        required = float(rules.get('countertrend_long_min_confidence' if side == 'LONG' else 'countertrend_short_min_confidence', .85))
+        result['setup'] = setup
+        measured = bool(setup.get('approved'))
+        result['confirmation_status'] = 'confirmed' if measured else 'awaiting_measurement'
+        if not setup.get('approved'):
+            result['reasons'].append('Entry opposes the recent price trend without a confirmed measured reversal.')
+            result['reasons'].extend(setup['reasons'])
+    else:
+        effective, _ = adjusted_rules(candidate, side, rules)
+        required = float(effective.get('min_confidence', .7))
+        signal = candidate.get('signal')
+        news_side = 'LONG' if signal == 'bullish' else 'SHORT' if signal == 'bearish' else 'HOLD'
+        if news_side != side:
+            result['entry_confirmation'] = confirmation(candidate, side, {**rules, 'volume_confirmation_enabled': True})
+            result['confirmation_status'] = 'confirmed' if result['entry_confirmation']['qualified'] else 'awaiting_measurement'
+            if not result['entry_confirmation']['qualified']:
+                result['reasons'].append('Recent price trend opposes the research direction; fresh direction-aligned RVOL/VWAP and completed-bar follow-through are required before entry.')
+    if result['confirmation_status'] != 'not_required':
+        if not result['auto_confirm_enabled']:
+            result['confirmation_status'] = 'automatic_confirmation_disabled'
+            result['reasons'].append('Strategist auto-confirm is OFF; this entry needs confirmation and is held for review. Enable auto-confirm to allow a fresh measured reassessment.')
+            result['confirmation_message'] = ' Strategist auto-confirm OFF: entry held for review; confirmation is not bypassed.'
+        elif result['confirmation_status'] == 'confirmed':
+            result['confirmation_message'] = ' Strategist auto-confirm ON: measured entry confirmation passed automatically; confidence, risk and execution gates still apply.'
+        else:
+            result['confirmation_message'] = ' Strategist auto-confirm ON: awaiting measured entry confirmation; no entry authorized by this confirmation check.'
+    result['required_confidence'] = required
+    if float(candidate.get('confidence') or 0) < required:
+        result['reasons'].append(f'Research quality confidence is below the {required:.1%} threshold; it is not treated as a probability for the selected direction.')
+    return result

@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 
 VERSION = "relevance_v1"
-RESEARCH_PROMPT_VERSION = "news_instrument_identity_v2"
+RESEARCH_PROMPT_VERSION = "news_market_horizon_v3"
 NEUTRAL_TTL_SECONDS = 2 * 3600
 
 

@@ -69,10 +69,19 @@ AGENT_RULE_HELP = {'profit_review_exits_enabled': 'Allow a news or sizing review
                         'leverage, $200 margin can provide up to $400 exposure. The units cap also applies.',
  'analysis_retention_days': 'Archive never-submitted analysis after this many days. Broker orders, fills, '
                             'uncertain submissions and open positions are preserved. Default: 3 days.',
+ 'analysis_archive_retention_days': 'Permanently purge never-submitted analysis after this many days. It remains restorable between the active and archive horizons. Broker-linked and uncertain submissions are never eligible. Default: 7 days.',
+ 'operational_history_retention_days': 'Retain legacy signal-polling rows for this many days, while always keeping the latest row per sector. Detailed lifecycle evidence remains in trade events. Default: 3 days.',
  'conditional_mean_reversion_confirmation_atr': 'Required completed-bar recovery from the post-news extreme '
                                                 'before entering the reversal.',
  'allow_mixed_trend_reversals': 'Allow measured temporary dips/rallies to reverse in a mixed daily trend, using half the normal risk budget. Reversal confirmation remains required.',
  'fresh_boundary_entries_enabled': 'Allow directional continuation beyond an observed monthly/weekly boundary only after two completed post-event closes hold beyond it with follow-through. ATR protection and positive net payoff still apply.',
+ 'short_term_trend_enabled': 'Require the proposed direction to agree with close/SMA5/SMA14, unless a measured reversal setup is confirmed. Applies symmetrically to LONG and SHORT.',
+ 'structure_entry_room_enabled': 'Defer entries aimed directly into a nearby confirmed daily support/resistance zone. Applies symmetrically to LONG and SHORT.',
+ 'structure_min_room_atr': 'Minimum ATR14 room to the nearest confirmed opposing daily swing before entry. Default 0.75 ATR.',
+ 'speed_ranking_enabled': 'Use beta and ATR percentage only to rank otherwise approved opportunities; they never select trade direction.',
+ 'preferred_beta': 'Reference beta for opportunity-speed reporting. Beta does not authorize a trade or relax a directional gate.',
+ 'high_beta_size_threshold': 'Above this beta, Risk Manager reduces allocation; it never increases allocation for high beta.',
+ 'high_beta_minimum_multiplier': 'Smallest allocation multiplier allowed for a high-beta candidate before ordinary portfolio caps are applied.',
  'conditional_mean_reversion_min_confidence': 'Research confidence required for a temporary news reaction; '
                                               'technical distance never overrides it.',
  'conditional_mean_reversion_stop_cushion_atr': 'Place the protective stop this many ATR units beyond the '
@@ -192,3 +201,8 @@ AGENT_RULE_HELP.update({
     'volume_max_vwap_distance_atr': 'Maximum distance on the proposed side of session VWAP in daily ATR units. Default 0.75. Requires completed-bar directional follow-through.',
     'volume_confidence_relaxation': 'Directional confidence reduction, maximum 0.05 (five percentage points); countertrend capped at 0.025. Effective threshold never below 0.60 or above its original value. No sizing increase.',
 })
+
+AGENT_RULE_HELP['recent_trend_enabled'] = 'Use recent 7/14-session price direction, five-session average slope and recent ranges/completed weeks for entry bias. Company quality cannot reverse it; opposing entries require measured reversals. Missing directional evidence retains legacy rules. Risk allocation never increases solely from this analysis.'
+
+AGENT_RULE_LABELS['trend_auto_confirm_enabled'] = 'Auto-confirm trend entries'
+AGENT_RULE_HELP['trend_auto_confirm_enabled'] = 'Automatically confirm recent-trend entries when required RVOL/VWAP follow-through or measured reversal checks pass. ON never bypasses missing/stale measurements, confidence, risk or broker checks. OFF holds entries needing confirmation for review, including manual submission through the same guards; it does not disable ordinary entries that need no extra confirmation. Reassessment occurs in normal research cycles, not a standing broker order.'

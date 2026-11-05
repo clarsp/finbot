@@ -1,6 +1,6 @@
 # Finbot operating contract
 
-The objective is positive net returns with explicit loss and exposure limits. This implementation is a versioned **demo experiment**, not evidence of profitability. The active strategy version is `news_reaction_v2`.
+The objective is positive net returns with explicit loss and exposure limits. This implementation is a versioned **demo experiment**, not evidence of profitability. The latest source strategy version is `news_reaction_v5`; see [CONTEXT.md](CONTEXT.md) for deployment state.
 
 ## Candidate and research workflow
 
@@ -87,7 +87,13 @@ The dashboard uses recorded verified broker equity/cash snapshots when available
 
 ## Lifecycle retention
 
-Maintenance archives never-submitted analysis hourly after **3 days** by default (`Execution → analysis_retention_days`). It includes old rejected and capacity-deferred zero-allocation analysis. It preserves broker-linked orders, persisted order references, uncertain submissions, fills, and positions. The archive stores compressed lifecycle and event records in the mounted SQLite database. It cleans active dashboard history, not the entire physical database. Administrators can archive now or restore an ID; restored entries receive a fresh retention grace period. Archives are not permanently purged automatically.
+Maintenance archives never-submitted analysis hourly after **3 days** by default (`Execution → analysis_retention_days`). It includes old rejected and capacity-deferred zero-allocation analysis. It preserves broker-linked orders, persisted order references, uncertain submissions, fills, and positions. The compressed archive remains restorable for `analysis_archive_retention_days`, **7 days** by default, then expired never-submitted archives are permanently purged. Maintenance records purged row counts and compressed bytes. Restored entries receive a fresh active-retention grace period. Deletion frees reusable SQLite pages; a separately controlled compaction is required to shrink the filesystem file.
+
+Detailed per-candidate evidence is canonical in immutable `trade_events`. The
+legacy `signals` and `agent_events` operational indexes retain compact summaries
+and lifecycle identifiers instead of repeating research, strategy and risk JSON.
+Legacy signal-polling rows expire after `operational_history_retention_days`
+(3 days by default), while the latest row per sector remains available.
 
 ## Operation and test workflow
 
@@ -432,3 +438,87 @@ bypass a missing fresh confirmation. Gate evidence includes baseline/effective
 thresholds, baseline acceptance and whether relaxation actually admitted the candidate;
 Risk Manager records confirmation and its unchanged budget multiplier. These are
 experimental qualification rules, not calibrated confidence or proven profitability.
+
+## Recent price direction — 3 November 2026
+
+`news_reaction_v5` adds `recent_price_trend_v1` from the **existing completed daily
+bars**; no extra provider or history request is added. The daily history read now
+precedes AI research. Research receives compact SMA/ATR/recent-direction evidence,
+not the full multiyear support/resistance array. The research prompt version is
+`news_market_horizon_v3`, invalidating unchanged-neutral reuse from older prompts.
+
+The existing SMA `trend_state` remains unchanged for historical comparisons,
+position management and conservative allocation. A separate `recent_trend` records:
+
+- Seven- and fourteen-trading-session close returns and displacement in daily ATR.
+- Five-session closing average and its change over five sessions in ATR units.
+- High/low ranges of the last five sessions versus the preceding five: both higher
+  means bullish structure; both lower means bearish; overlap/conflict means mixed.
+- The last five completed weekly closes, current/prior four-week average, and
+  weekly direction. Weekly confirmation requires last close > current average >
+  prior average for bullish, mirrored for bearish. A Friday resampling label later
+  than the last completed daily date is excluded, including conservatively waiting
+  on holiday-shortened weeks. The first sampled week is excluded conservatively
+  because its coverage can start partway through the week. A weekly high is never substituted for a close.
+
+At least 20 valid chronological daily sessions and a positive ATR14 are required.
+Recent direction is bullish/bearish when **both 7/14-session displacements reach
+0.5 ATR in that direction**, the five-session-average change agrees, and either
+recent high/low ranges or completed weekly direction confirms. Otherwise it is
+mixed/unavailable, explicitly recorded rather than forcing a direction. This is
+an experimental deterministic classification, not a calibrated probability.
+
+With `strategist.recent_trend_enabled=true` (default), an available directional
+recent trend determines LONG/SHORT bias for otherwise directional, eligible news
+research. Neutral/irrelevant research still cannot authorize entry. Fundamental
+metrics remain visible but neither lower nor raise confidence thresholds on this
+path; original confidence is retained as an uncalibrated research-quality
+prerequisite, never converted into a probability for the opposite trade direction.
+
+If news opposes the recent bias, fresh direction-aligned RVOL/VWAP and completed-bar
+follow-through are required before entry. This timing check uses the existing
+volume thresholds independently of whether optional volume *confidence relaxation*
+is enabled. A countertrend entry requires temporary-reaction classification, the
+existing measured mean-reversion setup and the original side-specific countertrend
+confidence threshold (no volume discount). High confidence or company quality
+alone cannot authorize reversal. Strategy and Risk Manager share these guards.
+
+Missing/mixed recent direction or a disabled control retains the prior news/SMA
+rules with an explicit fallback message. The control is exposed through existing
+GUI metadata, reporting and validated Telegram settings. This fallback does not
+invent a recent trend or make missing optional evidence an execution failure.
+
+Normal trend-following entries use `RECENT_TREND_CONTINUATION`, with existing ATR
+protection, structure targets, cost/quote/broker eligibility and prospective shadow
+tracking. Confirmed boundary-breakout and measured-reversal frameworks retain
+their own entry requirements. Allocation retains the existing SMA-based multiplier;
+an entry against recent direction is additionally capped at half allocation. Recent
+analysis never raises the budget solely by reclassifying an old mixed/opposing SMA
+state. Final submission reloads daily history and recomputes direction and entry
+guards. New decision messages and policies retain recent evidence and direction
+source. Existing v2/v3/v4 positions retain their saved policies and remain managed.
+
+Offline META #2052 regression: saved SMA ordering remains mixed, while recent
+price direction is bearish (7-session -12.87%, 14-session -13.38%). SHORT becomes
+the bias; the original bullish thesis cannot authorize LONG without reversal
+confirmation, nor SHORT without fresh opposing-news entry confirmation. The saved
+historical lifecycle is not changed or replayed into a broker order.
+
+### Strategist automatic confirmation — 3 November 2026
+
+`strategist.trend_auto_confirm_enabled=true` is the **Auto-confirm trend entries**
+checkbox. It automatically accepts a *measured* RVOL/VWAP follow-through or measured
+countertrend reversal when required by recent-trend entry rules. Confidence, risk,
+cost, fresh broker quote and execution checks still apply. Missing/stale/failed
+measurements remain unconfirmed; demo mode does not fabricate confirmation.
+
+OFF holds recent-trend entries needing confirmation for review, including requests
+through the manual submission boundary. It does not bypass the measurements or
+provide a manual approval override. Ordinary aligned entries needing no additional
+confirmation retain their existing rules. Normal research cycles reassess evidence;
+there is no standing broker order or replay of an older rejected candidate.
+
+Strategy/Risk decision messages and snapshots identify auto-confirm ON/OFF and
+`confirmed`, `awaiting_measurement`, `automatic_confirmation_disabled` or
+`not_required`. The shared guard rechecks the current setting at final submission.
+GUI and validated Telegram controls can change it later.

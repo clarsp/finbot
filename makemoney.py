@@ -1,3 +1,4 @@
+from recent_trend import recent_trend_note
 from volume_context import load_volume_context, adjusted_rules, decision_note
 from brokers.factory import demo_execution_enabled, account_lease_name
 from brokers.contracts import instrument_blockers, validate_runtime_binding
@@ -18,7 +19,7 @@ from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from trading_workflow import VERSION as WORKFLOW_VERSION, MANAGED_VERSIONS, size_order, mean_reversion_setup, reaction_from_bars, exit_reason, select_entry_side, continuation_setup
+from trading_workflow import VERSION as WORKFLOW_VERSION, MANAGED_VERSIONS, size_order, mean_reversion_setup, reaction_from_bars, exit_reason, select_entry_side, continuation_setup, recent_entry_requirements
 import workflow_store
 import broker_recovery
 import performance_analysis
@@ -84,6 +85,8 @@ DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
         "enabled": True,
         "status": "idle",
         "min_confidence": 0.7,
+        "recent_trend_enabled": True,
+        "trend_auto_confirm_enabled": True,
         "volume_confirmation_enabled": True,
         "volume_min_rvol": 1.5,
         "volume_max_vwap_distance_atr": 0.75,
@@ -97,6 +100,11 @@ DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
         "conditional_mean_reversion_stop_cushion_atr": 0.25,
         "allow_mixed_trend_reversals": True,
         "fresh_boundary_entries_enabled": True,
+        "short_term_trend_enabled": True,
+        "structure_entry_room_enabled": True,
+        "structure_min_room_atr": 0.75,
+        "speed_ranking_enabled": True,
+        "preferred_beta": 1.0,
         "strong_fundamentals_min_revenue_growth_pct": 15.0,
         "strong_fundamentals_min_net_profit_margin_pct": 20.0,
         "strong_fundamentals_max_debt_to_equity": 1.0,
@@ -125,6 +133,8 @@ DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
         "max_gross_exposure_pct": float(os.getenv("FINBOT_MAX_GROSS_EXPOSURE_PCT", "1.0")),
         "max_open_positions": int(os.getenv("FINBOT_MAX_OPEN_POSITIONS", "30")),
         "max_single_position_exposure_pct": 0.10,
+        "high_beta_size_threshold": 1.5,
+        "high_beta_minimum_multiplier": 0.5,
         "stress_gap_pct": 0.05,
         "max_stressed_loss_pct": 0.10,
         "sector_exposure_enabled": False,
@@ -146,7 +156,7 @@ DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
         "estimated_roundtrip_cost_bps": 10.0,
         "estimated_financing_annual_pct": 8.0,
     },
-    "execution": {"enabled": True, "status": "idle", "paper_trading_only": True, "max_trade_value": 2500, "max_trades_per_cycle": 2, "allowed_side": ["LONG", "SHORT"], "max_order_units": 5.0, "max_order_spend_usd": 200.0, "analysis_retention_days": 3, "max_research_age_hours": 24.0},
+    "execution": {"enabled": True, "status": "idle", "paper_trading_only": True, "max_trade_value": 2500, "max_trades_per_cycle": 2, "allowed_side": ["LONG", "SHORT"], "max_order_units": 5.0, "max_order_spend_usd": 200.0, "analysis_retention_days": 3, "analysis_archive_retention_days": 7, "operational_history_retention_days": 3, "max_research_age_hours": 24.0},
     "position_manager": {**position_policy.TRAILING_DEFAULTS, "profit_trailing_mode": "scheduled", "profit_trailing_enabled": False, "profit_review_exits_enabled": True, "profit_exit_min_net_usd": 1.0, "profit_exit_min_margin_pct": 0.5, "profit_exit_slippage_bps": 10.0, "pending_entry_max_minutes": 60.0, "recovery_max_attempts": 3, "recovery_initial_check_seconds": 60, "recovery_max_check_seconds": 900, "recovery_escalate_hours": 2.0, "enabled": True, "status": "idle"},
     "performance_analyst": {"enabled": True, "status": "idle", "minimum_closed_positions": 20},
 }
@@ -271,11 +281,20 @@ def load_news_reaction(symbol: str, headlines: list) -> dict:
 
 @permission('operator')
 def cleanup_stale_analysis() -> dict:
-    days = int(get_agent_rules()["execution"].get("analysis_retention_days", 3))
+    rules=get_agent_rules()["execution"]
+    days = int(rules.get("analysis_retention_days", 3))
+    archive_days=int(rules.get("analysis_archive_retention_days",7))
+    operational_days=int(rules.get('operational_history_retention_days',3))
     conn = get_connection()
     try:
-        ids = workflow_store.archive_analysis(conn, days)
-        return {"archived": len(ids), "retention_days": days}
+        preview=workflow_store.purge_archived_analysis(conn,archive_days)
+        ids = workflow_store.archive_analysis(conn, days, archive_retention_days=archive_days)
+        operational=workflow_store.purge_operational_history(conn,operational_days,apply=True)
+        conn.commit()
+        return {"archived": len(ids), "retention_days": days,"purged":preview["count"],
+                "purged_compressed_bytes":preview["compressed_bytes"],"archive_retention_days":archive_days,
+                "operational_rows_purged":operational['count'],"operational_payload_bytes_purged":operational['payload_bytes'],
+                "operational_history_retention_days":operational_days}
     finally:
         conn.close()
 
@@ -1501,22 +1520,28 @@ def update_agent_rules(agent_name: str, new_rules: Dict[str, Any]) -> Dict[str, 
     merged = dict(current.get(agent_name, DEFAULT_AGENT_RULES.get(agent_name, {})))
     merged.update(new_rules)
     for key, value in new_rules.items():
-        if key in {'volume_confirmation_enabled', 'allow_mixed_trend_reversals', 'fresh_boundary_entries_enabled'} and not isinstance(value, bool):
+        if key in {'trend_auto_confirm_enabled', 'recent_trend_enabled', 'volume_confirmation_enabled', 'allow_mixed_trend_reversals', 'fresh_boundary_entries_enabled'} and not isinstance(value, bool):
             raise ValueError(f'{key} must be true or false.')
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             if not math.isfinite(float(value)):
                 raise ValueError(f"{key} must be finite.")
-            if key in {"max_order_units", "max_order_spend_usd", "analysis_retention_days", "max_research_age_hours", "stop_atr_multiple", "target_reward_risk", "max_target_atr_multiple", "max_open_positions", "risk_per_trade_pct", "max_total_risk_pct", "max_gross_exposure_pct", "max_single_position_exposure_pct", "max_stressed_loss_pct", "max_sector_exposure_pct", "news_max_hold_hours", "mean_reversion_max_hold_hours", "conditional_mean_reversion_min_atr_multiple", "conditional_mean_reversion_confirmation_atr", "conditional_mean_reversion_stop_cushion_atr"} and float(value) <= 0:
+            if key in {"max_order_units", "max_order_spend_usd", "analysis_retention_days", "analysis_archive_retention_days", "operational_history_retention_days", "max_research_age_hours", "stop_atr_multiple", "target_reward_risk", "max_target_atr_multiple", "max_open_positions", "risk_per_trade_pct", "max_total_risk_pct", "max_gross_exposure_pct", "max_single_position_exposure_pct", "max_stressed_loss_pct", "max_sector_exposure_pct", "news_max_hold_hours", "mean_reversion_max_hold_hours", "conditional_mean_reversion_min_atr_multiple", "conditional_mean_reversion_confirmation_atr", "conditional_mean_reversion_stop_cushion_atr"} and float(value) <= 0:
                 raise ValueError(f"{key} must be greater than zero.")
             if key in {"minimum_reward_risk", "stress_gap_pct", "estimated_roundtrip_cost_bps", "estimated_financing_annual_pct"} and float(value) < 0:
                 raise ValueError(f"{key} cannot be negative.")
             if "confidence" in key and not 0 <= float(value) <= 1:
                 raise ValueError("Confidence thresholds must be between zero and one.")
-    for key in ("default_leverage", "max_leverage", "max_open_positions", "max_trades_per_cycle", "analysis_retention_days"):
+    for key in ("default_leverage", "max_leverage", "max_open_positions", "max_trades_per_cycle", "analysis_retention_days", "analysis_archive_retention_days", "operational_history_retention_days"):
         if key in merged and (float(merged[key]) < 1 or not float(merged[key]).is_integer()):
             raise ValueError(f"{key} must be a positive integer.")
     if int(merged.get("analysis_retention_days", 3)) > 365:
         raise ValueError("Analysis retention cannot exceed 365 days.")
+    if int(merged.get("analysis_archive_retention_days",7)) > 365:
+        raise ValueError("Archived analysis retention cannot exceed 365 days.")
+    if int(merged.get("operational_history_retention_days",7)) > 365:
+        raise ValueError("Operational history retention cannot exceed 365 days.")
+    if int(merged.get("analysis_archive_retention_days",7)) < int(merged.get("analysis_retention_days",3)):
+        raise ValueError("Archived analysis retention must be at least the active analysis retention.")
     if agent_name == 'strategist':
         for key, low, high in [('volume_min_rvol', 1, 10), ('volume_max_vwap_distance_atr', .05, 2), ('volume_confidence_relaxation', 0, .05)]:
             value = merged.get(key)
@@ -1582,7 +1607,7 @@ def record_agent_event(
             action,
             message,
             decision,
-            json.dumps(details or {}, sort_keys=True),
+            json.dumps(workflow_store.compact_operational_detail(details or {}), sort_keys=True),
         ),
     )
     conn.commit()
@@ -2572,7 +2597,7 @@ def save_signal(sector: str, signal: str, catalyst: str, confidence: float, payl
     conn = get_connection()
     conn.execute(
         "INSERT INTO signals (sector, signal, catalyst, confidence, payload) VALUES (?, ?, ?, ?, ?)",
-        (sector, signal, catalyst, confidence, json.dumps(payload, sort_keys=True)),
+        (sector, signal, catalyst, confidence, json.dumps(workflow_store.compact_operational_detail(payload), sort_keys=True)),
     )
     conn.commit()
     conn.close()
@@ -3080,6 +3105,7 @@ class StrategistAgent:
         )
         recent_news = market_data.get("recent_news", [])
         decision_gate = evaluate_strategist_gate(tech_data, position, recent_news, rules, risk_rules=get_agent_rules().get('risk_manager'))
+        trend_note = decision_gate.get("decision_message", "")
         decision = "accepted" if decision_gate["accepted"] and leverage > 0 else "rejected"
         if leverage <= 0:
             decision_gate["rejection_reasons"].append("Proposed leverage is not positive.")
@@ -3115,7 +3141,7 @@ class StrategistAgent:
                 f"Strategist approved {position} at {float(tech_data.get('confidence', 0.0)):.0%} confidence."
                 if decision == "accepted"
                 else f"Strategist rejected {position}: {' '.join(decision_gate['rejection_reasons'])}"
-            ) + decision_note(decision_gate.get("volume_confirmation")),
+            ) + decision_note(decision_gate.get("volume_confirmation")) + trend_note,
             decision,
             payload,
         )
@@ -3211,6 +3237,7 @@ class RiskManagerAgent:
         if strategy.get("position") not in execution_rules.get("allowed_side", ["LONG", "SHORT"]):
             execution_reasons.append("The proposed direction is disabled in Execution settings.")
 
+        recent_check = recent_entry_requirements(candidate, strategy.get("position"), all_rules.get("strategist", DEFAULT_AGENT_RULES["strategist"]))
         daily_trend = candidate.get("daily_trend_context") or {}
         market_session = candidate.get("market_session_context") or {}
         trend_state = str(daily_trend.get("trend_state") or "unknown").lower()
@@ -3221,13 +3248,13 @@ class RiskManagerAgent:
             trend_alignment = "opposes_news_direction"
             required_confidence = float(strategy_rules.get("countertrend_long_min_confidence", 0.85))
             risk_budget_multiplier = 0.5
-            if float(candidate.get("confidence") or 0.0) < required_confidence:
+            if not recent_check["active"] and float(candidate.get("confidence") or 0.0) < required_confidence:
                 reasons.append(f"Risk Manager rejects the bullish countertrend setup below {required_confidence:.0%} research confidence.")
         elif strategy.get("position") == "SHORT" and trend_state == "bullish":
             trend_alignment = "opposes_news_direction"
             required_confidence = float(strategy_rules.get("countertrend_short_min_confidence", 0.85))
             risk_budget_multiplier = 0.5
-            if float(candidate.get("confidence") or 0.0) < required_confidence:
+            if not recent_check["active"] and float(candidate.get("confidence") or 0.0) < required_confidence:
                 reasons.append(f"Risk Manager rejects the bearish countertrend setup below {required_confidence:.0%} research confidence.")
         elif trend_state == "mixed":
             trend_alignment = "mixed_or_not_directional"
@@ -3236,6 +3263,22 @@ class RiskManagerAgent:
             trend_alignment = "confirms_news_direction"
             risk_budget_multiplier = 1.0
 
+        if recent_check['active']:
+            volume_confirmation['thresholds'] = ({'min_confidence': volume_confirmation['thresholds']['min_confidence']}
+                if not recent_check['countertrend'] and 'min_confidence' in volume_confirmation['thresholds'] else {})
+            reasons.extend(recent_check['reasons'])
+            if recent_check['countertrend']:
+                risk_budget_multiplier = min(risk_budget_multiplier, .5)
+        beta = (candidate.get('fundamentals') or {}).get('beta')
+        beta_risk_multiplier = 1.0
+        try:
+            beta_value = float(beta)
+            beta_threshold = float(rules.get('high_beta_size_threshold', 1.5))
+            if math.isfinite(beta_value) and beta_value > beta_threshold:
+                beta_risk_multiplier = max(float(rules.get('high_beta_minimum_multiplier', .5)), beta_threshold / beta_value)
+                risk_budget_multiplier = min(risk_budget_multiplier, beta_risk_multiplier)
+        except (TypeError, ValueError):
+            beta = None
         ticker = str(candidate.get("ticker") or "").upper()
         instrument_id = str(instrument.get("instrument_id") or "")
         matching_position = next((position for position in positions if (
@@ -3298,14 +3341,19 @@ class RiskManagerAgent:
             "atr14": atr14, "daily_trend_context": daily_trend, "daily_trend_alignment": trend_alignment,
             "market_session_context": market_session,
             "strategy_notes": strategy.get("notes"), "strategy_framework": strategy.get("decision_gate", {}).get("strategy_framework"),
-            "volume_confirmation": volume_confirmation, "risk_budget_multiplier": risk_budget_multiplier, "leverage": int(approved_leverage) if str(approved_leverage).replace(".", "", 1).isdigit() else None,
+            "recent_trend_decision": recent_check, "volume_confirmation": volume_confirmation, "risk_budget_multiplier": risk_budget_multiplier,
+            "opportunity_speed": {"beta": beta, "atr_pct": daily_trend.get("atr_pct"), "beta_risk_multiplier": beta_risk_multiplier,
+                                  "role": "ranking and downside sizing only; never directional permission"},
+            "leverage": int(approved_leverage) if str(approved_leverage).replace(".", "", 1).isdigit() else None,
             "broker_order_submitted": False,
             "broker_instrument": instrument,
             "broker_quote": quote,
         }
         volume_confirmation.update({key: strategy.get('decision_gate', {}).get('volume_confirmation', {}).get(key)
                                     for key in ('baseline_accepted', 'relaxation_used')})
-        result['decision_message'] = ("; ".join(reasons) if reasons else "Portfolio, position, quote, and ATR risk checks passed; no order was submitted.") + decision_note(volume_confirmation)
+        speed_note = (f" Opportunity speed: beta {float(beta):.2f}, ATR {float(daily_trend.get('atr_pct')):.2f}% of price; volatility sizing multiplier {beta_risk_multiplier:.2f}."
+                      if beta is not None and daily_trend.get('atr_pct') is not None else "")
+        result['decision_message'] = ("; ".join(reasons) if reasons else "Portfolio, position, quote, and ATR risk checks passed; no order was submitted.") + decision_note(volume_confirmation) + recent_trend_note(daily_trend.get("recent_trend"), applied=recent_check["active"]) + recent_check.get("confirmation_message", "") + speed_note
         record_agent_event(
             "risk_manager", "completed", "news_candidate_portfolio_risk",
             result['decision_message'],
@@ -3640,7 +3688,11 @@ def evaluate_strategist_gate(
     risk_rules: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     baseline_rules = rules
+    recent_check = recent_entry_requirements(candidate, proposed_position, rules)
     rules, volume_confirmation = adjusted_rules(candidate, proposed_position, rules)
+    if recent_check['active']:
+        volume_confirmation['thresholds'] = ({'min_confidence': volume_confirmation['thresholds']['min_confidence']}
+            if not recent_check['countertrend'] and 'min_confidence' in volume_confirmation['thresholds'] else {})
     rejection_reasons = []
     confidence = float(candidate.get("confidence", 0.0))
     base_threshold = float(baseline_rules.get("min_confidence", 0.7))
@@ -3757,6 +3809,20 @@ def evaluate_strategist_gate(
     fundamental_confirmation = fundamentals_align and company_news_supports_position
 
     daily_trend = candidate.get("daily_trend_context") or {}
+    short_term_state = str(daily_trend.get("short_term_trend_state") or "unknown").lower()
+    expected_short_term = "bullish" if proposed_position == "LONG" else "bearish"
+    short_term_alignment = ("unavailable" if short_term_state not in {"bullish", "bearish", "mixed"}
+                            else "confirms" if short_term_state == expected_short_term
+                            else "mixed" if short_term_state == "mixed" else "opposes")
+    from price_structure import entry_structure_room
+    structure_room = {"available": False, "qualified": True, "reason": "Structure-room gate disabled."}
+    entry_quote = quote.get("ask" if proposed_position == "LONG" else "bid") or candidate.get("price")
+    if rules.get("structure_entry_room_enabled", True) and entry_quote and daily_trend.get("atr14"):
+        structure_room = entry_structure_room(
+            proposed_position, entry_quote, daily_trend["atr14"], daily_trend.get("price_structure"),
+            rules.get("structure_min_room_atr", .75))
+        if structure_room.get("available") and not structure_room.get("qualified"):
+            rejection_reasons.append(structure_room["reason"])
     if fundamentals.get('instrument_family')=='sp500':
         if (candidate.get('ai_analysis') or {}).get('company_relevance')!='direct':
             rejection_reasons.append('S&P 500 entries require direct index-wide market evidence, not ticker association or fund-issuer news.')
@@ -3772,15 +3838,24 @@ def evaluate_strategist_gate(
         (proposed_position == "LONG" and (trend_state == 'bullish' or mixed_allowed or (trend_state == 'bearish' and opposed_reversal)) and "bearish" in company_news_sentiments)
         or (proposed_position == "SHORT" and (trend_state == 'bearish' or mixed_allowed or (trend_state == 'bullish' and opposed_reversal)) and "bullish" in company_news_sentiments)
     )
+    if recent_check['active']:
+        conditional_setup = recent_check['countertrend']
     setup_info = mean_reversion_setup(candidate, proposed_position, rules) if conditional_setup else {}
     conditional_approved = bool(conditional_setup and setup_info.get("approved"))
+    if rules.get("short_term_trend_enabled", True) and short_term_alignment == "opposes" and not conditional_approved:
+        rejection_reasons.append(
+            f"Entry deferred: SMA5/SMA14 near-term direction is {short_term_state} and opposes the proposed {proposed_position}; no measured reversal is confirmed."
+        )
     breakout_info = continuation_setup(candidate, proposed_position, rules, risk_rules) if not conditional_setup else {}
     conditional_failed_variance = bool(conditional_setup and not conditional_approved)
     variance_available = bool(setup_info.get("atr14"))
     variance_distance = setup_info.get("distance")
     conditional_atr_multiple = float(rules.get("conditional_mean_reversion_min_atr_multiple", 1.25))
 
-    if conditional_approved:
+    if recent_check['active']:
+        required_confidence = recent_check['required_confidence']
+        rejection_reasons.extend(recent_check['reasons'])
+    elif conditional_approved:
         # A sufficiently extended price in the prevailing daily trend qualifies
         # this news/trend conflict for the explicit conditional mean-reversion track.
         required_confidence = float(rules.get("conditional_mean_reversion_min_confidence", 0.7))
@@ -3825,14 +3900,14 @@ def evaluate_strategist_gate(
     elif proposed_position == "LONG" and trend_state == "bearish":
         trend_alignment = "opposes_news_direction"
         required_trend_confidence = float(rules.get("countertrend_long_min_confidence", 0.85))
-        if not conditional_approved and confidence < required_trend_confidence:
+        if not recent_check["active"] and not conditional_approved and confidence < required_trend_confidence:
             rejection_reasons.append(
                 f"Bullish news conflicts with the bearish daily SMA trend; countertrend confidence must be at least {required_trend_confidence:.0%}."
             )
     elif proposed_position == "SHORT" and trend_state == "bullish":
         trend_alignment = "opposes_news_direction"
         required_trend_confidence = float(rules.get("countertrend_short_min_confidence", 0.85))
-        if not conditional_approved and confidence < required_trend_confidence:
+        if not recent_check["active"] and not conditional_approved and confidence < required_trend_confidence:
             rejection_reasons.append(
                 f"Bearish news conflicts with the bullish daily SMA trend; countertrend confidence must be at least {required_trend_confidence:.0%}."
             )
@@ -3843,9 +3918,15 @@ def evaluate_strategist_gate(
     else:
         trend_alignment = "mixed_or_not_directional"
 
+    if recent_check['active']:
+        trend_alignment = 'opposes_recent_price_trend' if recent_check['countertrend'] else 'confirms_recent_price_trend'
     entry_floor = entry_ceiling = None
     framework = 'NEWS_BREAKOUT_CONTINUATION' if breakout_info.get('approved') else None
     notes = 'STRATEGY: NEWS_BREAKOUT_CONTINUATION; confirmed range breakout with two-bar follow-through.' if framework else None
+    if recent_check['active'] and not recent_check['countertrend'] and not breakout_info.get('approved'):
+        framework = 'RECENT_TREND_CONTINUATION'
+        breakout_info = {'approved': not recent_check['reasons'], 'framework': framework, 'side': proposed_position}
+        notes = 'STRATEGY: RECENT_TREND_CONTINUATION; direction from recent completed price history; fundamentals are context.'
     if conditional_approved:
         framework = "CONDITIONAL_MEAN_REVERSION"
         entry_floor = setup_info["entry_zone_floor"]
@@ -3884,8 +3965,17 @@ def evaluate_strategist_gate(
         "company_news_supports_position": company_news_supports_position,
         "company_news_opposes_position": company_news_opposes_position,
         "fundamental_confirmation": fundamental_confirmation,
+        "fundamental_evidence_role": "context_only" if recent_check["active"] else "legacy_confidence_gates",
+        "recent_trend_decision": recent_check,
+        "decision_message": recent_trend_note(daily_trend.get("recent_trend"), applied=recent_check["active"])
+            + recent_check.get("confirmation_message", "")
+            + f" Near-term direction: SMA5 {daily_trend.get('sma5')}, SMA14 {daily_trend.get('sma14')} = {short_term_state} ({short_term_alignment} {proposed_position})."
+            + ((" Structure room: " + structure_room.get("reason", "")) if structure_room.get("available") else ""),
         "daily_trend_state": trend_state,
         "daily_trend_alignment": trend_alignment,
+        "short_term_trend_state": short_term_state,
+        "short_term_trend_alignment": short_term_alignment,
+        "structure_entry_room": structure_room,
         "strategy_framework": framework,
         "entry_setup": setup_info if conditional_setup else breakout_info,
         "conditional_mean_reversion": {
@@ -3931,14 +4021,29 @@ def calculate_candidate_success_score(
         "company_headline": bool(gate.get("company_news_supports_position")),
         "multi_horizon_trend": bool(trend_agrees),
     }
-    score = 0.70 * confidence + sum(confirmations.values()) * 0.10
+    fundamentals = candidate.get("fundamentals") or {}
+    daily = candidate.get("daily_trend_context") or {}
+    beta = fundamentals.get("beta")
+    atr_pct = daily.get("atr_pct")
+    speed_available = isinstance(beta, (int, float)) or isinstance(atr_pct, (int, float))
+    # Speed affects ordering, never direction. Cap it so a volatile name cannot
+    # outrank materially better research and confirmations by volatility alone.
+    speed_score = 0.0
+    if speed_available:
+        beta_component = min(1.0, max(0.0, float(beta or 0) / 2.0))
+        atr_component = min(1.0, max(0.0, float(atr_pct or 0) / 5.0))
+        speed_score = .5 * beta_component + .5 * atr_component
+    score = 0.65 * confidence + sum(confirmations.values()) * 0.10 + 0.05 * speed_score
     return {
         "score": round(min(1.0, score), 4),
         "components": {
             "research_confidence": round(confidence, 4),
             **confirmations,
+            "opportunity_speed": round(speed_score, 4) if speed_available else None,
+            "beta": beta,
+            "atr_pct": atr_pct,
         },
-        "method": "70% research confidence + 10% each for direction-aligned fundamentals, a supporting company headline, and a supporting multi-horizon trend; ranking heuristic, not calibrated probability.",
+        "method": "65% research confidence + 10% each for direction-aligned fundamentals, a supporting company headline, and a supporting multi-horizon trend + 5% opportunity speed from beta and ATR%; volatility never selects direction; ranking heuristic, not calibrated probability.",
     }
 
 
@@ -4487,7 +4592,13 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
         volume_context = volume_by_symbol.get(ticker)
         if volume_context is None:
             volume_context = await asyncio.to_thread(load_volume_context, ticker)
-        trends = {**trends, "volume_context": volume_context, "news_reaction": reaction, "market_session_context": market_session_context}
+        try:
+            bars = await asyncio.to_thread(load_daily_bars, ticker, "5y")
+        except Exception as error:
+            logger.info("Historical price context unavailable for %s: %s", ticker, type(error).__name__)
+            bars = None
+        daily_trend_context = evaluate_latest_signal(ticker, bars)
+        trends = {**trends, "daily_trend_context": {k: v for k, v in daily_trend_context.items() if k != "price_structure"}, "volume_context": volume_context, "news_reaction": reaction, "market_session_context": market_session_context}
         ai_result = await researcher_agent.analyze_news_candidate(
             ticker=ticker,
             company_name=company_name,
@@ -4529,14 +4640,8 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
             "relevance_tickers": [ticker],
         } for article in headlines]
         quote_price = quote.get("ask") or quote.get("price")
-        try:
-            bars = await asyncio.to_thread(load_daily_bars, ticker, "5y")
-        except Exception as error:
-            logger.info("Historical price context unavailable for %s: %s", ticker, type(error).__name__)
-            bars = None
         atr14 = float(bars.iloc[-1]["atr14"]) if bars is not None and not bars.empty else None
         atr_timestamp = bars.index[-1].isoformat() if bars is not None and not bars.empty else None
-        daily_trend_context = evaluate_latest_signal(ticker, bars)
         if not daily_trend_context.get("available"):
             daily_trend_context = {**daily_trend_context, "trend_state": "unknown"}
         provisional_side = "LONG" if signal == "bullish" else "SHORT"
@@ -4767,7 +4872,7 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
             strategy_result["decision"],
             "; ".join(strategy_result["decision_gate"].get("rejection_reasons") or [
                 f"Strategist proposed {strategy_result.get('position')} with leverage {strategy_result.get('leverage')}x."
-            ]) + decision_note(strategy_result["decision_gate"].get("volume_confirmation")),
+            ]) + decision_note(strategy_result["decision_gate"].get("volume_confirmation")) + strategy_result["decision_gate"].get("decision_message", ""),
             strategy_result,
         )
         record_trade_event(
@@ -5101,6 +5206,7 @@ async def _place_analysis_candidate_demo_order_once(trade_id: int, refresh_budge
               "requested_entry": entry, "stop_offset": risk["proposed_stop"]-entry,
               "target_offset": risk["proposed_take_profit"]-entry,
               "target_selection": risk.get("protection", {}).get("target_selection", {}),
+              "recent_trend_decision": strategy["decision_gate"].get("recent_trend_decision") or {},
               "mean_reversion": strategy["decision_gate"].get("conditional_mean_reversion") or {}}
     plan = RiskManagerAgent().build_shadow_plan(risk, policy, instrument['instrument_id'])
     if plan:
@@ -5120,9 +5226,9 @@ async def _place_analysis_candidate_demo_order_once(trade_id: int, refresh_budge
         raise ValueError("This candidate has already been submitted or changed; refresh the lifecycle.")
 
     record_trade_event(trade_id, "strategy", "strategist", "completed", "accepted",
-                       "Fresh demo-order strategy recheck passed." + decision_note(strategy["decision_gate"].get("volume_confirmation")), {**strategy, "candidate_context": candidate})
+                       "Fresh demo-order strategy recheck passed." + decision_note(strategy["decision_gate"].get("volume_confirmation")) + strategy["decision_gate"].get("decision_message", ""), {**strategy, "candidate_context": candidate})
     record_trade_event(trade_id, "risk", "risk_manager", "completed", "accepted",
-                       "Fresh account, positions, quote, ATR, sizing, and stop checks passed." + decision_note(risk.get("volume_confirmation")), risk)
+                       risk.get("decision_message") or "Fresh account, positions, quote, ATR, sizing, and stop checks passed.", risk)
     attempted_submission = False
     try:
         if not is_fresh_broker_quote(quote):
@@ -5432,7 +5538,7 @@ async def run_trading_cycle(use_openai: Optional[bool] = None) -> Dict[str, Any]
         )
         record_trade_event(
             trade_id, "strategy", "strategist", "completed", strategy_decision,
-            strategy_message + decision_note(decision_gate.get("volume_confirmation")),
+            strategy_message + decision_note(decision_gate.get("volume_confirmation")) + decision_gate.get("decision_message", ""),
             {**strategy, "stop_loss_price": stop_loss_price, "take_profit_price": take_profit_price},
         )
         trade_result["side"] = strategy["position"]

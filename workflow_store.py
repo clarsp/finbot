@@ -3,10 +3,62 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
 import json
 import time
 import uuid
 import zlib
+
+OPERATIONAL_DETAIL_LIMIT=16*1024
+OPERATIONAL_SUMMARY_KEYS={'trade_id','ticker','symbol','company_name','signal','confidence','status','decision',
+    'analysis_status','analysis_decision','execution_status','execution_reasons','reasons','mode','strategy',
+    'candidate_pool_size','approved_candidate_count','opened_count','max_trades_per_cycle','selection_rank',
+    'selection_score','automation_enabled','broker_order_submitted','neutral_reason'}
+
+
+def compact_operational_detail(value):
+    """Keep operational indexes small; trade_events remain the canonical evidence log."""
+    encoded=json.dumps(value or {},sort_keys=True,separators=(',',':'),default=str).encode()
+    if len(encoded)<=OPERATIONAL_DETAIL_LIMIT:return value or {}
+    source=value if isinstance(value,dict) else {}
+    summary={key:source[key] for key in OPERATIONAL_SUMMARY_KEYS if key in source and
+             (source[key] is None or isinstance(source[key],(str,int,float,bool)) or
+              len(json.dumps(source[key],default=str))<=2048)}
+    trades=source.get('trades')
+    if isinstance(trades,list):
+        summary['trades']=[{key:item.get(key) for key in ('trade_id','symbol','side','status','broker_order_submitted','reason') if key in item}
+                           for item in trades[:100] if isinstance(item,dict)]
+    summary['evidence_storage']='trade_events'
+    summary['operational_compaction']={'original_bytes':len(encoded),'sha256':hashlib.sha256(encoded).hexdigest(),
+        'omitted_keys':sorted(str(key) for key in source if key not in summary)}
+    return summary
+
+
+def compact_operational_history(conn, *, apply=False):
+    """Preview/apply removal of duplicated research/cycle JSON outside trade_events."""
+    candidates=[];before=after=0
+    for table,column,where in (('signals','payload','length(payload)>?'),
+            ('agent_events','details',"action IN ('dynamic_news_research','news_strategy_cycle') AND length(details)>?")):
+        for row in conn.execute(f'SELECT id,{column} value FROM {table} WHERE {where}',(OPERATIONAL_DETAIL_LIMIT,)):
+            try:value=json.loads(row['value'] or '{}')
+            except (TypeError,ValueError):continue
+            compact=json.dumps(compact_operational_detail(value),sort_keys=True)
+            if len(compact)>=len(row['value']):continue
+            candidates.append((table,int(row['id']),len(row['value']),len(compact)))
+            before+=len(row['value']);after+=len(compact)
+            if apply:conn.execute(f'UPDATE {table} SET {column}=? WHERE id=?',(compact,row['id']))
+    return {'rows':len(candidates),'before_bytes':before,'after_bytes':after,'reclaimable_bytes':before-after,
+            'applied':bool(apply),'tables':{table:sum(1 for item in candidates if item[0]==table) for table in ('signals','agent_events')}}
+
+
+def purge_operational_history(conn, retention_days=7, now=None, *, apply=False):
+    """Expire legacy signal polling rows; keep the newest row for each sector."""
+    from datetime import datetime,timedelta,timezone
+    now=now or datetime.now(timezone.utc);cutoff=(now-timedelta(days=int(retention_days))).strftime('%Y-%m-%d %H:%M:%S')
+    predicate='created_at<? AND id NOT IN (SELECT max(id) FROM signals GROUP BY sector)'
+    count,payload_bytes=conn.execute(f'SELECT count(*),coalesce(sum(length(payload)),0) FROM signals WHERE {predicate}',(cutoff,)).fetchone()
+    if apply and count:conn.execute(f'DELETE FROM signals WHERE {predicate}',(cutoff,))
+    return {'count':int(count),'payload_bytes':int(payload_bytes),'retention_days':int(retention_days),'cutoff':cutoff,'applied':bool(apply)}
 
 
 def ensure_schema(conn):
@@ -86,11 +138,34 @@ async def lease(connection_factory, name: str):
             c.close()
 
 
-def archive_analysis(conn, retention_days=3, now=None):
-    """Hide old never-submitted analysis while retaining a compressed restore copy."""
+def purge_archived_analysis(conn, retention_days=7, now=None, *, apply=False, basis='archived_at'):
+    """Preview or purge expired never-submitted archives by original lifecycle age."""
+    from datetime import datetime, timedelta, timezone
+    if not 1 <= int(retention_days) <= 365:
+        raise ValueError("Archived analysis retention must be 1–365 days.")
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=int(retention_days))).strftime("%Y-%m-%d %H:%M:%S")
+    if basis not in {'archived_at','created_at'}:raise ValueError('Archive purge basis must be archived_at or created_at.')
+    expired=[];compressed_bytes=0
+    for row in conn.execute("SELECT trade_id,archived_at,payload FROM archived_analysis ORDER BY trade_id"):
+        value=row['archived_at']
+        if basis=='created_at':
+            content=json.loads(zlib.decompress(row["payload"]));value=(content.get('trade') or {}).get('created_at')
+        if str(value or "") < cutoff:
+            expired.append(int(row["trade_id"]));compressed_bytes+=len(row["payload"])
+    if apply and expired:
+        conn.executemany("DELETE FROM archived_analysis WHERE trade_id=?",((trade_id,) for trade_id in expired))
+    return {"count":len(expired),"trade_ids":expired,"compressed_bytes":compressed_bytes,
+            "retention_days":int(retention_days),"cutoff":cutoff,"basis":basis,"applied":bool(apply)}
+
+
+def archive_analysis(conn, retention_days=3, now=None, archive_retention_days=7):
+    """Hide recent never-submitted analysis, then purge it after the restore window."""
     from datetime import datetime, timedelta, timezone
     if not 1 <= int(retention_days) <= 365:
         raise ValueError("Analysis retention must be 1–365 days.")
+    if int(archive_retention_days)<int(retention_days):
+        raise ValueError("Archived analysis retention must be at least the active analysis retention.")
     now = now or datetime.now(timezone.utc)
     cutoff = (now - timedelta(days=int(retention_days))).strftime("%Y-%m-%d %H:%M:%S")
     archived = []
@@ -112,7 +187,9 @@ def archive_analysis(conn, retention_days=3, now=None):
         conn.execute("DELETE FROM trade_events WHERE trade_id=?", (trade["id"],))
         conn.execute("DELETE FROM trades WHERE id=?", (trade["id"],))
         archived.append(trade["id"])
-    conn.execute("INSERT INTO maintenance_runs(action,details) VALUES ('archive_analysis',?)", (json.dumps({"count": len(archived), "retention_days": retention_days}),))
+    purged=purge_archived_analysis(conn,archive_retention_days,now,apply=True)
+    conn.execute("INSERT INTO maintenance_runs(action,details) VALUES ('archive_analysis',?)", (json.dumps({"count": len(archived), "retention_days": retention_days,
+        "purged":purged["count"],"purged_compressed_bytes":purged["compressed_bytes"],"archive_retention_days":archive_retention_days}),))
     conn.commit()
     return archived
 
