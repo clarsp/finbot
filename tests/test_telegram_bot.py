@@ -102,12 +102,32 @@ class TelegramTests(unittest.TestCase):
 
     def test_suspended_and_viewer_permissions_are_enforced(self):
         with app.access.service_request('telegram-viewer'):
-            self.assertIn('automation_enabled',asyncio.run(tg.answer(app,'/status')))
+            self.assertIn('New demo entries:',asyncio.run(tg.answer(app,'/status')))
             with self.assertRaises(PermissionError):asyncio.run(tg.answer(app,'/pause'))
         app.set_user_suspended('telegram-owner',True)
         self.process('/status')
         self.assertIn('suspended',self.reply())
         self.assertIsNone(app.access.identity())
+
+    def test_status_reports_executed_open_and_broker_confirmed_closed_trades(self):
+        open_id=self.trade()
+        self.update(open_id,status='OPEN',broker_position_id='open-position',
+                    opened_at='2026-10-27T09:00:00+00:00')
+        closed_id=self.trade()
+        self.update(closed_id,status='CLOSED',broker_position_id='closed-position',
+                    opened_at='2026-10-27T10:00:00+00:00',
+                    closed_at='2026-10-27T12:00:00+00:00')
+        c=app.get_connection()
+        c.execute('INSERT INTO broker_closed_positions VALUES (?,?,?,?,?)',
+                  ('closed-position','2026-10-27T12:00:00+00:00',7,0,'{}'))
+        c.commit();c.close()
+        with app.access.service_request('telegram-owner'), patch.object(
+                tg, 'request_context', wraps=tg.request_context):
+            reply=asyncio.run(tg.answer(app,'/status'))
+        self.assertIn('Executed broker-linked trades: 2 total',reply)
+        self.assertIn('Open broker-linked trades now: 1',reply)
+        self.assertIn('Closed broker-confirmed trades: 1 recorded',reply)
+        self.assertIn('Executed includes positions that are now open or closed',reply)
 
     def test_natural_language_uses_allowlist_and_checks_binding_after_model(self):
         plan={'operation':'set_rule','agent':'position_manager','key':'profit_trailing_interval_minutes','value':20}

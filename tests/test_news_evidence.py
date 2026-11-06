@@ -87,6 +87,20 @@ class NeutralReuseTests(unittest.TestCase):
                 asyncio.run(app.ResearcherAgent().analyze_news_candidate(**args))
                 self.assertEqual(adapter.research.await_count, 2)
 
+    def test_directional_research_reuses_stable_news_while_market_context_changes(self):
+        import makemoney as app
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'test.db';c=sqlite3.connect(path)
+            c.execute("CREATE TABLE neutral_research_cache(symbol TEXT PRIMARY KEY,fingerprint TEXT,result_json TEXT,analyzed_at REAL,reuse_count INTEGER)");c.close()
+            directional={"status":"available","signal":"bearish","confidence":.8}
+            adapter=SimpleNamespace(settings=SimpleNamespace(openai_model='test'),research=AsyncMock(return_value=directional))
+            args=dict(ticker='RUN',company_name='Sunrun',sector='Technology',headlines=[{'title':'Sunrun guidance'}],fundamentals={'trailing_eps':-1},market_context={'price':9},research_adapter=adapter)
+            with patch.object(app,'get_connection',side_effect=lambda:sqlite3.connect(path)),patch.object(app,'get_agent_rules',return_value={'researcher':{'enabled':True}}):
+                asyncio.run(app.ResearcherAgent().analyze_news_candidate(**args));args['market_context']={'price':8}
+                reused=asyncio.run(app.ResearcherAgent().analyze_news_candidate(**args))
+            self.assertEqual(adapter.research.await_count,1);self.assertIn('research_reuse',reused)
+            self.assertNotIn('neutral_reuse',reused)
+
 
 class EconomicGateTests(unittest.TestCase):
     def size(self, side, **rules):

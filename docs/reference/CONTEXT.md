@@ -6,6 +6,14 @@
 - Added a 0.75 ATR minimum-room gate to confirmed opposing daily structure.
 - Added beta plus ATR% as a capped 5% opportunity-speed ranking input.
 - High beta can reduce allocation; volatility never grants direction.
+- Promoted the existing five-minute OHLCV feed into intraday EMA9/20, VWAP
+  slope, three-bar structure, opening range, directional volume, gap, and
+  time-of-day evidence. Added 15-minute opening and 30-minute remaining-session
+  entry guards. SPY relative strength is recorded observationally.
+- Added immutable evidence aggregation: canonical Strategist/Risk subtrees with
+  local references, bounded structure periods, and content-addressed research
+  blobs. Unchanged directional research can be reused for six hours (neutral
+  two hours); market, strategy, risk and broker checks stay fresh.
 
 - Finbot is a Python/Streamlit app. Sole local Compose container `finbot-finbot-1`,
   dashboard https://localhost:8501, external volume `finbot_migrated_20261022`,

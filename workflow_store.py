@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from contextlib import asynccontextmanager
 import hashlib
 import json
@@ -14,6 +15,33 @@ OPERATIONAL_SUMMARY_KEYS={'trade_id','ticker','symbol','company_name','signal','
     'analysis_status','analysis_decision','execution_status','execution_reasons','reasons','mode','strategy',
     'candidate_pool_size','approved_candidate_count','opened_count','max_trades_per_cycle','selection_rank',
     'selection_score','automation_enabled','broker_order_submitted','neutral_reason'}
+
+
+def compact_trade_event_detail(stage, value):
+    """Replace same-event copies with immutable local evidence references."""
+    detail=copy.deepcopy(value or {})
+    if not isinstance(detail,dict):return detail
+    def reference(container,key,path):
+        if isinstance(container,dict) and key in container:
+            container[key]={'evidence_ref':path}
+    if stage=='strategy' and isinstance(detail.get('candidate_context'),dict):
+        analysis=detail.get('analysis') if isinstance(detail.get('analysis'),dict) else {}
+        gate=detail.get('decision_gate') if isinstance(detail.get('decision_gate'),dict) else {}
+        for container in (analysis,gate):
+            reference(container,'daily_trend_context','candidate_context.daily_trend_context')
+            reference(container,'market_quote','candidate_context.market_quote')
+            reference(container,'fundamentals','candidate_context.fundamentals')
+        reference(analysis,'decision_gate','decision_gate')
+        detail['evidence_layout']='candidate_context is canonical; evidence_ref paths resolve within this immutable event'
+    if stage=='risk':
+        quote=detail.get('broker_quote')
+        if isinstance(quote,dict) and 'instrument' in quote and detail.get('broker_instrument'):
+            quote['instrument']={'evidence_ref':'broker_instrument'}
+        target=((detail.get('protection') or {}).get('target_selection') if isinstance(detail.get('protection'),dict) else None)
+        if isinstance(target,dict) and 'structure' in target and (detail.get('daily_trend_context') or {}).get('price_structure'):
+            target['structure']={'evidence_ref':'daily_trend_context.price_structure'}
+        detail['evidence_layout']='daily_trend_context and broker_instrument are canonical; evidence_ref paths resolve within this immutable event'
+    return detail
 
 
 def compact_operational_detail(value):
@@ -80,6 +108,7 @@ def ensure_schema(conn):
     CREATE TABLE IF NOT EXISTS analysis_restores (trade_id INTEGER PRIMARY KEY, restored_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS maintenance_runs (id INTEGER PRIMARY KEY, created_at TEXT DEFAULT CURRENT_TIMESTAMP, action TEXT, details TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS neutral_research_cache (symbol TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result_json TEXT NOT NULL, analyzed_at REAL NOT NULL, reuse_count INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS evidence_blobs (sha256 TEXT PRIMARY KEY, kind TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, payload TEXT NOT NULL);
     """)
 
     import outcome_notifications

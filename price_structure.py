@@ -175,7 +175,10 @@ def multi_timeframe_structure(bars):
               "support": [{**z, "timeframe": "daily", "kind": "confirmed_swing_zone"}
                           for z in daily["support"]]}
     as_of = pd.Timestamp(bars.index[-1])
-    for timeframe, frequency, limit in (("weekly", "W-FRI", 104), ("monthly", "ME", 60)):
+    # The entry rules use the current/preceding monthly range and a four-week
+    # fallback. Older extrema bloated every persisted decision without changing
+    # the selected boundary.
+    for timeframe, frequency, limit in (("weekly", "W-FRI", 6), ("monthly", "ME", 3)):
         for end, group in list(bars.resample(frequency))[-limit:]:
             if group.empty:
                 continue

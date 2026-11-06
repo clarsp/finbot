@@ -46,6 +46,10 @@ class VolumeCalculationTests(unittest.TestCase):
         self.assertEqual(result['vwap'],100)
         self.assertEqual(result['completed_bars'],12)
         self.assertEqual(result['baseline_sessions'],20)
+        self.assertEqual(result['time_of_day'],'midday')
+        self.assertIn('intraday_structure_state',result)
+        self.assertIn('opening_range_high',result)
+        self.assertIn('gap_pct',result)
 
     def test_missing_current_slot_and_missing_baseline_are_unavailable(self):
         result=from_bars(self.bars.drop(self.bars.index[-2]),self.calendar,self.now)
@@ -65,6 +69,24 @@ class VolumeCalculationTests(unittest.TestCase):
 
 
 class VolumeGateTests(unittest.TestCase):
+    def test_completed_intraday_structure_is_directional_and_symmetric(self):
+        for side,state,slope,ema9,ema20 in [('LONG','bullish','rising',101,100),('SHORT','bearish','falling',99,100)]:
+            c=candidate(side)
+            c['volume_context'].update(intraday_structure_state=state,vwap_slope=slope,ema9=ema9,ema20=ema20)
+            self.assertTrue(confirmation(c,side,app.DEFAULT_AGENT_RULES['strategist'])['qualified'])
+            c['volume_context']['intraday_structure_state']='bearish' if side=='LONG' else 'bullish'
+            result=confirmation(c,side,app.DEFAULT_AGENT_RULES['strategist'])
+            self.assertFalse(result['qualified']);self.assertTrue(result['intraday_confirmation_applied'])
+
+    def test_opening_and_near_close_are_explicit_entry_deferrals(self):
+        c=candidate();c['confidence']=.9
+        c['volume_context'].update(session_elapsed_minutes=10,session_remaining_minutes=380)
+        gate=app.evaluate_strategist_gate(c,'LONG',[],app.DEFAULT_AGENT_RULES['strategist'])
+        self.assertFalse(gate['accepted']);self.assertIn('first 15', ' '.join(gate['rejection_reasons']))
+        c['volume_context'].update(session_elapsed_minutes=370,session_remaining_minutes=20)
+        gate=app.evaluate_strategist_gate(c,'LONG',[],app.DEFAULT_AGENT_RULES['strategist'])
+        self.assertFalse(gate['accepted']);self.assertIn('20 session minutes', ' '.join(gate['rejection_reasons']))
+
     def test_both_directions_admit_borderline_candidate_and_record_baseline(self):
         for side in ['LONG','SHORT']:
             c=candidate(side)

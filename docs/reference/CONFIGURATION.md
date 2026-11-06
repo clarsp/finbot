@@ -479,6 +479,30 @@ Yahoo beta and ATR percentage contribute only a capped opportunity-speed
 ranking component. They never select direction or relax a failed gate. Beta
 above 1.5 reduces Risk Manager allocation, with a 0.5 minimum multiplier.
 
+The existing Yahoo five-minute OHLCV request now also retains intraday EMA9/20,
+three-bar range structure, opening range, VWAP slope, directional candle volume,
+gap from the prior session, and session time remaining. When these richer fields
+are present, volume confirmation requires them to agree with LONG or SHORT; old
+or unavailable evidence remains explicit and cannot supply that confirmation.
+Ordinary entries wait for 15 completed session minutes and require at least 30
+minutes before the regular close. Current-session relative performance versus
+SPY is recorded when available but remains observational pending outcome data.
+
+### Evidence aggregation and research reuse (5 November 2026)
+
+New Strategist events retain one canonical `candidate_context`; repeated trend,
+quote, fundamental and gate subtrees use immutable event-local `evidence_ref`
+paths. Risk events similarly retain one daily structure and broker instrument.
+Only six weekly and three monthly periods are retained because the configured
+target rules cannot select older periods.
+
+Research results are content-addressed and may be reused for six hours when the
+selected headlines, fundamentals, model and prompt version are identical.
+Neutral reuse expires after two hours. Changed headlines or fundamentals
+invalidate reuse. Quote, intraday, Strategist, Risk and broker eligibility data
+are always refreshed. Reuse records the source hash and count; the immutable
+research payload is stored once in `evidence_blobs`.
+
 `strategist.trend_auto_confirm_enabled` (boolean, default true) is labeled
 **Auto-confirm trend entries**. ON lets the Strategist automatically confirm valid
 measured entries. OFF holds entries needing confirmation, rather than bypassing

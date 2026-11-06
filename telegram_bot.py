@@ -158,6 +158,26 @@ def request_context(app, plan, now=None):
             'history_sync':dict(c.execute("SELECT key,value FROM app_settings WHERE key IN ('closed_history_synced_at','closed_history_complete')")),
         }
 
+        executed_total = c.execute(
+            "SELECT count(*) FROM trades WHERE trading_profile_id=1 AND broker_position_id IS NOT NULL"
+        ).fetchone()[0]
+        executed_on_date = c.execute(
+            "SELECT count(*) FROM trades WHERE trading_profile_id=1 AND broker_position_id IS NOT NULL "
+            "AND datetime(opened_at)>=? AND datetime(opened_at)<?", bounds
+        ).fetchone()[0]
+        open_total = c.execute(
+            "SELECT count(*) FROM trades WHERE trading_profile_id=1 AND broker_position_id IS NOT NULL "
+            "AND status IN ('OPEN','EXIT_PENDING','RECONCILIATION_REQUIRED')"
+        ).fetchone()[0]
+        context['execution_summary'] = {
+            'scope': 'Broker-linked positions for active profile 1. Executed is inclusive of positions now open or closed.',
+            'executed_total': executed_total,
+            'executed_on_requested_date': executed_on_date,
+            'open_now': open_total,
+            'closed_total_recorded': len(outcomes),
+            'closed_on_requested_date': len(context['closed_history']['on_requested_date']),
+        }
+
         context['rejection_groups'] = [dict(r) for r in c.execute(
             "SELECT e.stage,e.message,count(*) AS count FROM trades t JOIN trade_events e ON e.trade_id=t.id WHERE t.trading_profile_id=1 AND datetime(t.created_at)>=? AND datetime(t.created_at)<? AND e.decision='rejected' GROUP BY e.stage,e.message ORDER BY count(*) DESC LIMIT 25", bounds)]
         snapshot=c.execute('SELECT created_at,payload FROM broker_snapshots ORDER BY id DESC LIMIT 1').fetchone()
@@ -319,7 +339,20 @@ async def answer(app, text, history=None, authorize=None):
         return '\n'.join(lines)[:3500]
     if not natural:
         if op=='status':
-            return json.dumps({k:context[k] for k in ('observed_at','automation_enabled','worker_heartbeat','status_counts')},indent=2)
+            summary=context['execution_summary']
+            heartbeat=context['worker_heartbeat'].get('worker_heartbeat','unavailable')
+            lines=[
+                'Finbot status',
+                f"Observed: {context['observed_at']}",
+                'New demo entries: '+('enabled' if context['automation_enabled'] else 'paused'),
+                f'Worker heartbeat: {heartbeat}',
+                f"Executed broker-linked trades: {summary['executed_total']} total; {summary['executed_on_requested_date']} on {context['date']}",
+                f"Open broker-linked trades now: {summary['open_now']}",
+                f"Closed broker-confirmed trades: {summary['closed_total_recorded']} recorded; {summary['closed_on_requested_date']} on {context['date']}",
+                'Today’s candidate statuses: '+json.dumps(context['status_counts'],sort_keys=True),
+                'Executed includes positions that are now open or closed; these are recorded values, not a fresh broker read.',
+            ]
+            return '\n'.join(lines)[:3500]
         if op=='positions':
             tracking={r['trade_id']:r for r in context.get('profit_tracking',[])}
             lines=['Recorded open positions (not a fresh broker read):']

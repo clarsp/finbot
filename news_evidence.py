@@ -1,4 +1,4 @@
-"""Auditable headline ranking and bounded reuse of unchanged neutral research."""
+"""Auditable headline ranking and bounded reuse of unchanged research."""
 from __future__ import annotations
 
 import hashlib
@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 VERSION = "relevance_v1"
 RESEARCH_PROMPT_VERSION = "news_market_horizon_v3"
+RESEARCH_TTL_SECONDS = 6 * 3600
 NEUTRAL_TTL_SECONDS = 2 * 3600
 
 
@@ -55,7 +56,7 @@ def select_headlines(ticker, company_name, articles, limit=8):
 
 
 def neutral_fingerprint(subject, model):
-    """Exact substantive inputs; omit retrieval clocks, not market observations."""
+    """Legacy exact substantive fingerprint, including market observations."""
     clocks = {"fetched_at", "retrieved_at", "observed_at", "last_updated", "last_updated_at", "quote_observed_at",
               "etoro_quote_timestamp", "local_timestamp", "session_progress", "minutes_from_open", "minutes_to_close"}
     def clean(value):
@@ -68,22 +69,51 @@ def neutral_fingerprint(subject, model):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def cached_neutral(conn, ticker, fingerprint, now=None):
+def research_fingerprint(subject, model):
+    """Stable news/fundamental identity; live market data is rechecked later."""
+    stable={k:v for k,v in subject.items() if k!='market_context'}
+    return neutral_fingerprint(stable,model)
+
+
+def cached_research(conn, ticker, fingerprint, now=None):
     now = time.time() if now is None else now
     row = conn.execute("SELECT fingerprint, result_json, analyzed_at, reuse_count FROM neutral_research_cache WHERE symbol=?", (ticker,)).fetchone()
-    if row is None or row[0] != fingerprint or not 0 <= now-row[2] < NEUTRAL_TTL_SECONDS:
+    if row is None or row[0] != fingerprint:
         return None
+    saved=json.loads(row[1]);ttl=NEUTRAL_TTL_SECONDS if saved.get('signal')=='neutral' else RESEARCH_TTL_SECONDS
+    if not 0 <= now-row[2] < ttl:return None
     conn.execute("UPDATE neutral_research_cache SET reuse_count=reuse_count+1 WHERE symbol=?", (ticker,))
     conn.commit()
-    return {**json.loads(row[1]), "neutral_reuse": {"fingerprint": fingerprint, "analyzed_at": row[2], "reuse_count": row[3]+1, "expires_at": row[2]+NEUTRAL_TTL_SECONDS}}
+    result=saved;encoded=json.dumps({k:v for k,v in result.items() if k not in {'research_reuse','neutral_reuse'}},sort_keys=True,separators=(',',':')).encode()
+    evidence_hash=hashlib.sha256(encoded).hexdigest()
+    reuse={"fingerprint":fingerprint,"evidence_hash":evidence_hash,"analyzed_at":row[2],"reuse_count":row[3]+1,
+        "expires_at":row[2]+ttl,"stable_inputs":"selected headlines + fundamentals + model + prompt version",
+        "fresh_downstream":"quote, intraday data, strategy, risk and broker eligibility"}
+    result={**result,"research_reuse":reuse}
+    if result.get('signal')=='neutral':result['neutral_reuse']=reuse
+    return result
+
+
+def remember_research(conn, ticker, fingerprint, result, now=None):
+    if result.get("status") != "available":return
+    stamp=time.time() if now is None else now
+    conn.execute("DELETE FROM neutral_research_cache WHERE analyzed_at < ?", (stamp-RESEARCH_TTL_SECONDS,))
+    saved={k:v for k,v in result.items() if k not in {'research_reuse','neutral_reuse'}}
+    payload=json.dumps(saved,sort_keys=True,separators=(',',':'))
+    evidence_hash=hashlib.sha256(payload.encode()).hexdigest()
+    conn.execute("CREATE TABLE IF NOT EXISTS evidence_blobs (sha256 TEXT PRIMARY KEY, kind TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, payload TEXT NOT NULL)")
+    conn.execute("INSERT OR IGNORE INTO evidence_blobs(sha256,kind,payload) VALUES (?,'research',?)",(evidence_hash,payload))
+    conn.execute("INSERT OR REPLACE INTO neutral_research_cache VALUES (?,?,?,?,0)",
+                 (ticker,fingerprint,json.dumps(saved),stamp))
+    conn.commit()
+
+
+def cached_neutral(conn, ticker, fingerprint, now=None):
+    result=cached_research(conn,ticker,fingerprint,now)
+    return result if result and result.get('signal')=='neutral' else None
 
 
 def remember_neutral(conn, ticker, fingerprint, result, now=None):
-    if result.get("status") != "available":
-        return  # Provider failures are never cached as genuine neutral research.
-    conn.execute("DELETE FROM neutral_research_cache WHERE analyzed_at < ?", ((time.time() if now is None else now)-NEUTRAL_TTL_SECONDS,))
-    if result.get("signal") == "neutral":
-        conn.execute("INSERT OR REPLACE INTO neutral_research_cache VALUES (?,?,?,?,0)", (ticker, fingerprint, json.dumps(result), time.time() if now is None else now))
+    if result.get('signal')=='neutral':remember_research(conn,ticker,fingerprint,result,now)
     else:
-        conn.execute("DELETE FROM neutral_research_cache WHERE symbol=?", (ticker,))
-    conn.commit()
+        conn.execute("DELETE FROM neutral_research_cache WHERE symbol=?",(ticker,));conn.commit()

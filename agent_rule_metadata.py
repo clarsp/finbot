@@ -80,6 +80,8 @@ AGENT_RULE_HELP = {'profit_review_exits_enabled': 'Allow a news or sizing review
  'structure_min_room_atr': 'Minimum ATR14 room to the nearest confirmed opposing daily swing before entry. Default 0.75 ATR.',
  'speed_ranking_enabled': 'Use beta and ATR percentage only to rank otherwise approved opportunities; they never select trade direction.',
  'preferred_beta': 'Reference beta for opportunity-speed reporting. Beta does not authorize a trade or relax a directional gate.',
+ 'avoid_opening_minutes': 'Defer ordinary entries until this many regular-session minutes have completed so the opening range can form. Default 15.',
+ 'minimum_session_remaining_minutes': 'Do not open an ordinary intraday thesis with fewer regular-session minutes remaining. Default 30.',
  'high_beta_size_threshold': 'Above this beta, Risk Manager reduces allocation; it never increases allocation for high beta.',
  'high_beta_minimum_multiplier': 'Smallest allocation multiplier allowed for a high-beta candidate before ordinary portfolio caps are applied.',
  'conditional_mean_reversion_min_confidence': 'Research confidence required for a temporary news reaction; '

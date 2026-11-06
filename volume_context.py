@@ -18,6 +18,10 @@ def from_bars(bars, calendar, now=None):
         frame = bars.copy()
         if frame.empty or frame.index.tz is None or frame.index.has_duplicates:
             raise ValueError('Missing, undated or duplicate bars.')
+        # Older fixtures and a few providers omit Open. Close is a conservative
+        # neutral proxy for candle-direction volume; Yahoo supplies real Open.
+        if 'Open' not in frame:
+            frame['Open'] = frame['Close']
         frame.index = frame.index.tz_convert('UTC')
         session = calendar.date_to_session(now.date(), direction='none')
         opened, closed = calendar.session_open(session), calendar.session_close(session)
@@ -29,10 +33,10 @@ def from_bars(bars, calendar, now=None):
             raise ValueError('Insufficient completed bars or session break.')
         def valid_slice(expected):
             selected = frame.reindex(expected)
-            values = selected[['High', 'Low', 'Close', 'Volume']]
+            values = selected[['Open', 'High', 'Low', 'Close', 'Volume']]
             if not values.map(lambda x: pd.notna(x) and math.isfinite(float(x))).all().all():
                 raise ValueError('Incomplete session coverage.')
-            if (values[['High', 'Low', 'Close']] <= 0).any().any() or (values.Volume < 0).any() or (values.High < values.Low).any():
+            if (values[['Open', 'High', 'Low', 'Close']] <= 0).any().any() or (values.Volume < 0).any() or (values.High < values.Low).any():
                 raise ValueError('Invalid OHLCV.')
             return values
         current = valid_slice(slots)
@@ -54,8 +58,41 @@ def from_bars(bars, calendar, now=None):
         if len(baseline) < 10 or total <= 0:
             raise ValueError('At least ten complete positive-volume comparison sessions required.')
         typical = (current.High + current.Low + current.Close) / 3
+        cumulative_volume = current.Volume.cumsum()
+        cumulative_vwap = (typical * current.Volume).cumsum() / cumulative_volume.replace(0, float('nan'))
+        vwap = float(cumulative_vwap.iloc[-1])
+        earlier_vwap = float(cumulative_vwap.iloc[-min(4, len(cumulative_vwap))])
+        ema9 = float(current.Close.ewm(span=9, adjust=False).mean().iloc[-1])
+        ema20 = float(current.Close.ewm(span=20, adjust=False).mean().iloc[-1])
+        recent = current.tail(3); previous_range = current.iloc[-6:-3]
+        structure_state = 'mixed'
+        if len(previous_range) == 3:
+            if recent.High.max() > previous_range.High.max() and recent.Low.min() > previous_range.Low.min():
+                structure_state = 'bullish'
+            elif recent.High.max() < previous_range.High.max() and recent.Low.min() < previous_range.Low.min():
+                structure_state = 'bearish'
+        opening = current.head(min(6, len(current)))
+        up_volume = float(current.loc[current.Close >= current.Open, 'Volume'].sum())
+        down_volume = float(current.loc[current.Close < current.Open, 'Volume'].sum())
+        elapsed_minutes = int((slots[-1] + pd.Timedelta(minutes=5) - opened).total_seconds() / 60)
+        session_minutes = int((closed - opened).total_seconds() / 60)
+        prior = frame.loc[frame.index < opened, 'Close']
+        previous_close = float(prior.iloc[-1]) if not prior.empty else None
+        session_open_price = float(current.Open.iloc[0])
         result.update(available=True, rvol=total / (sum(baseline) / len(baseline)),
-                      vwap=float((typical * current.Volume).sum() / total),
+                      vwap=vwap, vwap_slope='rising' if vwap > earlier_vwap else 'falling' if vwap < earlier_vwap else 'flat',
+                      vwap_change=float(vwap-earlier_vwap), ema9=ema9, ema20=ema20,
+                      intraday_structure_state=structure_state,
+                      opening_range_high=float(opening.High.max()), opening_range_low=float(opening.Low.min()),
+                      above_opening_range=bool(float(current.Close.iloc[-1]) > float(opening.High.max())),
+                      below_opening_range=bool(float(current.Close.iloc[-1]) < float(opening.Low.min())),
+                      up_volume=up_volume, down_volume=down_volume,
+                      directional_volume_ratio=(up_volume / down_volume if down_volume > 0 else None),
+                      session_elapsed_minutes=elapsed_minutes,
+                      session_remaining_minutes=max(0, session_minutes-elapsed_minutes),
+                      time_of_day=('opening' if elapsed_minutes <= 30 else 'closing' if session_minutes-elapsed_minutes <= 60 else 'midday'),
+                      previous_session_close=previous_close, session_open_price=session_open_price,
+                      gap_pct=(100*(session_open_price/previous_close-1) if previous_close else None),
                       last=float(current.Close.iloc[-1]), previous=float(current.Close.iloc[-2]),
                       through=(slots[-1] + pd.Timedelta(minutes=5)).isoformat(),
                       session_open=opened.isoformat(), session_close=closed.isoformat(),
@@ -77,7 +114,28 @@ def load_volume_context(symbol):
         name = CALENDARS.get(metadata.get('exchangeName'))
         if not name:
             return {'available': False, 'reason': 'Underlying exchange calendar is not explicitly mapped.'}
-        return from_bars(bars, xcals.get_calendar(name))
+        result = from_bars(bars, xcals.get_calendar(name))
+        if result.get('available') and reference_symbol(symbol) != 'SPY':
+            try:
+                benchmark = yf.Ticker('SPY').history(period='5d', interval='5m', auto_adjust=True, actions=False, prepost=False, timeout=5)
+                benchmark.index = pd.DatetimeIndex(benchmark.index).tz_convert('UTC')
+                through = pd.Timestamp(result['through']); opened = pd.Timestamp(result['session_open'])
+                stock_session = bars.copy(); stock_session.index = pd.DatetimeIndex(stock_session.index).tz_convert('UTC')
+                stock_session = stock_session.loc[(stock_session.index >= opened) & (stock_session.index < through)]
+                benchmark = benchmark.loc[(benchmark.index >= opened) & (benchmark.index < through)]
+                if len(stock_session) >= 4 and len(benchmark) >= 4:
+                    def change(frame, count=None):
+                        sample = frame.tail(count) if count else frame
+                        return 100*(float(sample.Close.iloc[-1])/float(sample.Close.iloc[0])-1)
+                    result['relative_strength'] = {
+                        'available': True, 'benchmark': 'SPY',
+                        'session_pct_points': change(stock_session)-change(benchmark),
+                        'last_15m_pct_points': change(stock_session,4)-change(benchmark,4),
+                        'last_60m_pct_points': change(stock_session,13)-change(benchmark,13),
+                        'role': 'current relative performance; beta is not a substitute'}
+            except Exception:
+                result['relative_strength'] = {'available': False, 'benchmark': 'SPY'}
+        return result
     except Exception as error:
         return {'available': False, 'reason': f'Volume context unavailable ({type(error).__name__}).'}
 
@@ -102,11 +160,23 @@ def confirmation(candidate, side, rules, now=None):
             raise ValueError('Invalid volume confirmation inputs.')
         sign = 1 if side == 'LONG' else -1
         distance = sign * (price - vwap) / atr
-        result.update(directional_vwap_distance_atr=distance, rvol=rvol)
+        intraday_state = evidence.get('intraday_structure_state')
+        expected = 'bullish' if side == 'LONG' else 'bearish'
+        richer_available = intraday_state in {'bullish','bearish','mixed'} and evidence.get('ema9') and evidence.get('ema20') and evidence.get('vwap_slope')
+        ema_aligned = None
+        if richer_available:
+            ema_aligned = (float(evidence['ema9']) > float(evidence['ema20'])) if side == 'LONG' else (float(evidence['ema9']) < float(evidence['ema20']))
+        vwap_slope_aligned = evidence.get('vwap_slope') == ('rising' if side == 'LONG' else 'falling')
+        intraday_aligned = not richer_available or (intraday_state == expected and ema_aligned and vwap_slope_aligned)
+        result.update(directional_vwap_distance_atr=distance, rvol=rvol,
+                      intraday_structure_state=intraday_state or 'unavailable', ema_aligned=bool(ema_aligned) if richer_available else None,
+                      vwap_slope=evidence.get('vwap_slope'), intraday_confirmation_applied=bool(richer_available))
         result['qualified'] = (rvol >= float(rules.get('volume_min_rvol', 1.5))
                                and 0 <= distance <= float(rules.get('volume_max_vwap_distance_atr', .75))
-                               and sign * (last - vwap) >= 0 and sign * (last - previous) > 0)
-        result['reason'] = 'Direction, participation and entry stretch confirmed.' if result['qualified'] else 'Participation, VWAP alignment or follow-through is insufficient.'
+                               and sign * (last - vwap) >= 0 and sign * (last - previous) > 0
+                               and intraday_aligned)
+        result['reason'] = ('Direction, participation, intraday structure and entry stretch confirmed.' if result['qualified'] else
+                            'Participation, VWAP/EMA alignment, intraday structure or follow-through is insufficient.')
     except (KeyError, ValueError, TypeError, OverflowError) as error:
         result['reason'] = str(error)
     return result
@@ -159,6 +229,8 @@ def decision_note(evidence):
     admission = (' This relaxation enabled strategy approval.' if evidence.get('relaxation_used') else
                  ' Strategy also passed baseline thresholds.' if evidence.get('baseline_accepted') is True else
                  ' Other eligibility checks still apply.')
+    intraday = (f" Intraday structure {evidence.get('intraday_structure_state')}; VWAP slope {evidence.get('vwap_slope')}; EMA9/20 aligned {evidence.get('ema_aligned')}."
+                if evidence.get('intraday_confirmation_applied') else "")
     return (f" Volume confirmation applied for {side}: RVOL {evidence['rvol']:.2f}x; "
             f"directional VWAP distance {evidence['directional_vwap_distance_atr']:.2f} ATR. "
-            f"Confidence thresholds: {'; '.join(changes)}.{admission} Risk allocation and limits unchanged.")
+            f"Confidence thresholds: {'; '.join(changes)}.{intraday}{admission} Risk allocation and limits unchanged.")

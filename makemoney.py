@@ -105,6 +105,8 @@ DEFAULT_AGENT_RULES: Dict[str, Dict[str, Any]] = {
         "structure_min_room_atr": 0.75,
         "speed_ranking_enabled": True,
         "preferred_beta": 1.0,
+        "avoid_opening_minutes": 15,
+        "minimum_session_remaining_minutes": 30,
         "strong_fundamentals_min_revenue_growth_pct": 15.0,
         "strong_fundamentals_min_net_profit_margin_pct": 20.0,
         "strong_fundamentals_max_debt_to_equity": 1.0,
@@ -1920,7 +1922,8 @@ def record_trade_event(
     conn = get_connection()
     conn.execute(
         "INSERT INTO trade_events (trade_id, stage, agent_name, status, decision, message, details) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (trade_id, stage, agent_name, status, decision, message, json.dumps(details or {}, sort_keys=True)),
+        (trade_id, stage, agent_name, status, decision, message,
+         json.dumps(workflow_store.compact_trade_event_detail(stage, details or {}), sort_keys=True)),
     )
     conn.commit()
     conn.close()
@@ -2895,7 +2898,7 @@ class ResearcherAgent:
                 "signal": "neutral",
                 "confidence": 0.0,
             }
-        from news_evidence import select_headlines, neutral_fingerprint, cached_neutral, remember_neutral
+        from news_evidence import select_headlines, research_fingerprint, cached_research, remember_research
         selected, selection = select_headlines(ticker, company_name, headlines)
         subject = {
                 "ticker": ticker,
@@ -2906,10 +2909,10 @@ class ResearcherAgent:
                 "fundamentals": fundamentals,
                 "market_context": market_context,
             }
-        fingerprint = neutral_fingerprint(subject, getattr(getattr(research_adapter, "settings", None), "openai_model", "unknown"))
+        fingerprint = research_fingerprint(subject, getattr(getattr(research_adapter, "settings", None), "openai_model", "unknown"))
         conn = get_connection()
         try:
-            prior = cached_neutral(conn, ticker, fingerprint)
+            prior = cached_research(conn, ticker, fingerprint)
         finally:
             conn.close()
         if prior:
@@ -2919,7 +2922,7 @@ class ResearcherAgent:
             result = {**result, "status": "available", "headline_selection": selection}
             conn = get_connection()
             try:
-                remember_neutral(conn, ticker, fingerprint, result)
+                remember_research(conn, ticker, fingerprint, result)
             finally:
                 conn.close()
             return result
@@ -3809,6 +3812,14 @@ def evaluate_strategist_gate(
     fundamental_confirmation = fundamentals_align and company_news_supports_position
 
     daily_trend = candidate.get("daily_trend_context") or {}
+    intraday = candidate.get("volume_context") or {}
+    if intraday.get("available"):
+        elapsed = intraday.get("session_elapsed_minutes")
+        remaining = intraday.get("session_remaining_minutes")
+        if elapsed is not None and float(elapsed) < float(rules.get("avoid_opening_minutes", 15)):
+            rejection_reasons.append(f"Entry deferred during the first {int(rules.get('avoid_opening_minutes',15))} regular-session minutes; opening structure is incomplete.")
+        if remaining is not None and float(remaining) < float(rules.get("minimum_session_remaining_minutes", 30)):
+            rejection_reasons.append(f"Entry deferred with only {float(remaining):.0f} session minutes remaining; insufficient time for the intraday thesis.")
     short_term_state = str(daily_trend.get("short_term_trend_state") or "unknown").lower()
     expected_short_term = "bullish" if proposed_position == "LONG" else "bearish"
     short_term_alignment = ("unavailable" if short_term_state not in {"bullish", "bearish", "mixed"}
@@ -4689,6 +4700,12 @@ async def run_etoro_news_research_cycle(settings: Optional[IntegrationSettings] 
             "evidence": {"headlines": headlines, "collected_headlines": collected_headlines, "fundamentals": fundamentals, "market_context": trends},
             "market_session_context": market_session_context,
         }
+        if ai_result.get('research_reuse'):
+            reference=ai_result['research_reuse']
+            researcher_result['openai']={'evidence_ref':f"evidence_blobs:{reference['evidence_hash']}",
+                                         'reused':True,'signal':signal,'confidence':confidence}
+            researcher_result['evidence']={'evidence_ref':f"evidence_blobs:{reference['evidence_hash']}",
+                                           'research_reuse':reference,'headline_selection':headline_selection}
         record_agent_event(
             "researcher", researcher_result["status"], "dynamic_news_research",
             f"{ticker}: {signal} research; {researcher_result['headline_count']} of {len(collected_headlines)} collected headlines analyzed.",
